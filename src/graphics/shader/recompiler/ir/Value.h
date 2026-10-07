@@ -55,7 +55,10 @@ public:
 	bool operator==(const Value& other) const;
 
 private:
+	friend class Inst;
 	Type type = Type::Void;
+	// A stored operand owns this reverse-use backlink. Value copies do not own an edge.
+	uint32_t use_index = UINT32_MAX;
 	union {
 		Inst*     inst;
 		ScalarReg scalar_reg;
@@ -70,6 +73,7 @@ private:
 	explicit Value(Type type, uint64_t bits);
 };
 static_assert(std::is_trivially_copyable_v<Value>);
+static_assert(sizeof(Value) == 16, "Operand backlink must fit the existing Value padding");
 
 template <Type type_>
 class TypedValue: public Value {
@@ -121,6 +125,7 @@ public:
 	[[nodiscard]] Value                   Arg(size_t index) const;
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;
+	// Unordered reverse edges. Adding, removing or replacing operands can reorder this vector.
 	[[nodiscard]] const std::vector<Use>& Uses() const;
 	// Runtime indices belong to the resource plan that owns this instruction.
 	[[nodiscard]] uint32_t EvaluationIndex(uint32_t& count) const {
@@ -157,6 +162,7 @@ private:
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
+	Value& ArgReference(size_t index);
 
 	static constexpr uint8_t InlineArity = 4;
 	static constexpr uint8_t PhiArity = UINT8_MAX;

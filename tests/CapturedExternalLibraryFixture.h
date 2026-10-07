@@ -1,108 +1,347 @@
 #pragma once
 
+#include "CapturedComputeManifest.h"
 #include "graphics/shader/recompiler/ExternalLibrary.h"
 #include "graphics/shader/recompiler/ShaderCallDiagnostics.h"
 
-#include <charconv>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <set>
-#include <cstdio>
-#include <cstdlib>
 
 namespace CapturedExternalTest {
 namespace Shader = Libs::Graphics::ShaderRecompiler;
 
-inline void Require(bool condition, const char* message) {
-    if (!condition) { std::fprintf(stderr, "CapturedExternalFixture: %s\n", message); std::exit(1); }
+inline void Require(bool condition, const char *message) {
+  if (!condition) {
+    std::fprintf(stderr, "CapturedExternalFixture: %s\n", message);
+    std::exit(1);
+  }
+}
+inline void RequireParse(bool condition, const std::string &failure) {
+  Require(condition, failure.c_str());
 }
 
-inline std::vector<uint32_t> ReadWords(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    Require(bool(file), "cannot open explicitly selected captured binary");
-    const auto bytes = file.tellg();
-    Require(bytes > 0 && bytes <= 1024 * 1024 && bytes % 4 == 0, "captured file exceeds bounded aligned input size");
-    std::vector<uint32_t> words(static_cast<size_t>(bytes) / sizeof(uint32_t));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(words.data()), bytes);
-    Require(bool(file), "captured read was incomplete");
-    return words;
+inline std::vector<uint32_t> ReadWords(const std::filesystem::path &path) {
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  Require(bool(file), "cannot open explicitly selected captured binary");
+  const auto bytes = file.tellg();
+  Require(bytes > 0 && bytes <= 1024 * 1024 && bytes % 4 == 0,
+          "captured file exceeds bounded aligned input size");
+  std::vector<uint32_t> words(static_cast<size_t>(bytes) / sizeof(uint32_t));
+  file.seekg(0);
+  file.read(reinterpret_cast<char *>(words.data()), bytes);
+  Require(bool(file), "captured read was incomplete");
+  return words;
 }
 
-struct Fixture {
-    std::vector<uint32_t> caller;
-    Shader::ExternalLibraryPlan library;
-    size_t total_functions = 0;
-    size_t total_records = 0;
+struct Region {
+  uint64_t address;
+  std::vector<uint32_t> words;
 };
 
-// Every candidate comes from this single captured table and its own captured prefix.
-// A smaller limit constructs a synthetic subset for offline translation scale only;
-// it cannot establish correctness for the omitted live dispatch targets or contexts.
-inline Fixture Load(const char* caller_path, const char* folder_path, size_t limit) {
-    Fixture fixture;
-    fixture.caller = ReadWords(caller_path);
-    const auto table = ReadWords(std::filesystem::path(folder_path) / "table_00.bin");
-    Require(table.size() % 4u == 0u, "captured table has a partial native record");
-    std::map<uint64_t, std::filesystem::path> paths;
-    for (const auto& entry : std::filesystem::directory_iterator(folder_path)) {
-        const auto name = entry.path().filename().string();
-        if (!name.starts_with("target_") || !name.ends_with(".bin")) continue;
-        const auto begin = name.find_last_of('_') + 1u;
-        const auto hex = std::string_view(name).substr(begin, name.size() - begin - 4u);
-        uint64_t address = 0;
-        const auto parsed = std::from_chars(hex.data(), hex.data() + hex.size(), address, 16);
-        Require(parsed.ec == std::errc{} && parsed.ptr == hex.data() + hex.size() &&
-                    address != 0 && address < (uint64_t{1} << 48u) && (address & 3u) == 0,
-                "captured prefix filename has an invalid entry address");
-        Require(paths.emplace(address, entry.path()).second, "duplicate captured prefix address");
+struct CapturedMemory {
+  std::vector<Region> regions;
+  void Merge() {
+    std::ranges::sort(regions, {}, &Region::address);
+    std::vector<Region> merged;
+    for (auto &region : regions) {
+      Require(region.address < (uint64_t{1} << 48u) &&
+                  (region.address & 3u) == 0u && !region.words.empty() &&
+                  region.words.size() * sizeof(uint32_t) <=
+                      (uint64_t{1} << 48u) - region.address,
+              "captured region has an invalid address span");
+      if (merged.empty() ||
+          region.address >
+              merged.back().address + merged.back().words.size() * 4u) {
+        merged.push_back(std::move(region));
+        continue;
+      }
+      auto &previous = merged.back();
+      const size_t offset =
+          static_cast<size_t>((region.address - previous.address) / 4u);
+      const size_t overlap =
+          std::min(region.words.size(), previous.words.size() - offset);
+      Require(std::equal(region.words.begin(), region.words.begin() + overlap,
+                         previous.words.begin() + offset),
+              "captured mapped regions conflict in overlapping bytes");
+      previous.words.insert(previous.words.end(),
+                            region.words.begin() + overlap, region.words.end());
     }
-    fixture.total_functions = paths.size();
-    fixture.total_records = table.size() / 4u;
-    Require(limit > 0u && limit <= paths.size(), "candidate subset exceeds captured library");
-    std::set<uint64_t> targets;
-    for (size_t record = 0; record < fixture.total_records; ++record) {
-        const auto code = uint64_t{table[record * 4u]} | uint64_t{table[record * 4u + 1u]} << 32u;
-        Require(paths.contains(code), "captured table entry lacks its captured code prefix");
-        targets.insert(code);
+    regions = std::move(merged);
+  }
+  static bool Read(void *context, uint64_t address,
+                   std::span<uint32_t> output) {
+    const auto &regions = static_cast<CapturedMemory *>(context)->regions;
+    if (output.empty() || (address & 3u) != 0u)
+      return false;
+    const auto after =
+        std::upper_bound(regions.begin(), regions.end(), address,
+                         [](uint64_t value, const Region &region) {
+                           return value < region.address;
+                         });
+    if (after == regions.begin())
+      return false;
+    const auto &region = *std::prev(after);
+    const uint64_t offset = (address - region.address) / 4u;
+    if (offset > region.words.size() ||
+        output.size() > region.words.size() - offset)
+      return false;
+    std::copy_n(region.words.begin() + static_cast<size_t>(offset),
+                output.size(), output.begin());
+    return true;
+  }
+};
+
+struct Fixture {
+  std::vector<uint32_t> caller;
+  Shader::ExternalLibraryPlan library;
+  ComputeControls controls;
+  size_t total_functions = 0;
+  size_t total_records = 0;
+  bool synthetic_inputs = false;
+};
+
+inline CaptureManifest ReadManifest(const std::filesystem::path &path) {
+  std::ifstream file(path, std::ios::binary | std::ios::ate);
+  Require(bool(file), "capture manifest is required; legacy data needs "
+                      "explicit synthetic mode");
+  const auto bytes = file.tellg();
+  Require(bytes > 0 && bytes <= 2 * 1024 * 1024,
+          "manifest exceeds bounded size");
+  std::string text(static_cast<size_t>(bytes), '\0');
+  file.seekg(0);
+  file.read(text.data(), bytes);
+  Require(bool(file), "manifest read was incomplete");
+  CaptureManifest manifest;
+  std::string failure;
+  RequireParse(ParseCaptureManifest(text, manifest, failure), failure);
+  return manifest;
+}
+
+inline std::filesystem::path CapturedFile(const std::filesystem::path &folder,
+                                          const Fields &fields) {
+  const auto found = fields.find("file");
+  Require(found != fields.end() && found->second != "none" &&
+              std::filesystem::path(found->second).filename().string() ==
+                  found->second &&
+              found->second.ends_with(".bin"),
+          "manifest capture file is absent or not a local binary name");
+  return folder / found->second;
+}
+
+inline std::vector<uint32_t> BracketWords(const Fields &fields,
+                                          const char *name, size_t count) {
+  const auto found = fields.find(name);
+  Require(found != fields.end() && found->second.starts_with('[') &&
+              found->second.ends_with(']'),
+          "manifest lacks the exact descriptor/user DWORD list");
+  auto text =
+      std::string_view(found->second).substr(1u, found->second.size() - 2u);
+  std::vector<uint32_t> result(count);
+  for (size_t word = 0; word < count; ++word) {
+    const auto comma = text.find(',');
+    Require((word + 1u < count) == (comma != std::string_view::npos) &&
+                ParseNumber(text.substr(0u, comma), result[word]),
+            "malformed manifest DWORD list");
+    if (comma != std::string_view::npos)
+      text.remove_prefix(comma + 1u);
+  }
+  return result;
+}
+
+// Actual mode requires every recorded compile input. Legacy mode must be
+// explicit. No guest code executes, and neither mode establishes live GPU
+// correctness.
+inline Fixture Load(const char *caller_path, const char *folder_path,
+                    size_t limit, bool actual_inputs = true) {
+  Fixture fixture;
+  fixture.synthetic_inputs = !actual_inputs;
+  const std::filesystem::path folder(folder_path);
+  const auto manifest = ReadManifest(folder / "manifest.txt");
+  std::string failure;
+  const auto number = [&](const Fields &fields, const char *name,
+                          auto &output) {
+    RequireParse(Number(fields, name, output, failure), failure);
+  };
+  const auto flag = [&](const Fields &fields, const char *name, bool expected) {
+    bool value = !expected;
+    RequireParse(Boolean(fields, name, value, failure), failure);
+    Require(value == expected,
+            "capture flag prevents a complete bounded snapshot");
+  };
+  fixture.caller = ReadWords(caller_path);
+  if (actual_inputs) {
+    RequireParse(
+        ParseComputeControls(manifest.global, fixture.controls, failure),
+        failure);
+    flag(manifest.global, "caller_file_written", true);
+    const auto caller_file = manifest.global.find("caller_file");
+    Require(caller_file != manifest.global.end() &&
+                caller_file->second == "caller.bin",
+            "actual manifest does not identify its checked caller binary");
+    Require(ReadWords(folder / "caller.bin") == fixture.caller,
+            "selected caller bytes differ from the caller captured with this "
+            "input manifest");
+  } else {
+    fixture.controls.caller_address = 0x1450008000ull;
+    fixture.controls.compute.wave_size = 64u;
+    fixture.controls.compute.host_subgroup_size = 32u;
+    std::fill_n(fixture.controls.compute.threads_num, 3u, 1u);
+    fixture.controls.user_data.resize(108u);
+    number(manifest.global, "caller_hash", fixture.controls.shader_hash);
+    number(manifest.global, "caller_span_bytes", fixture.controls.caller_bytes);
+    number(manifest.global, "decoded_instructions",
+           fixture.controls.decoded_instructions);
+  }
+  Require(fixture.caller.size() * 4u == fixture.controls.caller_bytes,
+          "caller byte count differs from this capture manifest");
+  for (const auto *name : {"call_sites_truncated", "table_budget_exhausted",
+                           "target_limit_reached", "target_budget_exhausted"})
+    flag(manifest.global, name, false);
+  for (const auto *name :
+       {"zero_targets", "misaligned_targets", "outside_48bit_targets"}) {
+    size_t count = 1u;
+    number(manifest.global, name, count);
+    Require(count == 0u,
+            "captured table contains an excluded invalid code target");
+  }
+  CapturedMemory memory;
+  std::set<uint64_t> table_targets;
+  size_t table_bytes = 0;
+  for (const auto &fields : manifest.tables) {
+    flag(fields, "descriptor_read", true);
+    flag(fields, "truncated", false);
+    flag(fields, "read_failed", false);
+    const auto rejection = fields.find("rejection");
+    Require(rejection != fields.end() && rejection->second == "none",
+            "captured call origin was unproven");
+    uint64_t descriptor_address = 0, table_address = 0;
+    size_t declared = 0, captured = 0;
+    number(fields, "descriptor_address", descriptor_address);
+    number(fields, "aligned_table_base", table_address);
+    number(fields, "declared_table_bytes", declared);
+    number(fields, "captured_bytes", captured);
+    auto words = ReadWords(CapturedFile(folder, fields));
+    Require(declared != 0u && declared == captured &&
+                declared == words.size() * 4u && declared % 16u == 0u,
+            "captured table is partial or differs from the declared native "
+            "record span");
+    table_bytes += declared;
+    fixture.total_records += words.size() / 4u;
+    for (size_t first = 0; first < words.size(); first += 4u)
+      table_targets.insert(uint64_t{words[first]} |
+                           (uint64_t{words[first + 1u]} << 32u));
+    memory.regions.push_back(
+        {descriptor_address, BracketWords(fields, "descriptor_words", 4u)});
+    memory.regions.push_back({table_address, std::move(words)});
+    if (!actual_inputs) {
+      uint32_t reg = 0;
+      number(fields, "user_sgpr_pair", reg);
+      Require(reg < 107u,
+              "synthetic origin pair lies outside scalar registers");
+      const auto user = BracketWords(fields, "user_words", 2u);
+      fixture.controls.user_data[reg] = user[0];
+      fixture.controls.user_data[reg + 1u] = user[1];
     }
-    Require(targets.size() == paths.size(), "captured prefix is not proven by this captured table");
-    std::map<uint64_t, uint32_t> ids;
-    for (const auto& [address, path] : paths) {
-        if (ids.size() == limit) break;
-        auto words = ReadWords(path);
-        Require(words.size() * sizeof(uint32_t) == 65536u, "candidate prefix is incomplete");
-        const auto id = static_cast<uint32_t>(ids.size());
-        ids.emplace(address, id);
-        fixture.library.functions.push_back({id, address, std::move(words)});
-    }
-    Shader::Decoder::Program caller;
-    Shader::Decoder::DecodeProgram(fixture.caller, caller);
-    std::array<uint32_t, 64> dummy_user {};
-    dummy_user[0] = 0x2000u; dummy_user[1] = 0x10u;
-    const auto traced = Shader::Diagnostics::TraceCallTables(caller, dummy_user);
-    Require(traced.calls.size() == 1u && !traced.call_sites_truncated && traced.calls[0].rejection.empty(),
-            "captured caller did not prove one function table origin");
-    const auto& trace = traced.calls[0];
-    Shader::ExternalCallSite site;
-    site.caller_pc = trace.call_pc; site.target_sgpr = trace.target_sgpr; site.return_sgpr = trace.return_sgpr;
-    site.record_load_pc = trace.record_load_pc; site.record_sgpr = 4u;
-    site.context_domain = 0; site.auxiliary_sgpr = 16u;
-    for (const auto& [address, id] : ids) site.candidate_addresses.push_back(address);
-    for (uint32_t record = 0; record < fixture.total_records; ++record) {
-        const auto first = record * 4u;
-        const auto code = uint64_t{table[first]} | uint64_t{table[first + 1u]} << 32u;
-        const auto found = ids.find(code); if (found == ids.end()) continue;
-        const auto aux = uint64_t{table[first + 2u]} | uint64_t{table[first + 3u]} << 32u;
-        site.records.push_back({record, found->second, code, aux});
-        site.context_records.push_back({record, found->second,
-            {table[first], table[first + 1u], table[first + 2u], table[first + 3u]}});
-    }
-    // Capture omitted the caller base; this is explicitly synthetic and does not validate live link bits.
-    fixture.library.caller_address = 0x1450008000ull;
-    fixture.library.call_sites.push_back(std::move(site));
-    fixture.library.complete = true;
-    return fixture;
+  }
+  size_t reserved_tables = 0, requested_tables = 0;
+  number(manifest.global, "table_bytes_reserved", reserved_tables);
+  number(manifest.global, "table_read_bytes_requested", requested_tables);
+  Require(table_bytes == reserved_tables && table_bytes == requested_tables &&
+              table_bytes <= Shader::Diagnostics::MaxTableBytes,
+          "captured table accounting does not match complete bounded reads");
+  std::set<uint64_t> prefix_targets;
+  for (const auto &fields : manifest.targets) {
+    uint64_t address = 0;
+    size_t bytes = 0;
+    number(fields, "raw_address", address);
+    number(fields, "captured_bytes", bytes);
+    flag(fields, "read_failed", false);
+    Require(
+        table_targets.contains(address) &&
+            prefix_targets.insert(address).second,
+        "candidate prefix is duplicated or absent from this captured table");
+    const auto path = CapturedFile(folder, fields);
+    const auto name = path.filename().string();
+    const auto start = name.find_last_of('_') + 1u;
+    uint64_t named_address = 0;
+    Require(name.starts_with("target_") &&
+                ParseNumber("0x" + name.substr(start, name.size() - start - 4u),
+                            named_address) &&
+                named_address == address,
+            "prefix filename and manifest target address disagree");
+    auto words = ReadWords(path);
+    Require(bytes == Shader::Diagnostics::MaxTargetBytes &&
+                bytes == words.size() * 4u,
+            "candidate prefix is incomplete");
+    memory.regions.push_back({address, std::move(words)});
+  }
+  Require(prefix_targets == table_targets,
+          "one or more captured native table targets lack their prefix");
+  fixture.total_functions = prefix_targets.size();
+  Require(limit > 0u && limit <= fixture.total_functions,
+          "candidate subset exceeds captured library");
+  size_t reserved_targets = 0, requested_targets = 0;
+  number(manifest.global, "target_bytes_reserved", reserved_targets);
+  number(manifest.global, "target_read_bytes_requested", requested_targets);
+  Require(reserved_targets == fixture.total_functions *
+                                  Shader::Diagnostics::MaxTargetBytes &&
+              requested_targets == reserved_targets &&
+              reserved_targets <= Shader::Diagnostics::MaxAggregateTargetBytes,
+          "captured prefix accounting does not match complete bounded reads");
+  memory.Merge();
+  Shader::Decoder::Program caller;
+  Shader::Decoder::DecodeProgram(fixture.caller, caller);
+  Require(caller.instructions.size() == fixture.controls.decoded_instructions,
+          "decoded caller count differs from this capture manifest");
+  auto loaded = Shader::LoadExternalLibrary(
+      caller, fixture.controls.caller_address, fixture.controls.user_data,
+      fixture.controls.user_data_base, CapturedMemory::Read, &memory);
+  if (!loaded.failure.empty())
+    std::fprintf(stderr, "CapturedExternalFixture loader: %s\n",
+                 loaded.failure.c_str());
+  Require(loaded.has_calls && loaded.plan.complete &&
+              loaded.plan.functions.size() == fixture.total_functions &&
+              loaded.plan.call_sites.size() == manifest.tables.size(),
+          "production guarded loader rejected captured inputs");
+  fixture.library = std::move(loaded.plan);
+  for (size_t call = 0; call < manifest.tables.size(); ++call) {
+    uint32_t pc = 0, target = 0, return_pair = 0, record_pc = 0, user_reg = 0;
+    const auto &fields = manifest.tables[call];
+    const auto &site = fixture.library.call_sites[call];
+    number(fields, "pc", pc);
+    number(fields, "target_encoded_pair", target);
+    number(fields, "return_encoded_pair", return_pair);
+    number(fields, "record_load_pc", record_pc);
+    number(fields, "user_sgpr_pair", user_reg);
+    Require(site.caller_pc == pc && site.target_sgpr == target &&
+                site.return_sgpr == return_pair &&
+                site.record_load_pc == record_pc &&
+                site.descriptor_user_sgpr == user_reg &&
+                site.record_sgpr != UINT32_MAX &&
+                site.auxiliary_sgpr != UINT32_MAX,
+            "decoded register/context provenance disagrees with the captured "
+            "call origin");
+  }
+  // Partial offline programs preserve original sparse ordinals and proved
+  // registers.
+  fixture.library.functions.resize(limit);
+  for (auto &site : fixture.library.call_sites) {
+    std::erase_if(site.records, [limit](const auto &record) {
+      return record.function_id >= limit;
+    });
+    std::erase_if(site.context_records, [limit](const auto &record) {
+      return record.function_id >= limit;
+    });
+    std::set<uint64_t> selected;
+    for (const auto &record : site.records)
+      selected.insert(record.function_address);
+    site.candidate_addresses.assign(selected.begin(), selected.end());
+  }
+  return fixture;
 }
 } // namespace CapturedExternalTest

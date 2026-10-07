@@ -486,6 +486,24 @@ add_executable(external_library_tests EXCLUDE_FROM_ALL
 target_link_libraries(external_library_tests fmt::fmt)
 target_include_directories(external_library_tests PRIVATE ${inc_headers})
 
+add_executable(captured_compute_manifest_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CapturedComputeManifestTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ExternalLibrary.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ShaderCallDiagnostics.cpp"
+	${shader_call_capture_decoder_sources}
+)
+target_link_libraries(captured_compute_manifest_tests fmt::fmt)
+target_include_directories(captured_compute_manifest_tests PRIVATE ${inc_headers})
+
+add_executable(ir_use_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/IrUseTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Value.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Type.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
+)
+target_link_libraries(ir_use_tests fmt::fmt)
+target_include_directories(ir_use_tests PRIVATE ${inc_headers})
+
 add_executable(external_program_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ExternalProgramTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ExternalProgram.cpp"
@@ -633,7 +651,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests shader_call_capture_tests external_library_tests external_program_tests)
+			virtual_memory_allocation_tests shader_call_capture_tests external_library_tests external_program_tests ir_use_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 endif()
@@ -664,6 +682,8 @@ if(BUILD_TESTING)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME shader_call_capture COMMAND $<TARGET_FILE:shader_call_capture_tests>)
 	add_test(NAME external_library COMMAND $<TARGET_FILE:external_library_tests>)
+	add_test(NAME captured_compute_manifest COMMAND $<TARGET_FILE:captured_compute_manifest_tests>)
+	add_test(NAME ir_use COMMAND $<TARGET_FILE:ir_use_tests>)
 	add_test(NAME external_program COMMAND $<TARGET_FILE:external_program_tests>)
 	add_test(NAME shader_external_leaf_calls COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --external-leaf-calls-only)
 	add_test(NAME shader_scalar_branch_restores COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-branch-restores-only)
@@ -747,6 +767,8 @@ if(BUILD_TESTING)
 		resource_materialization_tests
 		shader_call_capture_tests
 		external_library_tests
+		captured_compute_manifest_tests
+		ir_use_tests
 		external_program_tests
 		resource_tracking_tests
 		event_queue_lifetime_tests

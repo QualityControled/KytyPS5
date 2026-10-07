@@ -33868,34 +33868,57 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
-void CheckCapturedExternalTranslation(const char *caller_path, const char *folder_path, const char *limit_text) {
+void CheckCapturedExternalTranslation(const char *caller_path,
+                                      const char *folder_path,
+                                      const char *limit_text,
+                                      bool actual_inputs) {
   size_t limit = 0;
-  const auto parsed = std::from_chars(limit_text, limit_text + std::strlen(limit_text), limit);
-  Require("CapturedExternalTranslation", "bounded subset", parsed.ec == std::errc{} &&
-          parsed.ptr == limit_text + std::strlen(limit_text), "candidate limit must be a positive decimal integer");
+  const auto parsed =
+      std::from_chars(limit_text, limit_text + std::strlen(limit_text), limit);
+  Require("CapturedExternalTranslation", "bounded subset",
+          parsed.ec == std::errc{} &&
+              parsed.ptr == limit_text + std::strlen(limit_text),
+          "candidate limit must be a positive decimal integer");
   const auto started = std::chrono::steady_clock::now();
-  auto fixture = CapturedExternalTest::Load(caller_path, folder_path, limit);
+  auto fixture = CapturedExternalTest::Load(caller_path, folder_path, limit,
+                                            actual_inputs);
   const auto prepared = std::chrono::steady_clock::now();
-  std::printf("CapturedExternalTranslation: selected_functions=%zu total_functions=%zu selected_context_records=%zu total_records=%zu caller_base_synthetic=true input_shape_synthetic=true subset_only=%s\n",
-              fixture.library.functions.size(), fixture.total_functions,
-              fixture.library.call_sites[0].context_records.size(), fixture.total_records,
-              limit == fixture.total_functions ? "false" : "true");
-  ShaderComputeInputInfo compute{};
-  compute.wave_size = 64;
-  compute.host_subgroup_size = 32;
-  compute.threads_num[0] = compute.threads_num[1] = compute.threads_num[2] = 1u;
-  std::array<u32, 64> user_data{};
+  std::printf(
+      "CapturedExternalTranslation: selected_functions=%zu total_functions=%zu "
+      "selected_context_records=%zu total_records=%zu caller_base_synthetic=%s "
+      "input_shape_synthetic=%s subset_only=%s\n",
+      fixture.library.functions.size(), fixture.total_functions,
+      fixture.library.call_sites[0].context_records.size(),
+      fixture.total_records, fixture.synthetic_inputs ? "true" : "false",
+      fixture.synthetic_inputs ? "true" : "false",
+      limit == fixture.total_functions ? "false" : "true");
+  const auto &controls = fixture.controls;
+  std::printf(
+      "CapturedExternalTranslation: caller_base=0x%016llx wave=%u "
+      "host_subgroup=%u threads=%u,%u,%u workgroups=%u,%u,%u user_data_base=%u "
+      "user_words=%zu record_sgpr=%u auxiliary_sgpr=%u\n",
+      static_cast<unsigned long long>(controls.caller_address),
+      controls.compute.wave_size, controls.compute.host_subgroup_size,
+      controls.compute.threads_num[0], controls.compute.threads_num[1],
+      controls.compute.threads_num[2], controls.compute.workgroup_counts[0],
+      controls.compute.workgroup_counts[1],
+      controls.compute.workgroup_counts[2], controls.user_data_base,
+      controls.user_data.size(), fixture.library.call_sites[0].record_sgpr,
+      fixture.library.call_sites[0].auxiliary_sgpr);
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
-  options.wave_size = 64;
-  options.shader_hash = 0xcfbc46ff1e1ea34aull;
+  options.wave_size = controls.compute.wave_size;
+  options.shader_hash = controls.shader_hash;
+  options.user_data_base = controls.user_data_base;
   const auto *captured_dump = std::getenv("KYTY_TEST_CAPTURED_IR_DUMP");
-  options.dump_ir = captured_dump != nullptr && std::strcmp(captured_dump, "1") == 0;
+  options.dump_ir =
+      captured_dump != nullptr && std::strcmp(captured_dump, "1") == 0;
   options.early_dump = options.dump_ir;
-  Require("CapturedExternalTranslation", "bounded diagnostic dump", !options.dump_ir || limit <= 16u,
+  Require("CapturedExternalTranslation", "bounded diagnostic dump",
+          !options.dump_ir || limit <= 16u,
           "diagnostic IR dump is limited to at most 16 captured functions");
-  options.input_info.compute = &compute;
-  options.user_data = user_data;
+  options.input_info.compute = &controls.compute;
+  options.user_data = controls.user_data;
   options.external_library = &fixture.library;
   auto translated = ShaderRecompiler::TranslateProgram(fixture.caller, options);
   const auto finished = std::chrono::steady_clock::now();
@@ -33907,16 +33930,21 @@ void CheckCapturedExternalTranslation(const char *caller_path, const char *folde
   size_t duplicate_cast_blocks = 0;
   for (const auto *block : translated.program.blocks) {
     instructions += block->Instructions().size();
-    std::set<std::tuple<ValueOpcode, uint64_t, const ShaderRecompiler::IR::Inst *>> signatures;
+    std::set<
+        std::tuple<ValueOpcode, uint64_t, const ShaderRecompiler::IR::Inst *>>
+        signatures;
     bool duplicate_in_block = false;
     for (const auto &inst : block->Instructions()) {
       const auto opcode = inst.GetOpcode();
       ++opcode_counts[static_cast<size_t>(opcode)];
-      if (opcode != ValueOpcode::BitCastF32U32 && opcode != ValueOpcode::BitCastU32F32) continue;
+      if (opcode != ValueOpcode::BitCastF32U32 &&
+          opcode != ValueOpcode::BitCastU32F32)
+        continue;
       const size_t cast_index = opcode == ValueOpcode::BitCastF32U32 ? 0u : 1u;
       ++cast_counts[cast_index];
       const auto *source = inst.Arg(0).Resolve().TryInstruction();
-      if (source != nullptr && !signatures.emplace(opcode, inst.Flags<uint64_t>(), source).second) {
+      if (source != nullptr &&
+          !signatures.emplace(opcode, inst.Flags<uint64_t>(), source).second) {
         ++duplicate_cast_counts[cast_index];
         duplicate_in_block = true;
       }
@@ -33927,27 +33955,45 @@ void CheckCapturedExternalTranslation(const char *caller_path, const char *folde
   size_t private_bytes = 0;
 #ifdef _WIN32
   PROCESS_MEMORY_COUNTERS_EX counters{};
-  Require("CapturedExternalTranslation", "own process memory", GetProcessMemoryInfo(GetCurrentProcess(),
-              reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&counters), sizeof(counters)) != 0,
+  Require("CapturedExternalTranslation", "own process memory",
+          GetProcessMemoryInfo(
+              GetCurrentProcess(),
+              reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&counters),
+              sizeof(counters)) != 0,
           "cannot measure offline process memory");
   peak_rss = counters.PeakWorkingSetSize;
   private_bytes = counters.PrivateUsage;
 #endif
-  const auto seconds = [](auto begin, auto end) { return std::chrono::duration<double>(end - begin).count(); };
-  std::printf("CapturedExternalTranslation: blocks=%zu ir_instructions=%zu buffers=%zu images=%zu samplers=%zu descriptor_sources=%zu preparation_seconds=%.3f translate_seconds=%.3f peak_working_set_bytes=%zu private_bytes=%zu\n",
-              translated.program.blocks.size(), instructions, translated.program.info.buffers.size(),
-              translated.program.info.images.size(), translated.program.info.samplers.size(),
-              translated.program.descriptor_sources.size(), seconds(started, prepared), seconds(prepared, finished),
-              peak_rss, private_bytes);
-  std::printf("CapturedExternalTranslation: post_tracking_same_block_ssa_bitcasts f32_u32=%zu duplicate_f32_u32=%zu u32_f32=%zu duplicate_u32_f32=%zu duplicate_blocks=%zu\n",
-              cast_counts[0], duplicate_cast_counts[0], cast_counts[1], duplicate_cast_counts[1], duplicate_cast_blocks);
+  const auto seconds = [](auto begin, auto end) {
+    return std::chrono::duration<double>(end - begin).count();
+  };
+  std::printf(
+      "CapturedExternalTranslation: blocks=%zu ir_instructions=%zu buffers=%zu "
+      "images=%zu samplers=%zu descriptor_sources=%zu preparation_seconds=%.3f "
+      "translate_seconds=%.3f peak_working_set_bytes=%zu private_bytes=%zu\n",
+      translated.program.blocks.size(), instructions,
+      translated.program.info.buffers.size(),
+      translated.program.info.images.size(),
+      translated.program.info.samplers.size(),
+      translated.program.descriptor_sources.size(), seconds(started, prepared),
+      seconds(prepared, finished), peak_rss, private_bytes);
+  std::printf(
+      "CapturedExternalTranslation: post_tracking_same_block_ssa_bitcasts "
+      "f32_u32=%zu duplicate_f32_u32=%zu u32_f32=%zu duplicate_u32_f32=%zu "
+      "duplicate_blocks=%zu\n",
+      cast_counts[0], duplicate_cast_counts[0], cast_counts[1],
+      duplicate_cast_counts[1], duplicate_cast_blocks);
   for (size_t opcode = 0; opcode < opcode_counts.size(); ++opcode) {
-    if (opcode_counts[opcode] == 0u) continue;
-    const auto name = ShaderRecompiler::IR::ValueOpcodeName(static_cast<ValueOpcode>(opcode));
+    if (opcode_counts[opcode] == 0u)
+      continue;
+    const auto name =
+        ShaderRecompiler::IR::ValueOpcodeName(static_cast<ValueOpcode>(opcode));
     std::printf("CapturedExternalTranslation: opcode=%.*s count=%zu\n",
                 int(name.size()), name.data(), opcode_counts[opcode]);
   }
-  std::puts("CapturedExternalTranslation: no auxiliary guest-memory reads, materialization, SPIR-V emission, GPU execution, or live link-bit proof");
+  std::puts("CapturedExternalTranslation: no auxiliary guest-memory reads, "
+            "materialization, SPIR-V emission, GPU execution, or live link-bit "
+            "proof");
 }
 
 void CheckExternalDispatcherWordBounds() {
@@ -42112,10 +42158,18 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  const bool captured_translation_only = argc == 5 && std::strcmp(argv[1], "--captured-external-translate-only") == 0;
+  const bool captured_actual_inputs =
+      argc == 5 &&
+      std::strcmp(argv[1], "--captured-external-translate-only") == 0;
+  const bool captured_synthetic_inputs =
+      argc == 5 &&
+      std::strcmp(argv[1], "--captured-external-translate-synthetic-only") == 0;
+  const bool captured_translation_only =
+      captured_actual_inputs || captured_synthetic_inputs;
   EnsureConfigInitialized(!captured_translation_only);
   if (captured_translation_only) {
-    CheckCapturedExternalTranslation(argv[2], argv[3], argv[4]);
+    CheckCapturedExternalTranslation(argv[2], argv[3], argv[4],
+                                     captured_actual_inputs);
     return 0;
   }
   CheckLeastRecentlyUsedCacheOrdering();

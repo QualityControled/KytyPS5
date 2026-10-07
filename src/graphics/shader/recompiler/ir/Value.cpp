@@ -212,17 +212,13 @@ void Inst::SetParent(Block* block) {
 }
 
 void Inst::SetArg(size_t index, Value value) {
-	const auto old = Arg(index);
+	auto& slot = ArgReference(index);
+	const auto old = slot;
 	if (auto* old_inst = old.TryInstruction(); old_inst != nullptr) {
 		RemoveUse(old_inst, index);
 	}
-	if (num_args <= InlineArity) {
-		fixed_args[index] = value;
-	} else if (num_args == PhiArity) {
-		phi_args[index].second = value;
-	} else {
-		large_args[index] = value;
-	}
+	slot = value;
+	slot.use_index = UINT32_MAX;
 	if (auto* new_inst = value.TryInstruction(); new_inst != nullptr) {
 		AddUse(new_inst, index);
 	}
@@ -231,6 +227,7 @@ void Inst::SetArg(size_t index, Value value) {
 void Inst::AddPhiOperand(Block* predecessor, Value value) {
 	EXIT_IF(opcode != ValueOpcode::Phi);
 	const auto index = phi_args.size();
+	value.use_index = UINT32_MAX;
 	phi_args.emplace_back(predecessor, value);
 	if (auto* value_inst = value.TryInstruction(); value_inst != nullptr) {
 		AddUse(value_inst, index);
@@ -238,6 +235,8 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
+	// Self substitution leaves the definition and every consumer unchanged.
+	if (replacement.TryInstruction() == this) return;
 	const auto old_uses = uses;
 	for (const auto& use: old_uses) {
 		use.user->SetArg(use.operand, replacement);
@@ -256,17 +255,31 @@ void Inst::Invalidate() {
 }
 
 void Inst::AddUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found != used->uses.end());
+	auto& slot = ArgReference(operand);
+	EXIT_IF(slot.TryInstruction() != used || slot.use_index != UINT32_MAX);
+	EXIT_IF(used->uses.size() >= UINT32_MAX);
+	slot.use_index = static_cast<uint32_t>(used->uses.size());
 	used->uses.push_back({this, operand});
 }
 
 void Inst::RemoveUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found == used->uses.end());
-	used->uses.erase(found);
+	auto& slot = ArgReference(operand);
+	const auto index = slot.use_index;
+	EXIT_IF(slot.TryInstruction() != used || index >= used->uses.size());
+	EXIT_IF(used->uses[index] != Use({this, operand}));
+	const auto moved = used->uses.back();
+	if (index + 1u != used->uses.size()) {
+		used->uses[index] = moved;
+		moved.user->ArgReference(moved.operand).use_index = index;
+	}
+	used->uses.pop_back();
+	slot.use_index = UINT32_MAX;
+}
+
+Value& Inst::ArgReference(size_t index) {
+	EXIT_IF(index >= NumArgs());
+	if (num_args <= InlineArity) return fixed_args[index];
+	return num_args == PhiArity ? phi_args[index].second : large_args[index];
 }
 
 void Inst::ClearArgs() {
