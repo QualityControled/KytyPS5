@@ -1394,8 +1394,18 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				memory.sampler = sampler_plan.mapping[memory.sampler][type];
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
-			EXIT_IF(image.indirect_root == memory.resource &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+			if (image.indirect_root == memory.resource &&
+			    inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			    inst.GetOpcode() != ValueOpcode::ImageQueryDimensions &&
+			    inst.GetOpcode() != ValueOpcode::ImageRead &&
+			    inst.GetOpcode() != ValueOpcode::ImageWrite) {
+				const auto opcode = ValueOpcodeName(inst.GetOpcode());
+				EXIT("unsupported indirect image operation: shader=0x%016llx stage=%u pc=0x%08x "
+				     "opcode=%.*s\n",
+				     static_cast<unsigned long long>(program.shader_hash),
+				     static_cast<unsigned>(program.stage), inst.Flags<MemoryFlags>().pc,
+				     static_cast<int>(opcode.size()), opcode.data());
+			}
 		}
 	}
 	for (auto& memory: memory_info) {

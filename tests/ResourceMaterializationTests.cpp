@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 
@@ -517,6 +518,94 @@ void TestFiniteImageRefreshReusesScalarReads() {
         "finite image refresh grew reusable resource storage after warmup");
 }
 
+void TestSupportedIndirectImageOperationsSpecialize() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  constexpr std::array operations{ValueOpcode::ImageWrite,
+                                  ValueOpcode::ImageRead,
+                                  ValueOpcode::ImageQueryDimensions};
+  constexpr std::array names{"ImageWrite", "ImageRead", "ImageQueryDimensions"};
+  for (uint32_t index = 0; index < operations.size(); ++index) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    auto &selector = block.AppendNewInst(ValueOpcode::LaneId);
+    auto &image =
+        block.AppendNewInst(ValueOpcode::GetImageResource,
+                            {Value(&selector), Value(0u), Value(0u), Value(0u),
+                             Value(0u), Value(0u), Value(0u), Value(0u)});
+    image.SetFlags<uint32_t>(0u);
+    auto &address = block.AppendNewInst(
+        ValueOpcode::MakeImageAddress,
+        {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u)});
+    program.memory_info.push_back({.kind = ResourceKind::Image,
+                                   .resource = 0u,
+                                   .image_dimension = ImageDimension::Dim2D});
+    Inst *operation = nullptr;
+    if (operations[index] == ValueOpcode::ImageWrite) {
+      auto &texel =
+          block.AppendNewInst(ValueOpcode::CompositeConstructU32x4,
+                              {Value(1u), Value(2u), Value(3u), Value(4u)});
+      operation = &block.AppendNewInst(
+          operations[index],
+          {Value(&image), Value(&address), Value(&texel), Value(true)});
+    } else if (operations[index] == ValueOpcode::ImageRead) {
+      operation = &block.AppendNewInst(
+          operations[index], {Value(&image), Value(&address), Value(true)});
+    } else {
+      operation = &block.AppendNewInst(operations[index],
+                                       {Value(&image), Value(&address)});
+    }
+    operation->SetFlags(MemoryFlags{.index = 0u, .pc = 0x20u});
+    ImageResource root;
+    root.resource_class = operations[index] == ValueOpcode::ImageWrite
+                              ? ImageResourceClass::Storage
+                              : ImageResourceClass::Sampled;
+    root.numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float;
+    root.dimension = ImageDimension::Dim2D;
+    root.read = operations[index] != ValueOpcode::ImageWrite;
+    root.written = operations[index] == ValueOpcode::ImageWrite;
+    program.info.images = {root, root};
+    ResourceSpecialization specialization;
+    ResourceSpecialization::Image candidate;
+    candidate.numeric_class = root.numeric_class;
+    candidate.dimension = root.dimension;
+    candidate.indirect_root = 0u;
+    candidate.indirect_mapping_offset = 3u;
+    specialization.images.assign(4u, candidate);
+    specialization.images[1].indirect_root = ImageResource::NoIndirectImage;
+    specialization.images[2].dimension = ImageDimension::Dim2DArray;
+    specialization.images[3].shader_swizzle =
+        Libs::Graphics::DstSel(6, 5, 4, 7);
+    std::fprintf(stderr,
+                 "ResourceMaterializationTests: specializing indirect %s\n",
+                 names[index]);
+    ApplyResourceSpecialization(program, specialization);
+    Check(operation->GetOpcode() == operations[index] &&
+              operation->Flags<MemoryFlags>().index == 0u &&
+              program.memory_info[0].resource == 0u &&
+              image.Flags<uint32_t>() == 0u,
+          "supported indirect image instruction lost its root or memory "
+          "identity");
+    Check(program.info.images.size() == 4u &&
+              program.info.images[0].indirect_resources ==
+                  std::vector<uint32_t>{0u, 2u, 3u} &&
+              program.info.images[1].indirect_root ==
+                  ImageResource::NoIndirectImage &&
+              program.info.images[2].dimension == ImageDimension::Dim2DArray &&
+              program.info.images[3].shader_swizzle ==
+                  Libs::Graphics::DstSel(6, 5, 4, 7) &&
+              program.info.images[2].resource_class == root.resource_class &&
+              program.info.images[2].written == root.written,
+          "indirect image specialization lost candidate metadata or included "
+          "an unrelated root");
+  }
+}
+
 void TestMixedSamplerVariantsShareRuntimeDescriptor() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto program = MixedSamplerProgram();
@@ -564,7 +653,11 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-image-operations-only") == 0) {
+    TestSupportedIndirectImageOperationsSpecialize();
+    return 0;
+  }
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUniformVectorDescriptorRead();
@@ -573,6 +666,7 @@ int main() {
   TestWrittenDescriptorUsesStrictReaderOnce();
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
+  TestSupportedIndirectImageOperationsSpecialize();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;

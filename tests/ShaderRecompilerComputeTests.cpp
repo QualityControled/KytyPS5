@@ -14929,12 +14929,17 @@ public:
     }
   }
 
-  std::vector<u32> ReadImage(const char *shader_name, Image *image) {
-    const auto dword_count = static_cast<size_t>(image->width) *
-                             static_cast<size_t>(image->height) *
-                             image->layers * image->dwords_per_pixel;
+  std::vector<u32> ReadImage(const char *shader_name, Image *image,
+                             u32 mip = 0u) {
+    Require(shader_name, "readback", mip < image->mip_levels,
+            "image readback mip is out of bounds");
+    const auto width = MipExtent(image->width, mip);
+    const auto height = MipExtent(image->height, mip);
+    const auto dword_count = static_cast<size_t>(width) *
+                             static_cast<size_t>(height) * image->layers *
+                             image->dwords_per_pixel;
     auto staging = CreateHostBuffer(shader_name, dword_count * sizeof(u32),
-                                   vk::BufferUsageFlagBits::eTransferDst, {});
+                                    vk::BufferUsageFlagBits::eTransferDst, {});
 
     vk::CommandBuffer cmd = BeginCommands(shader_name, "readback");
     AddImageBarrier(
@@ -14946,11 +14951,11 @@ public:
     vk::BufferImageCopy copy{};
     copy.bufferOffset = 0;
     copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
-    copy.imageSubresource.mipLevel = 0;
+    copy.imageSubresource.mipLevel = mip;
     copy.imageSubresource.baseArrayLayer = 0;
     copy.imageSubresource.layerCount = image->layers;
-    copy.imageExtent.width = image->width;
-    copy.imageExtent.height = image->height;
+    copy.imageExtent.width = width;
+    copy.imageExtent.height = height;
     copy.imageExtent.depth = 1;
     cmd.copyImageToBuffer(image->image, vk::ImageLayout::eTransferSrcOptimal,
                           staging.buffer, 1, &copy);
@@ -15010,7 +15015,8 @@ public:
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
                 vk::Sampler sampler = nullptr,
-                std::span<const Image> sampled_resources = {}) {
+                std::span<const Image> sampled_resources = {},
+                std::span<const Image> storage_resources = {}) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto shader_data = compiled.packed_user_data;
@@ -15164,9 +15170,7 @@ public:
     std::vector<vk::DescriptorBufferInfo> buffer_infos;
     std::vector<vk::DescriptorImageInfo> sampled_infos;
     std::vector<vk::ImageView> sampled_mip_views;
-    std::vector<vk::DescriptorImageInfo> storage_infos;
-    std::vector<vk::DescriptorImageInfo> storage_uint_infos;
-    std::vector<vk::DescriptorImageInfo> storage_atomic_infos;
+    std::vector<std::vector<vk::DescriptorImageInfo>> storage_infos;
     std::vector<vk::DescriptorImageInfo> sampler_infos;
     Buffer flattened_buffer;
     Buffer user_data_buffer;
@@ -15287,35 +15291,31 @@ public:
       writes.push_back(write);
     }
     std::vector<const ShaderRecompiler::IR::DescriptorBinding *> sampled_bindings;
-    const ShaderRecompiler::IR::DescriptorBinding *storage = nullptr;
-    const ShaderRecompiler::IR::DescriptorBinding *storage_uint = nullptr;
-    const ShaderRecompiler::IR::DescriptorBinding *storage_atomic = nullptr;
+    std::vector<const ShaderRecompiler::IR::DescriptorBinding *>
+        storage_bindings;
     for (const auto &binding : layout.descriptors) {
       const auto resource_class =
           ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
       if (resource_class == ShaderRecompiler::IR::ImageResourceClass::None) {
         continue;
       }
-      const auto &image =
-          compiled.program.info.images.at(binding.resources.front());
       if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
         sampled_bindings.push_back(&binding);
-      } else if (image.atomic) {
-        storage_atomic = &binding;
-      } else if (image.numeric_class == Prospero::TextureNumericClass::Float) {
-        storage = &binding;
       } else {
-        storage_uint = &binding;
+        storage_bindings.push_back(&binding);
       }
     }
     size_t sampled_count = 0;
-    for (const auto *binding : sampled_bindings) sampled_count += binding->resources.size();
+    for (const auto *binding : sampled_bindings)
+      sampled_count += binding->resources.size();
     sampled_infos.reserve(sampled_count);
-    Require(test.name, "dispatch", sampled_resources.empty() ||
+    Require(test.name, "dispatch",
+            sampled_resources.empty() ||
                 sampled_resources.size() == compiled.program.info.images.size(),
             "sampled resources must match the logical images");
     for (const auto *sampled : sampled_bindings) {
-      Require(test.name, "dispatch", sampled_image != nullptr || !sampled_resources.empty(),
+      Require(test.name, "dispatch",
+              sampled_image != nullptr || !sampled_resources.empty(),
               "sampled image descriptor requested but no sampled image was "
               "provided");
       const auto first_info = sampled_infos.size();
@@ -15324,13 +15324,15 @@ public:
       for (u32 slot = 0; slot < sampled->resources.size(); slot++) {
         auto &info = sampled_infos[first_info + slot];
         const auto resource = sampled->resources[slot];
-        const auto *source_image = sampled_resources.empty() ? sampled_image
-                                                             : &sampled_resources[resource];
+        const auto *source_image = sampled_resources.empty()
+                                       ? sampled_image
+                                       : &sampled_resources[resource];
         info.imageView = source_image->view;
         info.imageLayout = source_image->layout;
         if (compiled.program.info.images[resource].mip_mode ==
             ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-          const auto mip = test.sampled_image_view_base_mip + mip_indices[resource]++;
+          const auto mip =
+              test.sampled_image_view_base_mip + mip_indices[resource]++;
           Require(test.name, "dispatch", mip < source_image->mip_levels,
                   "sampled mip descriptor exceeds the supplied image");
           vk::ImageViewCreateInfo view{};
@@ -15365,13 +15367,42 @@ public:
             return;
           }
           Require(
-              test.name, "dispatch", image != nullptr,
+              test.name, "dispatch",
+              image != nullptr || !storage_resources.empty(),
               "storage image descriptor requested but no matching image was "
               "provided");
           infos->resize(binding->resources.size());
-          for (auto &info : *infos) {
-            info.imageView = image->view;
-            info.imageLayout = image->layout;
+          std::vector<u32> mip_indices(compiled.program.info.images.size());
+          for (u32 slot = 0; slot < binding->resources.size(); ++slot) {
+            const auto resource = binding->resources[slot];
+            const auto *source_image = storage_resources.empty()
+                                           ? image
+                                           : &storage_resources[resource];
+            auto &info = (*infos)[slot];
+            info.imageView = source_image->view;
+            info.imageLayout = source_image->layout;
+            if (!storage_resources.empty() &&
+                compiled.program.info.images[resource].mip_mode ==
+                    ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+              const auto mip = mip_indices[resource]++;
+              Require(test.name, "dispatch", mip < source_image->mip_levels,
+                      "storage mip descriptor exceeds the supplied image");
+              vk::ImageViewCreateInfo view{};
+              view.image = source_image->image;
+              view.viewType =
+                  compiled.program.info.images[resource].dimension ==
+                          ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+                      ? vk::ImageViewType::e2DArray
+                      : vk::ImageViewType::e2D;
+              view.format = source_image->format;
+              view.subresourceRange = {vk::ImageAspectFlagBits::eColor, mip, 1,
+                                       0, source_image->layers};
+              RequireVk(
+                  test.name, "dispatch",
+                  m_device.createImageView(&view, nullptr, &info.imageView),
+                  "vkCreateImageView(storage mip)");
+              sampled_mip_views.push_back(info.imageView);
+            }
           }
           vk::WriteDescriptorSet write{};
           write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -15382,9 +15413,21 @@ public:
           write.pImageInfo = infos->data();
           writes.push_back(write);
         };
-    BindStorage(storage, storage_image, &storage_infos);
-    BindStorage(storage_uint, storage_image_uint, &storage_uint_infos);
-    BindStorage(storage_atomic, storage_image_uint, &storage_atomic_infos);
+    Require(test.name, "dispatch",
+            storage_resources.empty() ||
+                storage_resources.size() == compiled.program.info.images.size(),
+            "storage resources must match the logical images");
+    storage_infos.reserve(storage_bindings.size());
+    for (const auto *binding : storage_bindings) {
+      const auto &image =
+          compiled.program.info.images[binding->resources.front()];
+      BindStorage(binding,
+                  image.numeric_class == Prospero::TextureNumericClass::Float &&
+                          !image.atomic
+                      ? storage_image
+                      : storage_image_uint,
+                  &storage_infos.emplace_back());
+    }
     const auto *samplers = Binding(Kind::Samplers);
     if (samplers != nullptr) {
       Require(test.name, "dispatch", sampler != nullptr,
@@ -18033,6 +18076,9 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features12.shaderSampledImageArrayNonUniformIndexing == true,
             "nonuniform sampled image indexing is not supported");
+    Require("VulkanHarness", "dispatch",
+            available_features12.shaderStorageImageArrayNonUniformIndexing == true,
+            "nonuniform storage image indexing is not supported");
     Require("VulkanHarness", "dispatch", available_min_lod.minLod == true,
             "image view minimum LOD is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
@@ -33841,6 +33887,537 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+void CheckIndirectImageWrites(VulkanHarness &vulkan) {
+  constexpr const char *name = "IndirectImageWrites";
+  using namespace ShaderRecompiler::IR;
+
+  Program program{};
+  program.stage = ShaderType::Compute;
+  program.wave_size = 32;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.shader_info_complete = true;
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+  program.block_info.push_back({.id = 0});
+  auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
+  auto &key =
+      block->AppendNewInst(ValueOpcode::IMul32, {Value(&lane), Value(4u)});
+  auto &image =
+      block->AppendNewInst(ValueOpcode::GetImageResource,
+                           {Value(&key), Value(0u), Value(0u), Value(0u),
+                            Value(0u), Value(0u), Value(0u), Value(0u)});
+  image.SetFlags<u32>(0u);
+  auto &x = block->AppendNewInst(ValueOpcode::ShiftRightLogical32,
+                                 {Value(&lane), Value(1u)});
+  auto &address = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(&x), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u)});
+  std::array<Value, 4> data;
+  for (u32 component = 0; component < data.size(); ++component) {
+    auto &value = block->AppendNewInst(
+        ValueOpcode::IAdd32,
+        {Value(&lane), Value(0x3f800000u + component * 0x00800000u)});
+    data[component] = Value(&value);
+  }
+  auto &texel = block->AppendNewInst(ValueOpcode::CompositeConstructU32x4,
+                                     {data[0], data[1], data[2], data[3]});
+  auto &parity = block->AppendNewInst(ValueOpcode::BitwiseAnd32,
+                                      {Value(&lane), Value(1u)});
+  auto &enabled =
+      block->AppendNewInst(ValueOpcode::IEqual32, {Value(&parity), Value(0u)});
+  MemoryInfo memory{};
+  memory.kind = ResourceKind::Image;
+  memory.dmask = 0xfu;
+  memory.data_dwords = memory.component_count = 4u;
+  memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  memory.image_address_components = 2u;
+  program.memory_info.push_back(memory);
+  auto &write = block->AppendNewInst(
+      ValueOpcode::ImageWrite,
+      {Value(&image), Value(&address), Value(&texel), Value(&enabled)});
+  write.SetFlags(MemoryFlags{0u, 0x20u});
+  program.descriptor_sources.resize(1);
+  program.descriptor_sources[0].dword_count = 8u;
+  program.descriptor_sources[0].indirect_descriptor =
+      DescriptorSource::IndirectDescriptor{.table_source = 0u,
+                                           .table_stride = 32u};
+
+  ImageResource root{};
+  root.resource_class = ImageResourceClass::Storage;
+  root.numeric_class = Prospero::TextureNumericClass::Float;
+  root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  root.written = true;
+  root.indirect_root = 0u;
+  root.indirect_mapping_offset = 3u;
+  root.indirect_resources = {0u, 2u, 3u};
+  auto candidate = root;
+  candidate.indirect_resources.clear();
+  program.info.images.assign(4u, candidate);
+  program.info.images[0] = root;
+  program.info.images[1].indirect_root = ImageResource::NoIndirectImage;
+  // Candidate-specific inverse swizzles must be applied after selecting it.
+  program.info.images[3].shader_swizzle = DstSel(6, 5, 4, 7);
+
+  CompiledShader compiled;
+  compiled.program = std::move(program);
+  constexpr u32 width = 64u, height = 2u, sentinel = 0x3e800000u;
+  constexpr std::array dense_ordinals{0u, 1u, 2u, 1u, 2u, 0u, 1u, 2u};
+  constexpr std::array sparse_keys{0u, 8u, 16u, 24u};
+  constexpr std::array sparse_ordinals{0u, 1u, 2u, 1u};
+  for (const u32 mode : {0u, 1u, 2u}) {
+    // Mode one checks candidate-specific mip selection. Mode two checks that a
+    // dynamic single-mip candidate receives no writes at the out-of-range LOD.
+    const bool dynamic = mode != 0u;
+    const auto selected_mip = dynamic ? 1u : 0u;
+    address.SetArg(2u, Value(selected_mip));
+    compiled.program.memory_info[0].image_has_mip = dynamic;
+    compiled.program.memory_info[0].image_address_components =
+        dynamic ? 3u : 2u;
+    for (const bool integer : {false, true}) {
+      for (const bool homogeneous : {false, true}) {
+        const auto layers = homogeneous ? std::array{1u, 1u, 1u, 1u}
+                                        : std::array{1u, 1u, 2u, 1u};
+        for (u32 resource = 0; resource < layers.size(); ++resource) {
+          auto &info = compiled.program.info.images[resource];
+          info.numeric_class = integer ? Prospero::TextureNumericClass::Uint
+                                       : Prospero::TextureNumericClass::Float;
+          info.dimension =
+              layers[resource] == 1u
+                  ? ShaderRecompiler::Decoder::ImageDimension::Dim2D
+                  : ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+          info.mip_mode = dynamic ? ImageMipMode::Dynamic : ImageMipMode::None;
+          info.mip_count = mode == 1u ? (resource == 2u ? 3u : 2u) : 1u;
+          info.shader_swizzle = !homogeneous && resource == 3u
+                                    ? DstSel(6, 5, 4, 7)
+                                    : ShaderImageIdentitySwizzle;
+        }
+        for (const bool sparse : {false, true}) {
+          compiled.program.info.images[0].indirect_search_iterations =
+              sparse ? std::bit_width(u32(sparse_keys.size())) : 0u;
+          compiled.program.binding_layout_complete = false;
+          AllocateBindings(compiled.program);
+          compiled.packed_user_data.resize(
+              compiled.program.bindings.ShaderDataDwords());
+          compiled.resources.flattened_srt.assign(root.indirect_mapping_offset,
+                                                  0xdeadbeefu);
+          compiled.resources.flattened_srt.push_back(
+              sparse ? sparse_keys.size() : dense_ordinals.size());
+          if (sparse) {
+            for (u32 index = 0; index < sparse_keys.size(); ++index) {
+              compiled.resources.flattened_srt.push_back(sparse_keys[index]);
+              compiled.resources.flattened_srt.push_back(
+                  sparse_ordinals[index]);
+            }
+          } else {
+            compiled.resources.flattened_srt.insert(
+                compiled.resources.flattened_srt.end(), dense_ordinals.begin(),
+                dense_ordinals.end());
+          }
+          for (const u32 wave_size : {32u, 64u}) {
+            TestCase test;
+            test.name = sparse ? "SparseIndirectImageWrites"
+                               : "DenseIndirectImageWrites";
+            ShaderComputeInputInfo compute{};
+            compute.wave_size = wave_size;
+            compute.host_subgroup_size = vulkan.SubgroupSize();
+            compute.threads_num[0] = wave_size;
+            compute.threads_num[1] = compute.threads_num[2] = 1u;
+            compiled.program.wave_size = wave_size;
+            compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(
+                compiled.program, {.compute = &compute});
+            ValidateSpirv(test.name, compiled.spirv);
+            if (homogeneous && mode != 1u) {
+              spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+              std::string text;
+              Require(test.name, "native storage image array disassembly",
+                      tools.Disassemble(compiled.spirv, &text),
+                      "failed to disassemble indirect storage arrays");
+              const auto halves =
+                  wave_size > compute.host_subgroup_size ? 2u : 1u;
+              Require(
+                  test.name, "native storage image array",
+                  CountText(text, "OpImageWrite") == halves &&
+                      text.find("StorageImageArrayNonUniformIndexing") !=
+                          std::string::npos,
+                  "homogeneous writes expanded into per-candidate operations");
+              std::vector<u32> nonuniform;
+              std::vector<u32> image_operands;
+              for (size_t offset = 5; offset < compiled.spirv.size();) {
+                const auto words =
+                    std::span<const u32>(compiled.spirv)
+                        .subspan(offset, compiled.spirv[offset] >> 16u);
+                const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+                if (opcode == spv::OpDecorate &&
+                    words[2] == spv::DecorationNonUniform)
+                  nonuniform.push_back(words[1]);
+                if (opcode == spv::OpImageWrite)
+                  image_operands.push_back(words[1]);
+                offset += words.size();
+              }
+              Require(
+                  test.name, "nonuniform write image operands",
+                  std::ranges::all_of(image_operands,
+                                      [&](u32 operand) {
+                                        return std::ranges::find(nonuniform,
+                                                                 operand) !=
+                                               nonuniform.end();
+                                      }),
+                  "a storage image operand lacks its nonuniform decoration");
+            }
+            std::vector<VulkanHarness::Image> textures;
+            std::vector<std::vector<std::vector<u32>>> expected;
+            for (u32 resource = 0; resource < layers.size(); ++resource) {
+              auto &initial = expected.emplace_back();
+              for (u32 mip = 0;
+                   mip < compiled.program.info.images[resource].mip_count;
+                   ++mip) {
+                initial.emplace_back(
+                    VulkanHarness::ImageMipDwordCount(width, height, 4u, mip,
+                                                      layers[resource]),
+                    sentinel);
+              }
+              textures.push_back(vulkan.CreateImageMips(
+                  test.name, width, height,
+                  integer ? vk::Format::eR32G32B32A32Uint
+                          : vk::Format::eR32G32B32A32Sfloat,
+                  vk::ImageUsageFlagBits::eStorage, initial, 4u,
+                  vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+                  layers[resource] == 1u ? vk::ImageViewType::e2D
+                                         : vk::ImageViewType::e2DArray,
+                  layers[resource]));
+            }
+            for (u32 lane_index = 0; lane_index < wave_size; lane_index += 2u) {
+              u32 ordinal = 0u;
+              if (sparse) {
+                for (u32 index = 0; index < sparse_keys.size(); ++index) {
+                  if (lane_index * 4u == sparse_keys[index])
+                    ordinal = sparse_ordinals[index];
+                }
+              } else if (lane_index < dense_ordinals.size()) {
+                ordinal = dense_ordinals[lane_index];
+              }
+              const auto resource = root.indirect_resources[ordinal];
+              if (selected_mip >= expected[resource].size())
+                continue;
+              for (u32 component = 0; component < 4u; ++component) {
+                const auto source_component =
+                    !homogeneous && resource == 3u && component != 3u
+                        ? 2u - component
+                        : component;
+                expected[resource][selected_mip][(lane_index / 2u) * 4u +
+                                                 component] =
+                    0x3f800000u + source_component * 0x00800000u + lane_index;
+              }
+            }
+            auto buffer = vulkan.CreateStorageBuffer(test.name, {0u}, 1u);
+            vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr,
+                            nullptr, nullptr, {}, textures);
+            vulkan.DestroyBuffer(&buffer);
+            for (u32 resource = 0; resource < textures.size(); ++resource) {
+              for (u32 mip = 0; mip < expected[resource].size(); ++mip) {
+                const auto actual =
+                    vulkan.ReadImage(test.name, &textures[resource], mip);
+                CompareWords(test,
+                             "selected candidate, inverse swizzle, predicate, "
+                             "fallback and unrelated image/layer preservation",
+                             actual, expected[resource][mip]);
+              }
+              vulkan.DestroyImage(&textures[resource]);
+            }
+            std::printf("PASS %s %s %s mode%u wave%u\n", test.name,
+                        integer ? "uint" : "float",
+                        homogeneous ? "native" : "mixed", mode, wave_size);
+          }
+        }
+      }
+    }
+  }
+}
+
+void CheckIndirectImageQueriesAndReads(VulkanHarness &vulkan) {
+  constexpr const char *name = "IndirectImageQueriesAndReads";
+  using namespace ShaderRecompiler::IR;
+
+  Program program{};
+  program.stage = ShaderType::Compute;
+  program.wave_size = 32;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.shader_info_complete = true;
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+  program.block_info.push_back({.id = 0});
+
+  auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
+  auto &key =
+      block->AppendNewInst(ValueOpcode::IMul32, {Value(&lane), Value(4u)});
+  auto &image =
+      block->AppendNewInst(ValueOpcode::GetImageResource,
+                           {Value(&key), Value(0u), Value(0u), Value(0u),
+                            Value(0u), Value(0u), Value(0u), Value(0u)});
+  image.SetFlags<u32>(0u);
+  auto &query_address = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(1u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u)});
+  MemoryInfo query_memory{};
+  query_memory.kind = ResourceKind::Image;
+  query_memory.image_dimension =
+      ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  query_memory.image_address_components = 1u;
+  program.memory_info.push_back(query_memory);
+  auto &query = block->AppendNewInst(ValueOpcode::ImageQueryDimensions,
+                                     {Value(&image), Value(&query_address)});
+  query.SetFlags(MemoryFlags{0u, 0x20u});
+
+  // The third operand is the instruction's mip, not an array candidate's layer.
+  auto &read_address = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(0u), Value(0u), Value(1u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u)});
+  auto &parity = block->AppendNewInst(ValueOpcode::BitwiseAnd32,
+                                      {Value(&lane), Value(1u)});
+  auto &enabled =
+      block->AppendNewInst(ValueOpcode::IEqual32, {Value(&parity), Value(0u)});
+  MemoryInfo read_memory{};
+  read_memory.kind = ResourceKind::Image;
+  read_memory.dmask = 0xfu;
+  read_memory.data_dwords = read_memory.component_count = 4u;
+  read_memory.image_dimension =
+      ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  read_memory.image_address_components = 3u;
+  read_memory.image_has_mip = true;
+  program.memory_info.push_back(read_memory);
+  auto &read = block->AppendNewInst(
+      ValueOpcode::ImageRead,
+      {Value(&image), Value(&read_address), Value(&enabled)});
+  read.SetFlags(MemoryFlags{1u, 0x24u});
+
+  auto &output_offset =
+      block->AppendNewInst(ValueOpcode::IMul32, {Value(&lane), Value(32u)});
+  auto &output =
+      block->AppendNewInst(ValueOpcode::GetBufferResource,
+                           {Value(0u), Value(0u), Value(0u), Value(0u)});
+  output.SetFlags<u32>(0u);
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .offen = true});
+  for (u32 word = 0; word < 8u; ++word) {
+    auto &value = block->AppendNewInst(
+        ValueOpcode::CompositeExtractU32x4,
+        {Value(word < 4u ? &query : &read), Value(word % 4u)});
+    auto &store =
+        block->AppendNewInst(ValueOpcode::StoreBufferU32,
+                             {Value(&output), Value(0u), Value(&output_offset),
+                              Value(word * 4u), Value(&value), Value(true)});
+    store.SetFlags(MemoryFlags{2u, 0x28u + word * 4u});
+  }
+  program.info.buffers.push_back({.packed_stride = 1u, .written = true});
+  program.descriptor_sources.resize(1);
+  program.descriptor_sources[0].dword_count = 8u;
+  program.descriptor_sources[0].indirect_descriptor =
+      DescriptorSource::IndirectDescriptor{.table_source = 0u,
+                                           .table_stride = 32u};
+
+  ImageResource root{};
+  root.resource_class = ImageResourceClass::Sampled;
+  root.numeric_class = Prospero::TextureNumericClass::Float;
+  root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  root.read = true;
+  root.mip_count = 1u;
+  root.indirect_root = 0u;
+  root.indirect_mapping_offset = 3u;
+  // An unrelated native root separates this root from its materialized
+  // children.
+  root.indirect_resources = {0u, 2u, 3u};
+  auto candidate = root;
+  candidate.indirect_resources.clear();
+  program.info.images.assign(4u, candidate);
+  program.info.images[0] = root;
+  program.info.images[1].indirect_root = ImageResource::NoIndirectImage;
+  program.info.images[2].dimension =
+      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+
+  CompiledShader compiled;
+  compiled.program = std::move(program);
+  constexpr std::array widths{4u, 4u, 8u, 16u};
+  constexpr std::array heights{4u, 4u, 4u, 8u};
+  for (const bool homogeneous : {false, true}) {
+    const auto layers =
+        homogeneous ? std::array{1u, 1u, 1u, 1u} : std::array{1u, 1u, 2u, 1u};
+    const auto mip_counts =
+        homogeneous ? std::array{1u, 1u, 1u, 1u} : std::array{2u, 2u, 3u, 4u};
+    const auto mip = homogeneous ? 0u : 1u;
+    query_address.SetArg(0u, Value(mip));
+    read_address.SetArg(2u, Value(mip));
+    for (u32 resource = 0; resource < widths.size(); ++resource) {
+      compiled.program.info.images[resource].dimension =
+          layers[resource] == 1u
+              ? ShaderRecompiler::Decoder::ImageDimension::Dim2D
+              : ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+      // Sampled mip_count budgets native descriptors, rather than the levels
+      // exposed by the Vulkan view. One full-chain descriptor covers each image.
+      compiled.program.info.images[resource].mip_count = 1u;
+    }
+    std::vector<VulkanHarness::Image> textures;
+    for (u32 resource = 0; resource < widths.size(); ++resource) {
+      std::vector<std::vector<u32>> mips;
+      for (u32 mip = 0; mip < mip_counts[resource]; ++mip) {
+        const auto texels_per_layer = std::max(widths[resource] >> mip, 1u) *
+                                      std::max(heights[resource] >> mip, 1u);
+        auto &pixels =
+            mips.emplace_back(texels_per_layer * layers[resource] * 4u);
+        for (u32 layer = 0; layer < layers[resource]; ++layer) {
+          for (u32 texel = 0; texel < texels_per_layer; ++texel) {
+            for (u32 component = 0; component < 4u; ++component) {
+              pixels[(layer * texels_per_layer + texel) * 4u + component] =
+                  std::bit_cast<u32>(float(1000u * layer + 100u * resource +
+                                           10u * mip + component + 1u));
+            }
+          }
+        }
+      }
+      textures.push_back(vulkan.CreateImageMips(
+          name, widths[resource], heights[resource],
+          vk::Format::eR32G32B32A32Sfloat, vk::ImageUsageFlagBits::eSampled,
+          mips, 4u, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
+          layers[resource] == 1u ? vk::ImageViewType::e2D
+                                 : vk::ImageViewType::e2DArray,
+          layers[resource]));
+    }
+
+    constexpr std::array dense_ordinals{0u, 1u, 2u, 1u, 2u, 0u, 1u, 2u};
+    constexpr std::array sparse_keys{0u, 8u, 16u, 24u};
+    constexpr std::array sparse_ordinals{0u, 1u, 2u, 1u};
+    for (const bool sparse : {false, true}) {
+      compiled.program.info.images[0].indirect_search_iterations =
+          sparse ? std::bit_width(u32(sparse_keys.size())) : 0u;
+      compiled.program.binding_layout_complete = false;
+      AllocateBindings(compiled.program);
+      compiled.packed_user_data.resize(
+          compiled.program.bindings.ShaderDataDwords());
+      // A nonzero offset detects mapping readers that accidentally assume slot
+      // zero.
+      compiled.resources.flattened_srt.assign(root.indirect_mapping_offset,
+                                              0xdeadbeefu);
+      compiled.resources.flattened_srt.push_back(
+          sparse ? sparse_keys.size() : dense_ordinals.size());
+      if (sparse) {
+        for (u32 index = 0; index < sparse_keys.size(); ++index) {
+          compiled.resources.flattened_srt.push_back(sparse_keys[index]);
+          compiled.resources.flattened_srt.push_back(sparse_ordinals[index]);
+        }
+      } else {
+        compiled.resources.flattened_srt.insert(
+            compiled.resources.flattened_srt.end(), dense_ordinals.begin(),
+            dense_ordinals.end());
+      }
+      for (const u32 wave_size : {32u, 64u}) {
+        TestCase test;
+        test.name = sparse ? "SparseIndirectImageQueriesReads"
+                           : "DenseIndirectImageQueriesReads";
+        ShaderComputeInputInfo compute{};
+        compute.wave_size = wave_size;
+        compute.host_subgroup_size = vulkan.SubgroupSize();
+        compute.threads_num[0] = wave_size;
+        compute.threads_num[1] = compute.threads_num[2] = 1u;
+        compiled.program.wave_size = wave_size;
+        compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(
+            compiled.program, {.compute = &compute});
+        ValidateSpirv(test.name, compiled.spirv);
+        if (homogeneous) {
+          spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+          std::string text;
+          Require(test.name, "native image array disassembly",
+                  tools.Disassemble(compiled.spirv, &text),
+                  "failed to disassemble indirect query and read arrays");
+          const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+          Require(test.name, "native query and read arrays",
+                  CountText(text, "OpImageFetch") == halves &&
+                      CountText(text, "OpImageQuerySizeLod") == halves &&
+                      CountText(text, "OpImageQueryLevels") == halves &&
+                      text.find("SampledImageArrayNonUniformIndexing") !=
+                          std::string::npos,
+                  "homogeneous query or read expanded into per-candidate image "
+                  "operations");
+          std::vector<u32> nonuniform;
+          std::vector<u32> image_operands;
+          for (size_t offset = 5; offset < compiled.spirv.size();) {
+            const auto words =
+                std::span<const u32>(compiled.spirv)
+                    .subspan(offset, compiled.spirv[offset] >> 16u);
+            const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+            if (opcode == spv::OpDecorate &&
+                words[2] == spv::DecorationNonUniform)
+              nonuniform.push_back(words[1]);
+            if (opcode == spv::OpImageFetch ||
+                opcode == spv::OpImageQuerySizeLod ||
+                opcode == spv::OpImageQueryLevels)
+              image_operands.push_back(words[3]);
+            offset += words.size();
+          }
+          Require(test.name, "nonuniform query and read image operands",
+                  std::ranges::all_of(image_operands,
+                                      [&](u32 operand) {
+                                        return std::ranges::find(nonuniform,
+                                                                 operand) !=
+                                               nonuniform.end();
+                                      }),
+                  "an image query or fetch operand lacks its nonuniform "
+                  "decoration");
+        }
+        test.initial.assign(wave_size * 8u, 0xdeadbeefu);
+        test.expected.assign(test.initial.size(), 0u);
+        for (u32 lane_index = 0; lane_index < wave_size; ++lane_index) {
+          u32 ordinal = 0u;
+          if (sparse) {
+            for (u32 index = 0; index < sparse_keys.size(); ++index) {
+              if (lane_index * 4u == sparse_keys[index])
+                ordinal = sparse_ordinals[index];
+            }
+          } else if (lane_index < dense_ordinals.size()) {
+            ordinal = dense_ordinals[lane_index];
+          }
+          const auto resource = root.indirect_resources[ordinal];
+          test.expected[lane_index * 8u] = widths[resource] >> mip;
+          test.expected[lane_index * 8u + 1u] = heights[resource] >> mip;
+          test.expected[lane_index * 8u + 2u] =
+              layers[resource] == 1u ? 0u : layers[resource];
+          test.expected[lane_index * 8u + 3u] = mip_counts[resource];
+          if ((lane_index & 1u) == 0u) {
+            for (u32 component = 0; component < 4u; ++component) {
+              test.expected[lane_index * 8u + 4u + component] =
+                  std::bit_cast<u32>(
+                      float(100u * resource + 10u * mip + component + 1u));
+            }
+          }
+        }
+        auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial,
+                                                 test.initial.size());
+        vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, textures);
+        const auto actual =
+            vulkan.ReadBuffer(test.name, buffer, test.expected.size());
+        vulkan.DestroyBuffer(&buffer);
+        CompareWords(
+            test,
+            "candidate dimensions, mip, layer, condition and unmapped keys",
+            test.expected, actual);
+        std::printf("[compute] %-32s %s wave%u ok\n", test.name,
+                    homogeneous ? "native array" : "mixed dimensions/mips",
+                    wave_size);
+      }
+    }
+    for (auto &texture : textures)
+      vulkan.DestroyImage(&texture);
+  }
+}
+
 void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
@@ -41621,10 +42198,23 @@ int main(int argc, char **argv) {
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-image-write-only") == 0) {
+    VulkanHarness vulkan;
+    CheckIndirectImageWrites(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-image-memory-only") == 0) {
+    VulkanHarness vulkan;
+    CheckIndirectImageWrites(vulkan);
+    CheckIndirectImageQueriesAndReads(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
     CheckIndirectImageKeySwitch(vulkan);
+    CheckIndirectImageWrites(vulkan);
+    CheckIndirectImageQueriesAndReads(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
   }
@@ -41787,6 +42377,8 @@ int main(int argc, char **argv) {
   CheckRuntimeBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
+  CheckIndirectImageWrites(vulkan);
+  CheckIndirectImageQueriesAndReads(vulkan);
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
