@@ -693,7 +693,118 @@ void TestCapturedCallerFromFile(const char* path) {
 	                                     [](const auto& instruction) { return instruction.pc == 0xae4u; });
 	Check(decoded_call != program.instructions.end() && decoded_call->opcode == Decoder::Opcode::S_SWAPPC_B64,
 	      "captured call lost its decoded SWAPPC identity");
+	const auto direct = Diagnostics::CaptureDirectUserLoads(true, program, user_data, nullptr);
+	for (const auto expected: std::array<std::pair<uint32_t, uint32_t>, 2>{{{0xa4u, 16u}, {0x610u, 2u}}}) {
+		const auto source = std::ranges::find(direct.loads, expected.first,
+		                                     &Diagnostics::DirectUserLoadSnapshot::pc);
+		Check(source != direct.loads.end() && source->dword_count == expected.second &&
+		          source->rejection == "memory reader unavailable" && source->words.empty(),
+		      "actual pre-call direct source was rejected as post-call or guessed without reader");
+	}
 	std::puts("ShaderCallCaptureTests: full captured caller origin passed (no guest memory reads)");
+}
+
+void TestDirectUserLoadSnapshots() {
+	Fixture fixture;
+	fixture.program.instructions.clear();
+	fixture.Append(0xa4u, {0xf4101100u, 0xfa000198u}); // s68..83, two image sharps
+	fixture.Append(0x610u, {0xf4040400u, 0xfa000150u}); // s16..17, record affine constants
+	const uint64_t base = uint64_t {fixture.user_data[0]} | (uint64_t {fixture.user_data[1]} << 32u);
+	Memory memory;
+	std::vector<uint32_t> sharp_words(16u);
+	for (uint32_t i = 0; i < sharp_words.size(); ++i) sharp_words[i] = 0x100u + i;
+	memory.Add(base + 408u, sharp_words);
+	memory.Add(base + 336u, {3u, 1u});
+	const auto capture = Diagnostics::CaptureDirectUserLoads(true, fixture.program,
+	    fixture.user_data, Memory::Read, &memory);
+	Check(capture.loads.size() == 2u && !capture.limit_reached && capture.requested_bytes == 72u,
+	      "direct loads have incorrect bounded size");
+	Check(capture.loads[0].words == sharp_words && capture.loads[0].destination_sgpr == 68u &&
+	          capture.loads[0].address == base + 408u && capture.loads[0].rejection.empty(),
+	      "actual X16 image source was not captured exactly");
+	Check(capture.loads[1].words == std::vector<uint32_t>({3u, 1u}) &&
+	          capture.loads[1].destination_sgpr == 16u && capture.loads[1].address == base + 336u,
+	      "actual affine record constants were not captured exactly");
+	const auto reads = memory.requests.size();
+	Check(Diagnostics::CaptureDirectUserLoads(false, fixture.program, fixture.user_data,
+	    Memory::Read, &memory).loads.empty() && memory.requests.size() == reads,
+	    "disabled direct capture touched guest memory");
+	fixture.user_data[0] |= 3u;
+	fixture.user_data[1] |= 0xabcd0000u;
+	const auto tagged = Diagnostics::CaptureDirectUserLoads(true, fixture.program,
+	    fixture.user_data, Memory::Read, &memory);
+	Check(tagged.loads[0].words == sharp_words && tagged.loads[0].address == base + 408u,
+	      "direct capture did not apply native tagged/unaligned pointer arithmetic");
+	std::puts("ShaderCallCaptureTests: direct user snapshots passed");
+}
+
+void TestDirectUserLoadRejectionAndBounds() {
+	Fixture fixture;
+	fixture.program.instructions.clear();
+	fixture.Append(0xa4u, {0xf4101100u, 0xfa000198u});
+	Memory memory;
+	memory.scribble_failed_read = true;
+	auto capture = Diagnostics::CaptureDirectUserLoads(true, fixture.program,
+	    fixture.user_data, Memory::Read, &memory);
+	Check(capture.loads.size() == 1u && capture.loads[0].read_failed &&
+	          capture.loads[0].words.empty(), "failed direct read leaked scribbled bytes");
+	fixture.Append(0x100u, {0xbe800380u}); // s0 = 0, modifies initial base
+	memory.requests.clear();
+	capture = Diagnostics::CaptureDirectUserLoads(true, fixture.program,
+	    fixture.user_data, Memory::Read, &memory);
+	Check(!capture.loads[0].rejection.empty() && memory.requests.empty(),
+	      "modified initial user pointer was read");
+	fixture.program.instructions.pop_back();
+	fixture.program.instructions[0].src1.kind = Decoder::OperandKind::Sgpr;
+	fixture.program.instructions[0].src1.reg = 3u;
+	capture = Diagnostics::CaptureDirectUserLoads(true, fixture.program,
+	    fixture.user_data, Memory::Read, &memory);
+	Check(!capture.loads[0].rejection.empty() && memory.requests.empty(),
+	      "dynamic-offset direct load was read");
+	fixture.program.instructions[0].src1.kind = Decoder::OperandKind::Null;
+	fixture.program.instructions[0].offset = 0u;
+	fixture.user_data[0] = 0xffffffe0u;
+	fixture.user_data[1] = 0xffffu;
+	capture = Diagnostics::CaptureDirectUserLoads(true, fixture.program,
+	    fixture.user_data, Memory::Read, &memory);
+	Check(!capture.loads[0].rejection.empty() && memory.requests.empty(),
+	      "X16 load crossing 48-bit range was read");
+	fixture.user_data[0] = 0x2000u;
+	fixture.user_data[1] = 0u;
+	fixture.program.instructions[0].offset = 0xffffffffu;
+	memory.Add(0x1ffcu, std::vector<uint32_t>(16u, 7u));
+	capture = Diagnostics::CaptureDirectUserLoads(true, fixture.program,
+	    fixture.user_data, Memory::Read, &memory);
+	Check(capture.loads[0].address == 0x1ffcu && capture.loads[0].words.size() == 16u,
+	      "negative direct offset was not aligned correctly");
+	fixture.program.instructions.resize(Diagnostics::MaxDirectUserLoads + 1u,
+	                                     fixture.program.instructions.front());
+	memory.requests.clear();
+	capture = Diagnostics::CaptureDirectUserLoads(true, fixture.program,
+	    fixture.user_data, Memory::Read, &memory);
+	Check(capture.limit_reached && capture.loads.size() == Diagnostics::MaxDirectUserLoads &&
+	          capture.requested_bytes == Diagnostics::MaxDirectUserLoads * 64u &&
+	          memory.requests.size() == Diagnostics::MaxDirectUserLoads,
+	      "direct capture exceeded its attempt or byte bound");
+	Fixture after_call;
+	after_call.program.instructions.clear();
+	after_call.Append(0xa4u, {0xf4101100u, 0xfa000198u});
+	after_call.Append(0xae4u, {0xbe8e210eu});
+	after_call.Append(0xb00u, {0xf4101100u, 0xfa000198u});
+	memory.requests.clear();
+	capture = Diagnostics::CaptureDirectUserLoads(true, after_call.program,
+	    after_call.user_data, Memory::Read, &memory);
+	Check(capture.loads.size() == 2u && capture.loads[0].rejection.empty() &&
+	          !capture.loads[1].rejection.empty() && memory.requests.size() == 1u,
+	      "load after external return was incorrectly traced to initialized user pointer");
+	after_call.Append(0xb08u, {0xbf820000u});
+	after_call.program.instructions.back().branch_target = 0xa4u;
+	memory.requests.clear();
+	capture = Diagnostics::CaptureDirectUserLoads(true, after_call.program,
+	    after_call.user_data, Memory::Read, &memory);
+	Check(!capture.loads[0].rejection.empty() && memory.requests.empty(),
+	      "call-return loopback to earlier user load bypassed clobber rejection");
+	std::puts("ShaderCallCaptureTests: direct user rejection/bounds passed");
 }
 
 } // namespace
@@ -703,6 +814,8 @@ int main(int argc, char** argv) {
 		Check(argc == 1 || (argc == 3 && std::string_view(argv[1]) == "--trace-gt7-file"),
 		      "usage: ShaderCallCaptureTests [--trace-gt7-file captured-native-shader.bin]");
 		TestActualAliasedTraceAndUnchangedDecoder();
+		TestDirectUserLoadSnapshots();
+		TestDirectUserLoadRejectionAndBounds();
 		TestDisabledCaptureMakesNoReads();
 		TestInitialUserRegisterBaseAndNullHandoff();
 		TestFullAddressDescriptorAndPartialTargetPrefix();

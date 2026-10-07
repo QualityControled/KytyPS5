@@ -444,7 +444,7 @@ void DefineInputs(EmitterState& state) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
-	if (state.lane_count == 2) {
+	if (state.lane_count == 2 || state.program.info.uses_external_call_probe) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
 			    return input.kind == IR::StageInputKind::GlobalInvocationId;
@@ -527,7 +527,7 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.requirements.subgroup_local_invocation_id) {
+	if (state.requirements.subgroup_local_invocation_id || state.program.info.uses_external_call_probe) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -536,6 +536,19 @@ void DefineInputs(EmitterState& state) {
 		if (state.program.stage == ShaderType::Pixel) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
+	}
+	if (state.program.info.uses_external_call_probe) {
+		state.probe_subgroup_id_variable = DefineInterfaceVariable(
+		    state, TypeU32(state), spv::StorageClassInput, "probe_SubgroupId");
+		state.builder.AddAnnotation(spv::OpDecorate, state.probe_subgroup_id_variable,
+		                            spv::DecorationBuiltIn, spv::BuiltInSubgroupId);
+		state.probe_subgroup_size_variable = DefineInterfaceVariable(
+		    state, TypeU32(state), spv::StorageClassInput, "probe_SubgroupSize");
+		state.builder.AddAnnotation(spv::OpDecorate, state.probe_subgroup_size_variable,
+		                            spv::DecorationBuiltIn, spv::BuiltInSubgroupSize);
+		state.probe_layout_bad_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassWorkgroup, TypeU32(state)), spv::StorageClassWorkgroup);
+		state.builder.AddName(state.probe_layout_bad_variable, "probe_layout_bad");
 	}
 }
 
@@ -722,8 +735,12 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_barrier ||
 	    state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
-	    state.requirements.subgroup_local_invocation_id) {
+	    state.requirements.subgroup_local_invocation_id || state.program.info.uses_external_call_probe) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	}
+	if (state.program.info.uses_external_call_probe) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);

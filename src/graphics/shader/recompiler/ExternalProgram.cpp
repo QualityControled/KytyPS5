@@ -303,4 +303,49 @@ LinkedExternalProgram LinkExternalProgram(const Decoder::Program&    caller,
 	}
 	return result;
 }
+LinkedExternalProgram BuildExternalCallProbe(const Decoder::Program& caller,
+                                             const ExternalLibraryPlan& library) {
+	LinkedExternalProgram result;
+	try {
+		if (!library.complete || library.call_sites.empty())
+			Fail("external probe requires a complete call-table plan");
+		if (caller.code.size() > UINT32_MAX / 4u)
+			Fail("probe caller exceeds the internal PC range");
+		result.code.assign(caller.code.begin(), caller.code.end());
+		result.program.instructions = caller.instructions;
+		std::set<uint32_t> call_pcs;
+		for (const auto& site: library.call_sites) {
+			if (!call_pcs.insert(site.caller_pc).second)
+				Fail("duplicate external probe call site");
+			const auto call = std::ranges::find(caller.instructions, site.caller_pc, &Instruction::pc);
+			if (call == caller.instructions.end() || call->opcode != Opcode::S_SWAPPC_B64 ||
+			    !Pair(call->src0) || !Pair(call->dst) || call->src0.reg != site.target_sgpr ||
+			    call->dst.reg != site.return_sgpr)
+				Fail("external probe does not match the actual SWAPPC register pairs");
+			const auto load = std::ranges::find(caller.instructions, site.record_load_pc, &Instruction::pc);
+			if (load == caller.instructions.end() || load->opcode != Opcode::S_BUFFER_LOAD_DWORDX4 ||
+			    load->dst.kind != Decoder::OperandKind::Sgpr || load->dst.reg != site.record_sgpr ||
+			    site.auxiliary_sgpr > 104u || site.context_domain == UINT32_MAX ||
+			    site.candidate_addresses.empty() || site.records.empty())
+				Fail("external probe has no proved record load, auxiliary pair, or complete domain");
+			result.transfers.push_back({
+			    .pc = site.caller_pc, .target_sgpr = site.target_sgpr,
+			    .return_sgpr = site.return_sgpr,
+			    .guest_pc = Add(library.caller_address, site.caller_pc), .call = true,
+			    .probe = true, .record_load_pc = site.record_load_pc,
+			    .auxiliary_sgpr = site.auxiliary_sgpr, .context_domain = site.context_domain});
+		}
+		for (const auto& inst: caller.instructions) {
+			if (inst.opcode == Opcode::S_SWAPPC_B64 && !call_pcs.contains(inst.pc))
+				Fail("probe caller contains a SWAPPC without proved call-table provenance");
+			if (inst.opcode == Opcode::S_BARRIER)
+				Fail("external probe cannot end waves in a caller with workgroup barriers");
+		}
+		result.program.code = result.code;
+		result.success = true;
+	} catch (const std::exception& exception) {
+		result.failure = exception.what();
+	}
+	return result;
+}
 } // namespace Libs::Graphics::ShaderRecompiler

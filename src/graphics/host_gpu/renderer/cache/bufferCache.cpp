@@ -654,8 +654,8 @@ Buffer* BufferCache::GetShaderCallFaultBuffer() {
 	return m_shader_call_fault_manager->GetBuffer();
 }
 
-void BufferCache::ProcessShaderCallFaultBuffer() {
-	if (m_shader_call_fault_manager) m_shader_call_fault_manager->Process();
+void BufferCache::ProcessShaderCallFaultBuffer(bool wait_for_completion) {
+	if (m_shader_call_fault_manager) m_shader_call_fault_manager->Process(wait_for_completion);
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

@@ -498,6 +498,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
+	if (options.external_call_probe &&
+	    (options.external_library == nullptr || options.stage != ShaderType::Compute))
+		EXIT("external call probe requires an explicit compute external-library plan");
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
 	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
 	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
@@ -553,7 +556,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                 fmt::format("functions={} call_sites={}",
 		                             options.external_library->functions.size(),
 		                             options.external_library->call_sites.size()));
-		external_program = LinkExternalProgram(decoded, *options.external_library);
+		external_program = options.external_call_probe
+		                       ? BuildExternalCallProbe(decoded, *options.external_library)
+		                       : LinkExternalProgram(decoded, *options.external_library);
 		if (!external_program.success)
 			EXIT("external shader linking failed: %s", external_program.failure.c_str());
 		decoded = std::move(external_program.program);
@@ -591,7 +596,11 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     static_cast<uint64_t>(native_cfg.blocks.size()),
 	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
 	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
-	if (native_cfg.irreducible) {
+	if (options.external_call_probe) {
+		// Structurization may replace Return terminators with a common exit.
+		// Keep the exact native call boundary and use the existing dispatcher.
+		LogExternalPhase(options, "probe-cfg", phase_ms(), "caller-only diagnostic dispatcher");
+	} else if (native_cfg.irreducible) {
 		LogDispatcherFallback(options, native_cfg, "build");
 	} else {
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
@@ -636,6 +645,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .input_info       = options.input_info,
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	    .external_entries = external_program.entries,
+	    .external_call_probe = options.external_call_probe,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);

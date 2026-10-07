@@ -8,6 +8,7 @@ VALUE_OPCODE(ReferenceU64, Void, U64)
 VALUE_OPCODE(ConditionRef, U1, U1)
 // Keeps finite external-record provenance while the GPU value remains unchanged.
 VALUE_OPCODE(ExternalCallContextWord, U32, U32, U32, U32, U32, U32)
+VALUE_OPCODE(ExternalCallProbe, Void, U64, U64, U32, U32, U32, U32)
 
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)

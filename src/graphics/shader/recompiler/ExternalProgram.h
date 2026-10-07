@@ -27,4 +27,9 @@ struct LinkedExternalProgram {
 [[nodiscard]] LinkedExternalProgram LinkExternalProgram(const Decoder::Program&    caller,
                                                         const ExternalLibraryPlan& library);
 
+// Diagnostic-only caller graph. Each proved external call records its inputs
+// and returns; no library instruction or caller continuation is substituted.
+[[nodiscard]] LinkedExternalProgram BuildExternalCallProbe(const Decoder::Program& caller,
+                                                          const ExternalLibraryPlan& library);
+
 } // namespace Libs::Graphics::ShaderRecompiler

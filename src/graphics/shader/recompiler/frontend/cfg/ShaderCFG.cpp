@@ -1528,7 +1528,11 @@ Graph BuildGraph(const Decoder::Program& program, std::span<const ExternalTransf
 	std::map<uint32_t, const ExternalTransfer*> external_by_pc;
 	for (const auto& transfer: external_transfers) {
 		if (!external_by_pc.emplace(transfer.pc, &transfer).second ||
-		    transfer.target_pcs.empty() || transfer.target_pcs.size() != transfer.guest_addresses.size())
+		    (!transfer.probe && transfer.target_pcs.empty()) ||
+		    (transfer.probe && (!transfer.call || !transfer.target_pcs.empty() ||
+		                        !transfer.guest_addresses.empty() || transfer.auxiliary_sgpr > 104u ||
+		                        transfer.record_load_pc == UINT32_MAX || transfer.context_domain == UINT32_MAX)) ||
+		    transfer.target_pcs.size() != transfer.guest_addresses.size())
 			ExitBuildFailure(graph, FailureKind::InvalidInput, UINT32_MAX, "invalid external transfer metadata");
 	}
 	for (uint32_t i = 0; i < program.instructions.size(); i++) {
@@ -1635,10 +1639,14 @@ Graph BuildGraph(const Decoder::Program& program, std::span<const ExternalTransf
 		if (const auto external = external_by_pc.find(last.pc); external != external_by_pc.end()) {
 			const auto& transfer = *external->second;
 			auto& term = block.terminator;
-			term.kind = TerminatorKind::IndirectBranch;
+			term.kind = transfer.probe ? TerminatorKind::Return : TerminatorKind::IndirectBranch;
 			term.indirect_pc_sgpr = transfer.target_sgpr;
 			term.external_transfer = true;
 			term.external_call = transfer.call;
+			term.external_call_probe = transfer.probe;
+			term.external_record_load_pc = transfer.record_load_pc;
+			term.external_auxiliary_sgpr = transfer.auxiliary_sgpr;
+			term.external_context_domain = transfer.context_domain;
 			term.external_guest_pc = transfer.guest_pc;
 			term.external_link_address = transfer.link_address;
 			term.external_return_sgpr = transfer.return_sgpr;
@@ -1744,6 +1752,17 @@ Graph BuildGraph(const Decoder::Program& program, std::span<const ExternalTransf
 	SortUnique(graph.code_table_load_pcs);
 
 	RecomputeAnalyses(graph);
+	for (const auto& block: graph.blocks) {
+		if (!block.terminator.external_call_probe) continue;
+		const auto load_pc = block.terminator.external_record_load_pc;
+		const auto load = std::ranges::find_if(graph.blocks, [load_pc](const BasicBlock& candidate) {
+			return candidate.start_pc <= load_pc && load_pc < candidate.end_pc;
+		});
+		if (load == graph.blocks.end() || !graph.Dominates(load->id, block.id) ||
+		    load_pc >= program.instructions[block.inst_end - 1u].pc)
+			ExitBuildFailure(graph, FailureKind::InvalidInput, block.id,
+			                 "external probe record load does not dominate its actual call");
+	}
 
 	if (indirect_setpc) {
 		graph.irreducible  = true;

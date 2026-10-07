@@ -208,6 +208,7 @@ inline constexpr auto EmitReference    = EmitVoid;
 inline constexpr auto EmitReferenceU32 = EmitVoid;
 inline constexpr auto EmitReferenceU64 = EmitVoid;
 uint32_t EmitExternalCallContextWord(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitExternalCallProbe(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitControlNop   = EmitVoid;
 inline constexpr auto EmitSendmsg      = EmitVoid;
 inline constexpr auto EmitTtraceData   = EmitVoid;

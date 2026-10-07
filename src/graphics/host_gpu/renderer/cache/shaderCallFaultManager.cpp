@@ -26,7 +26,7 @@ Buffer* ShaderCallFaultManager::GetBuffer() noexcept {
 	return &m_fault_buffer;
 }
 
-void ShaderCallFaultManager::Process() {
+void ShaderCallFaultManager::Process(bool wait_for_completion) {
 	if (!m_used) return;
 	m_used = false;
 	if (const auto tick = m_ticks[m_area]; tick != 0u) {
@@ -44,7 +44,7 @@ void ShaderCallFaultManager::Process() {
 	                           vk::AccessFlagBits::eHostRead);
 	m_scheduler.DeferOperation([this, offset, area] {
 		m_download_buffer.Invalidate(offset, RecordSize);
-		std::array<uint32_t, 8> record {};
+		std::array<uint32_t, 16> record {};
 		std::memcpy(record.data(), m_download_buffer.Mapped().data() + offset, RecordSize);
 		m_ticks[area] = 0;
 		if (record[0] == 0u) return;
@@ -55,12 +55,37 @@ void ShaderCallFaultManager::Process() {
 			EXIT("Shader external-material context fault: ordinal=%u domain=%u guest_pc=0x%016"
 			     PRIx64 " shader=0x%016" PRIx64 "\n", record[2], record[3], pc, hash);
 		}
+		if (record[1] == 3u) {
+			const uint64_t auxiliary = uint64_t {record[12]} | (uint64_t {record[13]} << 32u);
+			EXIT("Shader selected-call diagnostic stop: target=0x%016" PRIx64
+			     " guest_pc=0x%016" PRIx64 " shader=0x%016" PRIx64
+			     " ordinal=%u domain=%u exec=0x%08x%08x auxiliary=0x%016" PRIx64
+			     " input_mismatch=%u host_subgroup=%u; no callee or caller continuation executed\n",
+			     target, pc, hash, record[8], record[9], record[11], record[10], auxiliary,
+			     record[14], record[15]);
+		}
+		if (record[1] == 5u) {
+			EXIT("Shader selected-call diagnostic layout rejection: detail0=%u detail1=%u "
+			     "guest_pc=0x%016" PRIx64 " shader=0x%016" PRIx64
+			     " physical_local=%u subgroup_id=%u subgroup_lane=%u subgroup_size=%u "
+			     "physical_workgroup=%u expected_subgroup=%u guest_wave=%u host_width=%u"
+			     "; stopped before guest shader work\n", record[2], record[3], pc, hash,
+			     record[8], record[9], record[10], record[11], record[12], record[13],
+			     record[14], record[15]);
+		}
 		EXIT("Shader external-call runtime fault: kind=%u target=0x%016" PRIx64
 		     " guest_pc=0x%016" PRIx64 " shader=0x%016" PRIx64 "\n",
 		     record[1], target, pc, hash);
 	});
 	m_ticks[m_area] = m_scheduler.CurrentTick();
+	const auto scheduled_tick = m_ticks[m_area];
 	m_area = (m_area + 1u) % MaxPending;
+	if (wait_for_completion) {
+		// Probe invocations deliberately stop at SWAPPC. Finish their dispatch and inspect
+		// the record before any following PM4 consumer can use incomplete results.
+		m_scheduler.Wait(scheduled_tick);
+		m_scheduler.PopPendingOperations();
+	}
 }
 
 } // namespace Libs::Graphics

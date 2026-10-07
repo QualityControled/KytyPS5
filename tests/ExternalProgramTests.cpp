@@ -105,6 +105,124 @@ void TestAliasedFullAddressDispatcherAndCFG() {
 	      "CFG conflated guest addresses with dense labels or dropped saved continuation");
 }
 
+struct ProbeFixture {
+  std::vector<uint32_t> code{0xf4280382u, 0x10000000u, 0xbe8e210eu,
+                             0xbf810000u};
+  Decoder::Program caller;
+  Shader::ExternalLibraryPlan library;
+  ProbeFixture() {
+    Decoder::DecodeProgram(code, caller);
+    library.complete = true;
+    library.caller_address = Fixture::Caller;
+    Shader::ExternalCallSite site;
+    site.caller_pc = 8u;
+    site.record_load_pc = 0u;
+    site.record_sgpr = 14u;
+    site.target_sgpr = site.return_sgpr = 14u;
+    site.auxiliary_sgpr = 16u;
+    site.context_domain = 11u;
+    site.candidate_addresses = {Fixture::A, Fixture::B};
+    site.records = {{0u, 0u, Fixture::A, 0x1200200300ull},
+                    {7u, 1u, Fixture::B, 0x1400200300ull}};
+    library.call_sites.push_back(site);
+  }
+  void Decode() { Decoder::DecodeProgram(code, caller); }
+  Shader::LinkedExternalProgram Probe() {
+    return Shader::BuildExternalCallProbe(caller, library);
+  }
+};
+
+void TestProbePreservesCallBoundaryAndRegisters() {
+  for (const uint32_t destination : {14u, 20u}) {
+    ProbeFixture fixture;
+    fixture.code[2] = 0xbe80210eu | (destination << 16u);
+    fixture.Decode();
+    fixture.library.call_sites[0].return_sgpr = destination;
+    const auto probe = fixture.Probe();
+    Check(probe.success && probe.failure.empty() && probe.entries.empty() &&
+              probe.transfers.size() == 1u && probe.code == fixture.code &&
+              probe.program.instructions.size() ==
+                  fixture.caller.instructions.size(),
+          "probe rewrote the native call or linked/examined an external "
+          "function body");
+    const auto &transfer = probe.transfers[0];
+    Check(transfer.probe && transfer.call && transfer.target_sgpr == 14u &&
+              transfer.return_sgpr == destination &&
+              transfer.guest_pc == Fixture::Caller + 8u &&
+              transfer.link_address == 0u && transfer.record_load_pc == 0u &&
+              transfer.auxiliary_sgpr == 16u &&
+              transfer.context_domain == 11u &&
+              transfer.guest_addresses.empty() && transfer.target_pcs.empty(),
+          "probe dropped record/auxiliary provenance or manufactured an "
+          "ordinary saved return link");
+    const auto graph = CFG::BuildGraph(probe.program, probe.transfers);
+    const auto *block = graph.FindBlockByPc(0u);
+    Check(!graph.unsupported && block != nullptr &&
+              block->terminator.kind == CFG::TerminatorKind::Return &&
+              block->terminator.external_call_probe &&
+              block->terminator.external_transfer &&
+              block->successors.empty() &&
+              block->terminator.external_guest_pc == Fixture::Caller + 8u &&
+              block->terminator.external_record_load_pc == 0u &&
+              block->terminator.external_auxiliary_sgpr == 16u &&
+              block->terminator.external_context_domain == 11u,
+          "probe selected call retained an executable continuation or lost its "
+          "exact metadata");
+  }
+}
+
+void TestProbeRejectsMissingProvenance() {
+  const auto reject = [](ProbeFixture &fixture, std::string_view reason) {
+    const auto probe = fixture.Probe();
+    Check(!probe.success && !probe.failure.empty() &&
+              probe.failure.find(reason) != std::string::npos,
+          "invalid probe provenance did not receive an explicit nonfatal "
+          "rejection");
+  };
+  ProbeFixture partial;
+  partial.library.complete = false;
+  reject(partial, "complete");
+  ProbeFixture unmatched;
+  unmatched.library.call_sites[0].target_sgpr = 12u;
+  reject(unmatched, "register pairs");
+  ProbeFixture load;
+  load.library.call_sites[0].record_load_pc = 4u;
+  reject(load, "record load");
+  ProbeFixture destination;
+  destination.library.call_sites[0].record_sgpr = 12u;
+  reject(destination, "record load");
+  ProbeFixture auxiliary;
+  auxiliary.library.call_sites[0].auxiliary_sgpr = UINT32_MAX;
+  reject(auxiliary, "auxiliary pair");
+  ProbeFixture domain;
+  domain.library.call_sites[0].context_domain = UINT32_MAX;
+  reject(domain, "domain");
+  ProbeFixture records;
+  records.library.call_sites[0].records.clear();
+  reject(records, "domain");
+  ProbeFixture duplicate;
+  duplicate.library.call_sites.push_back(duplicate.library.call_sites[0]);
+  reject(duplicate, "duplicate");
+}
+
+void TestProbeRejectsBarriersAndUnplannedCalls() {
+  ProbeFixture barrier;
+  barrier.code.insert(barrier.code.end() - 1u, 0xbf8a0000u);
+  barrier.Decode();
+  const auto rejected = barrier.Probe();
+  Check(!rejected.success &&
+            rejected.failure.find("barriers") != std::string::npos,
+        "probe allowed early wave termination in a caller with a workgroup "
+        "barrier");
+  ProbeFixture extra;
+  extra.code.insert(extra.code.end() - 1u, 0xbe8e210eu);
+  extra.Decode();
+  const auto unplanned = extra.Probe();
+  Check(!unplanned.success &&
+            unplanned.failure.find("without proved") != std::string::npos,
+        "probe left an additional unplanned call executable");
+}
+
 void TestDistinctPairAndCopiedReturn() {
 	Fixture fixture; fixture.caller_code[0] = 0xbe90210eu; fixture.DecodeCaller();
 	fixture.library.call_sites[0].return_sgpr = 16u;
@@ -297,18 +415,43 @@ void TestFullCapturedLibraryLink(const char* caller_path, const char* folder_pat
 }
 } // namespace
 
-int main(int argc, char** argv) {
-	Check(argc == 1 || (argc == 4 && std::string_view(argv[1]) == "--captured-library"),
-	      "usage: ExternalProgramTests [--captured-library caller.bin captured-prefix-folder]");
-	TestAliasedFullAddressDispatcherAndCFG();
-	TestDistinctPairAndCopiedReturn();
-	TestMultipleCallSitesKeepIndependentContinuations();
-	TestReachableForwardSkipAndNegativeBranchUnion();
-	TestConsistentOverlapAndAdjacentRanges();
-	TestUnsupportedLeafFormsAreRejected();
-	TestSavedLinkMustSurviveEveryReturnPath();
-	TestProvenanceAndCandidateSetValidation();
-	TestUncoveredAndTruncatedBranchClosure();
-	std::puts("ExternalProgramTests: all nine groups passed (offline native linkage/CFG only)");
-	if (argc == 4) TestFullCapturedLibraryLink(argv[2], argv[3]);
+int main(int argc, char **argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--probe-dominance-rejection") == 0) {
+    ProbeFixture fixture;
+    fixture.code.insert(fixture.code.begin(), 0xbf850002u);
+    fixture.Decode();
+    fixture.library.call_sites[0].record_load_pc = 4u;
+    fixture.library.call_sites[0].caller_pc = 12u;
+    const auto probe = fixture.Probe();
+    Check(probe.success, "dominance fixture did not reach CFG validation");
+    (void)CFG::BuildGraph(probe.program, probe.transfers);
+    Check(false, "probe accepted a path skipping its record load");
+  }
+  const bool probe_only =
+      argc == 2 && std::string_view(argv[1]) == "--probe-only";
+  Check(argc == 1 || probe_only ||
+            (argc == 4 && std::string_view(argv[1]) == "--captured-library"),
+        "usage: ExternalProgramTests [--probe-only | --captured-library "
+        "caller.bin captured-prefix-folder]");
+  TestProbePreservesCallBoundaryAndRegisters();
+  TestProbeRejectsMissingProvenance();
+  TestProbeRejectsBarriersAndUnplannedCalls();
+  if (probe_only) {
+    std::puts("ExternalProgramTests: all three probe groups passed "
+              "(caller-only construction/CFG; no guest execution)");
+    return 0;
+  }
+  TestAliasedFullAddressDispatcherAndCFG();
+  TestDistinctPairAndCopiedReturn();
+  TestMultipleCallSitesKeepIndependentContinuations();
+  TestReachableForwardSkipAndNegativeBranchUnion();
+  TestConsistentOverlapAndAdjacentRanges();
+  TestUnsupportedLeafFormsAreRejected();
+  TestSavedLinkMustSurviveEveryReturnPath();
+  TestProvenanceAndCandidateSetValidation();
+  TestUncoveredAndTruncatedBranchClosure();
+  std::puts("ExternalProgramTests: all twelve groups passed (offline native "
+            "linkage/probe/CFG only)");
+  if (argc == 4)
+    TestFullCapturedLibraryLink(argv[2], argv[3]);
 }

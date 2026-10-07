@@ -17,7 +17,32 @@ inline constexpr size_t MaxTargets              = 2048;
 inline constexpr size_t MaxTargetBytes          = 64 * 1024;
 inline constexpr size_t MaxAggregateTargetBytes = 128 * 1024 * 1024;
 inline constexpr size_t ReadChunkBytes          = 4096;
+inline constexpr size_t MaxDirectUserLoads      = 256;
 using MemoryReader                     = bool (*)(void*, uint64_t, std::span<uint32_t>);
+
+struct DirectUserLoadSnapshot {
+	uint32_t pc = 0;
+	uint32_t destination_sgpr = 0;
+	uint32_t user_sgpr = 0;
+	uint32_t dword_count = 0;
+	int32_t offset = 0;
+	uint64_t address = 0;
+	std::vector<uint32_t> words;
+	std::string rejection;
+	bool read_failed = false;
+};
+
+struct DirectUserLoadCapture {
+	std::vector<DirectUserLoadSnapshot> loads;
+	bool limit_reached = false;
+	size_t requested_bytes = 0;
+};
+
+// Diagnostic snapshots only: straight immutable initial user-pointer loads. Dynamic or
+// modified bases are rejected; no value is substituted into shader execution.
+[[nodiscard]] DirectUserLoadCapture CaptureDirectUserLoads(
+    bool enabled, const Decoder::Program& program, std::span<const uint32_t> user_data,
+    MemoryReader reader, void* reader_context = nullptr, uint32_t user_data_base = 0);
 
 struct CallTableTrace {
 	uint32_t                call_pc              = 0;

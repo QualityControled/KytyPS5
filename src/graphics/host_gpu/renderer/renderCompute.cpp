@@ -435,6 +435,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	if (program.info.uses_external_call_probe) {
+		m_context.GetBufferCache().ProcessShaderCallFaultBuffer(true);
+	}
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -494,6 +497,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	if (program.info.uses_external_call_probe) {
+		m_context.GetBufferCache().ProcessShaderCallFaultBuffer(true);
+	}
 }
 
 } // namespace Libs::Graphics

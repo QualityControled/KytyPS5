@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <limits>
 #include <unordered_set>
+#include <unordered_map>
 
 namespace Libs::Graphics::ShaderRecompiler::Diagnostics {
 namespace {
@@ -209,7 +210,101 @@ bool ReadPrefix(MemoryReader reader, void* context, uint64_t address, size_t byt
 	return true;
 }
 
+std::vector<bool> ReachableAfterExternalReturn(const Decoder::Program& program) {
+	std::vector<bool> reachable(program.instructions.size(), false);
+	std::vector<size_t> pending;
+	std::unordered_map<uint32_t, size_t> indices;
+	for (size_t i = 0; i < program.instructions.size(); ++i) {
+		indices.emplace(program.instructions[i].pc, i);
+		if (IsSwappc(program.instructions[i]) && i + 1u < program.instructions.size())
+			pending.push_back(i + 1u);
+	}
+	while (!pending.empty()) {
+		const auto i = pending.back();
+		pending.pop_back();
+		if (reachable[i]) continue;
+		reachable[i] = true;
+		const auto& inst = program.instructions[i];
+		if (inst.opcode == Opcode::S_ENDPGM) continue;
+		if (inst.opcode == Opcode::S_SETPC_B64) {
+			// An unknown caller jump after a call can reach any root load.
+			std::fill(reachable.begin(), reachable.end(), true);
+			break;
+		}
+		if (Decoder::IsDirectBranch(inst.opcode)) {
+			const auto target = indices.find(inst.branch_target);
+			if (target == indices.end()) {
+				std::fill(reachable.begin(), reachable.end(), true);
+				break;
+			}
+			pending.push_back(target->second);
+			if (inst.opcode == Opcode::S_BRANCH) continue;
+		}
+		if (i + 1u < program.instructions.size()) pending.push_back(i + 1u);
+	}
+	return reachable;
+}
+
 } // namespace
+
+DirectUserLoadCapture CaptureDirectUserLoads(
+    bool enabled, const Decoder::Program& program, std::span<const uint32_t> user_data,
+    MemoryReader reader, void* reader_context, uint32_t user_data_base) {
+	DirectUserLoadCapture capture;
+	if (!enabled) return capture;
+	const bool unknown_writer = std::ranges::any_of(program.instructions, IsUnknownWriter);
+	const auto post_call = ReachableAfterExternalReturn(program);
+	for (size_t instruction_index = 0; instruction_index < program.instructions.size(); ++instruction_index) {
+		const auto& inst = program.instructions[instruction_index];
+		const bool direct_load = inst.opcode == Opcode::S_LOAD_DWORD ||
+		    inst.opcode == Opcode::S_LOAD_DWORDX2 || inst.opcode == Opcode::S_LOAD_DWORDX4 ||
+		    inst.opcode == Opcode::S_LOAD_DWORDX8 || inst.opcode == Opcode::S_LOAD_DWORDX16;
+		if (!direct_load) continue;
+		if (capture.loads.size() == MaxDirectUserLoads) {
+			capture.limit_reached = true;
+			break;
+		}
+		DirectUserLoadSnapshot load;
+		load.pc = inst.pc;
+		load.destination_sgpr = inst.dst.reg;
+		load.user_sgpr = inst.src0.reg;
+		load.dword_count = inst.data_dwords;
+		load.offset = static_cast<int32_t>(inst.offset);
+		if (post_call[instruction_index]) {
+			load.rejection = "load can follow an external call which may clobber its base";
+		} else if (unknown_writer || inst.dst.kind != OperandKind::Sgpr ||
+		    inst.src0.kind != OperandKind::Sgpr || inst.src0.reg > 104u ||
+		    !IsZeroOffset(inst.src1) || load.dword_count == 0u || load.dword_count > 16u) {
+			load.rejection = "dynamic/unknown scalar load origin";
+		} else if (load.user_sgpr < user_data_base ||
+		           load.user_sgpr - user_data_base >= user_data.size() ||
+		           user_data.size() - (load.user_sgpr - user_data_base) < 2u) {
+			load.rejection = "base is not an initialized user pointer";
+		} else if (std::ranges::any_of(program.instructions, [&](const auto& other) {
+			return WritesScalar(other, load.user_sgpr) || WritesScalar(other, load.user_sgpr + 1u);
+		})) {
+			load.rejection = "user pointer pair is modified in caller";
+		} else {
+			const auto first = load.user_sgpr - user_data_base;
+			const auto base = uint64_t {user_data[first]} | (uint64_t {user_data[first + 1u]} << 32u);
+			// AddOffset checks a quartet range as well; the exact load's upper bound is checked
+			// independently. Rejecting a smaller load near the end is conservative.
+			if (!AddOffset(base, load.offset, load.address) ||
+			    load.dword_count * sizeof(uint32_t) - 1u > AddressMask - load.address) {
+				load.rejection = "load exceeds 48-bit scalar address bounds";
+			} else if (reader == nullptr) {
+				load.rejection = "memory reader unavailable";
+			} else {
+				load.words.resize(load.dword_count);
+				capture.requested_bytes += load.words.size() * sizeof(uint32_t);
+				load.read_failed = !reader(reader_context, load.address, load.words);
+				if (load.read_failed) load.words.clear(); // failed callbacks may scribble bytes
+			}
+		}
+		capture.loads.push_back(std::move(load));
+	}
+	return capture;
+}
 
 CallTableTraceResult TraceCallTables(const Decoder::Program&   program,
                                      std::span<const uint32_t> user_data, uint32_t user_data_base) {

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
+#include "common/atomicFileReplace.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -45,6 +46,24 @@
 namespace Libs::Graphics {
 
 namespace {
+
+bool ExternalProbeRequested() {
+	const auto* value = std::getenv("KYTY_PROBE_EXTERNAL_CALL_TARGET");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+bool HasExternalCall(std::span<const uint32_t> code) {
+	if (!std::ranges::any_of(code, [](uint32_t word) {
+		return ((word >> 23u) & 0x1ffu) == 0x17du && ((word >> 8u) & 0xffu) == 0x21u &&
+		       ((word >> 16u) & 0x7fu) != 125u;
+	})) return false;
+	ShaderRecompiler::Decoder::Program decoded;
+	ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+	return std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+		return inst.opcode == ShaderRecompiler::Decoder::Opcode::S_SWAPPC_B64 &&
+		       ((inst.raw[0] >> 16u) & 0x7fu) != 125u;
+	});
+}
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -177,6 +196,8 @@ bool DumpShaderCallInputs(const char* stage_name,
 	const auto capture = ShaderRecompiler::Diagnostics::CaptureCallTables(
 	    true, decoded, options.user_data, ReadShaderGuestMemory, nullptr, options.user_data_base);
 	if (capture.tables.empty()) return false;
+	const auto direct_loads = ShaderRecompiler::Diagnostics::CaptureDirectUserLoads(
+	    true, decoded, options.user_data, ReadShaderGuestMemory, nullptr, options.user_data_base);
 
 	static std::atomic_uint64_t id = 0;
 	std::filesystem::path folder;
@@ -247,6 +268,28 @@ bool DumpShaderCallInputs(const char* stage_name,
 	manifest += "\n";
 	bool files_written = WriteCallCaptureFile(folder / "caller.bin", code.data(), code.size_bytes());
 	manifest += fmt::format("caller_file=caller.bin caller_file_written={}\n", files_written);
+	manifest += fmt::format("direct_user_loads={} direct_user_load_limit={} "
+	    "direct_user_load_max_dwords=16 direct_user_load_limit_reached={} "
+	    "direct_user_load_requested_bytes={}\n", direct_loads.loads.size(),
+	    ShaderRecompiler::Diagnostics::MaxDirectUserLoads, direct_loads.limit_reached,
+	    direct_loads.requested_bytes);
+	for (size_t i = 0; i < direct_loads.loads.size(); ++i) {
+		const auto& load = direct_loads.loads[i];
+		std::string file_name = "none";
+		if (!load.words.empty()) {
+			file_name = fmt::format("direct_user_{:03d}_{:08x}.bin", i, load.pc);
+			if (!WriteCallCaptureFile(folder / file_name, load.words.data(),
+			                          load.words.size() * sizeof(uint32_t))) {
+				file_name += " (write failed)";
+				files_written = false;
+			}
+		}
+		manifest += fmt::format("direct_user_load[{}]: pc=0x{:08x} destination_sgpr={} "
+		    "user_sgpr={} dword_count={} offset={} address=0x{:016x} "
+		    "read_failed={} rejection={} file={}\n", i, load.pc, load.destination_sgpr,
+		    load.user_sgpr, load.dword_count, load.offset, load.address, load.read_failed,
+		    load.rejection.empty() ? "none" : load.rejection, file_name);
+	}
 	for (size_t i = 0; i < capture.tables.size(); ++i) {
 		const auto& table = capture.tables[i];
 		const auto& trace = table.trace;
@@ -371,12 +414,14 @@ struct PipelineCache::ProgramCache {
 		uint64_t              hash            = 0;
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
+		bool                  external_call_probe = false;
 		std::vector<uint32_t> static_state;
 		std::shared_ptr<const ShaderRecompiler::ExternalLibraryPlan> external_library;
 
 		bool operator==(const ProgramKey& other) const {
 			if (stage != other.stage || hash != other.hash || user_data_count != other.user_data_count ||
-			    code_size != other.code_size || static_state != other.static_state) return false;
+			    code_size != other.code_size || static_state != other.static_state ||
+			    external_call_probe != other.external_call_probe) return false;
 			if (external_library == other.external_library) return true;
 			if (!external_library || !other.external_library) return false;
 			// The bucket hash is not an identity: all addresses and bytes must agree.
@@ -413,6 +458,7 @@ struct PipelineCache::ProgramCache {
 			}
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
+			PipelineKeyHash::Mix(hash, key.external_call_probe);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
 			if (key.external_library) {
 				PipelineKeyHash::Mix(hash, key.external_library->caller_address);
@@ -555,6 +601,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		lookup_key.external_library.reset();
+		lookup_key.external_call_probe = false;
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			const bool could_call = std::ranges::any_of(params.code, [](uint32_t word) {
 				return ((word >> 23u) & 0x1ffu) == 0x17du && ((word >> 8u) & 0xffu) == 0x21u &&
@@ -585,6 +632,7 @@ struct PipelineCache::ProgramCache {
 				}
 			}
 			if (could_call) lookup_key.external_library = LoadLibrary(params, user_data);
+			lookup_key.external_call_probe = lookup_key.external_library && ExternalProbeRequested();
 		}
 		auto                                         entry = programs.find(lookup_key);
 		std::vector<ShaderRecompiler::IR::ExternalCallContextDomain> context_domains;
@@ -657,6 +705,7 @@ struct PipelineCache::ProgramCache {
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 		options.external_library = lookup_key.external_library.get();
+		options.external_call_probe = lookup_key.external_call_probe;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -790,7 +839,8 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	m_driver_cache_path     = std::filesystem::path("_PipelineCache") /
+	    (title_id + (ExternalProbeRequested() ? "-external-probe.bin" : ".bin"));
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -857,6 +907,14 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
+	PersistDriverCache(true);
+}
+
+void PipelineCache::Checkpoint() {
+	PersistDriverCache(false);
+}
+
+void PipelineCache::PersistDriverCache(bool retire) {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -903,15 +961,17 @@ void PipelineCache::Save() {
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
 	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
+	    !Common::AtomicReplaceFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
 		return;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	if (retire) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+	}
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -1014,6 +1074,12 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	const auto* checkpoint = std::getenv("KYTY_EXTERNAL_DIAGNOSTIC_CHECKPOINT");
+	if (!m_external_checkpointed && checkpoint != nullptr && std::strcmp(checkpoint, "1") == 0 &&
+	    HasExternalCall(params.code)) {
+		m_external_checkpointed = true;
+		Checkpoint();
+	}
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
@@ -1246,6 +1312,11 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	if (input_info.stage.program->info.uses_external_call_probe) {
+		// Capture the newly compiled diagnostic as well as the earlier startup pipelines.
+		// The live cache remains valid for future pipeline creation and normal shutdown.
+		Checkpoint();
+	}
 
 	return *iter->second;
 }

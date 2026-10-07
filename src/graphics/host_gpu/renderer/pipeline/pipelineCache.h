@@ -106,6 +106,8 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	// Persist valid cache data without retiring the live cache object.
+	void Checkpoint();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -173,11 +175,13 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	bool                         m_external_checkpointed = false;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
 	void InitializeDriverCache();
+	void PersistDriverCache(bool retire);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

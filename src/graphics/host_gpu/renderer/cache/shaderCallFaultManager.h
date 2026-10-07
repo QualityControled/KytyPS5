@@ -14,10 +14,12 @@ public:
 	ShaderCallFaultManager(GraphicContext& graphics, CommandScheduler& scheduler);
 	KYTY_CLASS_NO_COPY(ShaderCallFaultManager);
 	[[nodiscard]] Buffer* GetBuffer() noexcept;
-	void Process();
+	void Process(bool wait_for_completion = false);
 
 private:
-	static constexpr uint64_t RecordSize = 8u * sizeof(uint32_t);
+	// First eight DWORDs retain the ordinary fault ABI; the probe adds ordinal,
+	// domain, full EXEC, auxiliary pointer, half agreement and subgroup width.
+	static constexpr uint64_t RecordSize = 16u * sizeof(uint32_t);
 	static constexpr size_t MaxPending = 8;
 	CommandScheduler& m_scheduler;
 	Buffer m_fault_buffer;

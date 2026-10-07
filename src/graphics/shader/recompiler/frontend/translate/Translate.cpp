@@ -810,6 +810,23 @@ void Translator::TranslateExternalCall(const Decoder::Instruction& inst, const C
 	                       IR::U32(IR::Value(static_cast<uint32_t>(term.external_link_address >> 32u)))});
 }
 
+void Translator::TranslateExternalCallProbe(const Decoder::Instruction& inst,
+                                            const CFG::Terminator& term, IR::U32 ordinal) {
+	if (!term.external_call_probe || term.kind != CFG::TerminatorKind::Return ||
+	    term.external_auxiliary_sgpr > 104u)
+		EXIT("external target probe has no exact diagnostic Return boundary");
+	// Scalar SWAPPC executes even with EXEC=0. Capture before the aliased link
+	// write, and deliberately execute neither the call nor its continuation.
+	const auto target = ReadU64(inst.src0);
+	const auto aux_low = ir.GetScalarReg(static_cast<IR::ScalarReg>(term.external_auxiliary_sgpr));
+	const auto aux_high = ir.GetScalarReg(static_cast<IR::ScalarReg>(term.external_auxiliary_sgpr + 1u));
+	const auto auxiliary = ir.Emit(IR::ValueOpcode::CompositeConstructU64, {aux_low, aux_high});
+	ir.Emit(IR::ValueOpcode::ExternalCallProbe,
+	        {target, auxiliary, ordinal, IR::Value(term.external_context_domain),
+	         ir.GetExecLo(), program.wave_size == 64u ? ir.GetExecHi() : IR::U32(IR::Value(0u))},
+	        term.external_guest_pc);
+}
+
 IR::U32 Translator::CaptureExternalRecordOrdinal(const Decoder::Instruction& inst) {
 	if (inst.opcode != Decoder::Opcode::S_BUFFER_LOAD_DWORDX4)
 		EXIT("external record provenance is not a four-word scalar buffer load");
@@ -1034,12 +1051,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			break;
 		default: break; // ValidateTranslateOptions rejects unsupported stages.
 	}
-	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
+	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported || options.external_call_probe;
 	result.cfg_failure_kind    = cfg.failure_kind;
 	result.fallback_reason     = cfg.unsupported_reason;
-	result.info.uses_external_call_fault = std::ranges::any_of(cfg.blocks, [](const auto& block) {
+	result.info.uses_external_call_fault = options.external_call_probe || std::ranges::any_of(cfg.blocks, [](const auto& block) {
 		return block.terminator.external_transfer;
 	});
+	result.info.uses_external_call_probe = options.external_call_probe;
 	for (const auto& entry: options.external_entries) {
 		const IR::ExternalCallContextBinding binding {entry.domain_id, entry.function_id};
 		if (std::ranges::find(result.external_context_bindings, binding) == result.external_context_bindings.end())
@@ -1377,6 +1395,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		external_entries.emplace(entry.pc, &entry);
 		external_record_loads.insert(entry.record_load_pc);
 	}
+	if (options.external_call_probe) {
+		for (const auto& block: cfg.blocks)
+			if (block.terminator.external_call_probe)
+				external_record_loads.insert(block.terminator.external_record_load_pc);
+	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
@@ -1408,11 +1431,23 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                  options.input_info.vertex->resources[resource]);
 				continue;
 			}
-			if (instruction.opcode == Decoder::Opcode::S_SWAPPC_B64)
-				translator.TranslateExternalCall(instruction, cfg_block.terminator);
+			if (instruction.opcode == Decoder::Opcode::S_SWAPPC_B64) {
+				if (cfg_block.terminator.external_call_probe) {
+					const auto ordinal = external_ordinals.find(cfg_block.terminator.external_record_load_pc);
+					if (ordinal == external_ordinals.end())
+						EXIT("external target probe has no captured load-time GPU record ordinal");
+					translator.TranslateExternalCallProbe(instruction, cfg_block.terminator, ordinal->second);
+				} else translator.TranslateExternalCall(instruction, cfg_block.terminator);
+			}
 			else translator.TranslateInstruction(instruction);
 		}
 		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
+	}
+	if (options.external_call_probe) {
+		for (const auto* block: result.blocks)
+			for (const auto& inst: *block)
+				if (inst.GetOpcode() == IR::ValueOpcode::Barrier)
+					EXIT("external target probe cannot terminate a wave with workgroup barriers");
 	}
 	IR::ValidateProgram(result, false);
 	return result;

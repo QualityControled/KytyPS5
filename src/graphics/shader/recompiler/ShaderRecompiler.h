@@ -25,6 +25,9 @@ struct CompileOptions {
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
 	const ExternalLibraryPlan*  external_library = nullptr;
+	// Diagnostic variant: record an actual external target, then end its wave.
+	// The host must wait and inspect the record before submitting consumers.
+	bool                        external_call_probe = false;
 };
 
 struct TranslateResult {

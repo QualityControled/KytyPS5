@@ -481,6 +481,7 @@ struct ShaderInfo {
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
 	bool                             uses_external_call_fault = false;
+	bool                             uses_external_call_probe = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

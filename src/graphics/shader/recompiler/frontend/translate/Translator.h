@@ -19,6 +19,8 @@ public:
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source, IR::BlockInfo& info);
 	void TranslateExternalCall(const Decoder::Instruction& inst, const CFG::Terminator& term);
+	void TranslateExternalCallProbe(const Decoder::Instruction& inst, const CFG::Terminator& term,
+	                                IR::U32 ordinal);
 	IR::U32 CaptureExternalRecordOrdinal(const Decoder::Instruction& inst);
 	void MarkExternalContext(const ExternalFunctionEntry& entry, IR::U32 ordinal);
 

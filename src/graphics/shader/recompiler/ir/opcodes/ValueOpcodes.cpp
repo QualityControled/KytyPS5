@@ -91,6 +91,7 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::Reference:
 		case ValueOpcode::ReferenceU32:
 		case ValueOpcode::ReferenceU64:
+		case ValueOpcode::ExternalCallProbe:
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::SetTessellationAttribute:
 		case ValueOpcode::MeshAllocate:

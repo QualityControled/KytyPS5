@@ -31,6 +31,7 @@ struct TranslateOptions {
 	ShaderStageInputInfo          input_info;
 	const EmbeddedFetchPlan*      embedded_fetch = nullptr;
 	std::span<const ExternalFunctionEntry> external_entries;
+	bool external_call_probe = false;
 };
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,

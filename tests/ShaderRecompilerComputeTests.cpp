@@ -1335,6 +1335,7 @@ struct TestCase {
   std::optional<std::vector<u32>> expected_buffer_resources;
   const ShaderRecompiler::ExternalLibraryPlan *external_library = nullptr;
   uint64_t shader_hash = 0;
+  bool external_call_probe = false;
 };
 
 struct GraphicsCase {
@@ -1610,6 +1611,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   options.user_data = user_data;
   options.external_library = test.external_library;
   options.shader_hash = test.shader_hash;
+  options.external_call_probe = test.external_call_probe;
 
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
@@ -15208,8 +15210,9 @@ public:
             "external-call shaders require their dedicated fault channel");
     if (shader_call_fault != nullptr) {
       Require(test.name, "external call fault binding",
-              shader_call_fault->size == 8u * sizeof(u32),
-              "external-call fault channel must contain exactly eight DWORDs");
+              shader_call_fault->size == 16u * sizeof(u32) ||
+                  (!compiled.program.info.uses_external_call_probe && shader_call_fault->size == 8u * sizeof(u32)),
+              "dedicated fault channel size does not match the normal/probe shader variant");
       shader_call_fault_info = {shader_call_fault->buffer, 0, shader_call_fault->size};
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -33871,7 +33874,7 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
 void CheckCapturedExternalTranslation(const char *caller_path,
                                       const char *folder_path,
                                       const char *limit_text,
-                                      bool actual_inputs) {
+                                      bool actual_inputs, bool probe = false) {
   size_t limit = 0;
   const auto parsed =
       std::from_chars(limit_text, limit_text + std::strlen(limit_text), limit);
@@ -33920,7 +33923,12 @@ void CheckCapturedExternalTranslation(const char *caller_path,
   options.input_info.compute = &controls.compute;
   options.user_data = controls.user_data;
   options.external_library = &fixture.library;
+  options.external_call_probe = probe;
   auto translated = ShaderRecompiler::TranslateProgram(fixture.caller, options);
+  if (probe) Require("CapturedExternalTranslation", "explicit probe variant",
+                      translated.program.info.uses_external_call_probe &&
+                          translated.program.info.uses_external_call_fault,
+                      "captured caller did not retain its diagnostic variant and channel");
   const auto finished = std::chrono::steady_clock::now();
   size_t instructions = 0;
   using ShaderRecompiler::IR::ValueOpcode;
@@ -33991,6 +33999,7 @@ void CheckCapturedExternalTranslation(const char *caller_path,
     std::printf("CapturedExternalTranslation: opcode=%.*s count=%zu\n",
                 int(name.size()), name.data(), opcode_counts[opcode]);
   }
+  std::printf("CapturedExternalTranslation: external_call_probe=%s\n", probe ? "true" : "false");
   std::puts("CapturedExternalTranslation: no auxiliary guest-memory reads, "
             "materialization, SPIR-V emission, GPU execution, or live link-bit "
             "proof");
@@ -34060,6 +34069,256 @@ void CheckExternalDispatcherWordBounds() {
     std::printf("ExternalDispatcherWordBounds: blocks=%u switches=%zu max_switch_words=%zu max_phi_words=%zu validated\n",
                 block_count, switches, max_switch_words, max_phi_words);
   }
+}
+
+void CheckExternalCallProbe(VulkanHarness &vulkan, bool incomplete_workgroup = false) {
+  using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+  constexpr uint64_t caller_address = 0x234abc8000ull;
+  constexpr uint64_t address_a = 0x1300100000ull;
+  constexpr uint64_t address_b = 0x1400100000ull;
+  constexpr uint64_t auxiliary_a = 0x1200200300ull;
+  constexpr uint64_t auxiliary_b = 0x1400200300ull;
+  constexpr uint64_t shader_hash = 0xfedcba9876543210ull;
+  constexpr u32 untouched = 0xdedededeu;
+  Require("ExternalCallProbe", "real subgroup32", vulkan.SubgroupSize() == 32u,
+          "this diagnostic fixture requires a real physical subgroup32");
+  size_t cases = 0;
+  for (const u32 wave_size : {32u, 64u}) {
+    for (const bool distinct_return : {false, true}) {
+      for (const bool different_halves : {false, true}) {
+        if (different_halves && (wave_size != 64u || distinct_return)) continue;
+        TestCase test;
+        test.name = different_halves ? "ExternalProbeReadFirstLaneCoherence"
+                    : distinct_return ? "ExternalProbeDistinctReturn" : "ExternalProbeAliasedReturn";
+        test.has_user_data = true;
+        test.external_call_probe = true;
+        test.user_data = MakeNativeUserData(nullptr);
+        test.initial.assign(128u, untouched);
+        test.user_data[2] = static_cast<u32>(test.initial.size() * sizeof(u32));
+        test.user_data[4] = 0x80u;
+        test.user_data[5] = 16u << 16u;
+        test.user_data[6] = 2u;
+        test.user_data[7] = 0u;
+        test.storage_buffer_offsets = {0x80u, 0u};
+        test.user_data[8] = 0u;
+        test.user_data[10] = 0xa5a5a5a5u;
+        test.user_data[11] = 0x55aa55aau;
+        test.user_data[12] = 1u;
+        test.has_compute_info = true;
+        test.compute_info.wave_size = wave_size;
+        test.compute_info.host_subgroup_size = vulkan.SubgroupSize();
+        test.compute_info.threads_num[0] = incomplete_workgroup ? 4u : wave_size;
+        test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+        test.compute_info.thread_ids_num = 1u;
+        test.shader_hash = shader_hash;
+        for (u32 record = 0; record < 2u; ++record) {
+          const auto target = record == 0u ? address_a : address_b;
+          const auto auxiliary = record == 0u ? auxiliary_a : auxiliary_b;
+          const auto start = 0x80u / sizeof(u32) + record * 4u;
+          test.initial[start] = static_cast<u32>(target);
+          test.initial[start + 1u] = static_cast<u32>(target >> 32u);
+          test.initial[start + 2u] = static_cast<u32>(auxiliary);
+          test.initial[start + 3u] = static_cast<u32>(auxiliary >> 32u);
+        }
+        auto &code = test.code;
+        code.push_back(EncodeSopc(0x06, 12, InlineU32(0)));
+        const auto no_call_branch = code.size();
+        code.push_back(0);
+        if (different_halves) {
+          code.push_back(EncodeVop2(0x16, 8, InlineU32(5), 0)); // v0 >> 5.
+          code.push_back(EncodeVop2(0x1a, 8, InlineU32(4), 8));
+        } else {
+          code.push_back(EncodeVop2(0x1b, 8, InlineU32(31), 0)); // Same lane within either virtual half.
+          code.push_back(EncodeVop2(0x25, 8, 8, 8)); // GPU lane plus runtime scalar byte offset.
+        }
+        code.push_back(EncodeVop1(0x02, 8, Vgpr(8)));
+        const auto load_pc = static_cast<u32>(code.size() * sizeof(u32));
+        code.push_back(EncodeSmem0(0x0a, 14, 2));
+        code.push_back(EncodeSmem1(0, 8));
+        code.push_back(EncodeSMovB32(126, 10));
+        code.push_back(EncodeSMovB32(127, 11));
+        const auto call_pc = static_cast<u32>(code.size() * sizeof(u32));
+        code.push_back(EncodeSop1(0x21, distinct_return ? 20 : 14, 14));
+        // A selected call must terminate before all of this continuation,
+        // including the restoration of EXEC and the visible output write.
+        code.push_back(EncodeSop1(0x04, 126, 193u));
+        AppendVMovLiteral(&code, 24, 0xdeadbeefu);
+        AppendStoreVgprAtLaneDwordOffset(&code, 24, 0, 0);
+        AppendEnd(&code);
+        const auto no_call_target = code.size();
+        code[no_call_branch] = EncodeSopp(0x05, no_call_target - no_call_branch - 1u);
+        code.push_back(EncodeVop2(0x25, 24, InlineU32(7), 0));
+        AppendStoreVgprAtLaneDwordOffset(&code, 24, 0, 0);
+        AppendEnd(&code);
+
+        ShaderRecompiler::ExternalLibraryPlan library;
+        library.complete = true;
+        library.caller_address = caller_address;
+        ShaderRecompiler::ExternalCallSite site;
+        site.caller_pc = call_pc;
+        site.target_sgpr = 14u;
+        site.return_sgpr = distinct_return ? 20u : 14u;
+        site.record_load_pc = load_pc;
+        site.record_sgpr = 14u;
+        site.auxiliary_sgpr = 16u;
+        site.context_domain = 11u;
+        site.table_base = 0x80u;
+        site.table_bytes = 32u;
+        site.candidate_addresses = {address_a, address_b};
+        for (u32 record = 0; record < 2u; ++record) {
+          const auto target = record == 0u ? address_a : address_b;
+          const auto auxiliary = record == 0u ? auxiliary_a : auxiliary_b;
+          site.records.push_back({record, record, target, auxiliary});
+          site.context_records.push_back({record, record,
+              {static_cast<u32>(target), static_cast<u32>(target >> 32u),
+               static_cast<u32>(auxiliary), static_cast<u32>(auxiliary >> 32u)}});
+        }
+        library.call_sites.push_back(std::move(site));
+        test.external_library = &library;
+        auto compiled = CompileCase(test, vulkan.SubgroupSize());
+        Require(test.name, "dedicated probe variant",
+                compiled.program.info.uses_external_call_probe && compiled.program.info.uses_external_call_fault &&
+                ShaderRecompiler::IR::FindBinding(compiled.program.bindings, Kind::ShaderCallFaultBuffer) != nullptr,
+                "selected-call variant lost its dedicated diagnostic channel");
+        auto RuntimeWord = [&](u32 reg, u32 value, bool required = true) {
+          const auto &registers = compiled.program.bindings.user_data_registers;
+          const auto found = std::ranges::find(registers, reg);
+          Require(test.name, "runtime probe input", !required || found != registers.end(),
+                  "probe input was replaced by a host constant");
+          if (found != registers.end()) compiled.packed_user_data[found - registers.begin()] = value;
+        };
+        auto Run = [&](u32 record, bool zero_exec, bool no_call, bool prior_event) {
+          RuntimeWord(8, record * 16u, !different_halves);
+          RuntimeWord(10, zero_exec ? 0u : 0xa5a5a5a5u);
+          RuntimeWord(11, zero_exec ? 0u : 0x55aa55aau, wave_size == 64u);
+          RuntimeWord(12, no_call ? 0u : 1u);
+          const std::vector<u32> event_initial = prior_event
+              ? std::vector<u32>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+              : std::vector<u32>(16u, 0u);
+          auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+          auto event = vulkan.CreateStorageBuffer(test.name, event_initial, event_initial.size());
+          vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, &event);
+          auto expected_output = test.initial;
+          if (no_call) for (u32 lane = 0; lane < wave_size; ++lane) expected_output[lane] = lane + 7u;
+          CompareWords(test, "selected call stops; no-call path remains exact", expected_output,
+                       vulkan.ReadBuffer(test.name, output, expected_output.size()));
+          std::vector<u32> expected_event(16u, 0u);
+          if (prior_event) expected_event = event_initial;
+          else if (!no_call) {
+            const auto target = record == 0u ? address_a : address_b;
+            const auto auxiliary = record == 0u ? auxiliary_a : auxiliary_b;
+            const auto pc = caller_address + call_pc;
+            expected_event = {1u, 3u, static_cast<u32>(target), static_cast<u32>(target >> 32u),
+                static_cast<u32>(pc), static_cast<u32>(pc >> 32u),
+                static_cast<u32>(shader_hash), static_cast<u32>(shader_hash >> 32u), record, 11u,
+                zero_exec ? 0u : 0xa5a5a5a5u,
+                zero_exec || wave_size == 32u ? 0u : 0x55aa55aau,
+                static_cast<u32>(auxiliary), static_cast<u32>(auxiliary >> 32u),
+                0u, 32u};
+          }
+          const auto actual_event = vulkan.ReadBuffer(test.name, event, 16u);
+          std::printf("ExternalProbeGPU: wave=%u distinct_return=%u record=%u exec_zero=%u no_call=%u prior=%u mismatch=%u kind=%u\n",
+                      wave_size, distinct_return, record, zero_exec, no_call, prior_event,
+                      actual_event[14], actual_event[1]);
+          CompareWords(test, "full target/aux, live ordinal, EXEC and mismatch record", expected_event, actual_event);
+          vulkan.DestroyBuffer(&output);
+          vulkan.DestroyBuffer(&event);
+          ++cases;
+        };
+        if (different_halves) Run(0u, false, false, false);
+        else {
+          for (u32 record : {0u, 1u}) for (bool zero_exec : {false, true}) Run(record, zero_exec, false, false);
+          Run(0u, false, true, false);
+          Run(0u, false, false, true);
+          if (wave_size == 32u && !distinct_return) {
+            auto static_test = test;
+            static_test.name = "ExternalProbeStaticallyNoCall";
+            static_test.code[0] = EncodeSopc(0x06, InlineU32(0), InlineU32(0));
+            auto static_compiled = CompileCase(static_test, vulkan.SubgroupSize());
+            Require(static_test.name, "entry layout guard channel",
+                    static_compiled.program.info.uses_external_call_probe &&
+                        static_compiled.program.info.uses_external_call_fault &&
+                        ShaderRecompiler::IR::FindBinding(static_compiled.program.bindings, Kind::ShaderCallFaultBuffer) != nullptr,
+                    "statically pruned call removed the entry diagnostic guard channel");
+            auto output = vulkan.CreateStorageBuffer(static_test.name, static_test.initial, static_test.initial.size());
+            auto event = vulkan.CreateStorageBuffer(static_test.name, std::vector<u32>(16u, 0u), 16u);
+            vulkan.Dispatch(static_test, static_compiled, output, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, &event);
+            auto expected = static_test.initial;
+            for (u32 lane = 0; lane < wave_size; ++lane) expected[lane] = lane + 7u;
+            CompareWords(static_test, "statically no-call output", expected,
+                         vulkan.ReadBuffer(static_test.name, output, expected.size()));
+            CompareWords(static_test, "statically no-call has no selected event", std::vector<u32>(16u, 0u),
+                         vulkan.ReadBuffer(static_test.name, event, 16u));
+            vulkan.DestroyBuffer(&output);
+            vulkan.DestroyBuffer(&event);
+            ++cases;
+          }
+        }
+      }
+    }
+  }
+  std::printf("ExternalCallProbe: %zu native GPU cases passed (diagnostic stop, live table selection, full64 inputs, EXEC0, no-call, scalar coherence, first event)\n", cases);
+}
+
+void CheckExternalProbeMismatch(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler::IR;
+  // Deliberately malformed scalar inputs exercise the diagnostic, rather than
+  // assuming a native READFIRSTLANE should disagree between emulated halves.
+  for (u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = "ExternalProbeSyntheticMismatch";
+    test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.host_subgroup_size = vulkan.SubgroupSize();
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.initial.assign(32u, 0xdedededeu);
+    CompiledShader compiled;
+    auto &program = compiled.program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = wave;
+    program.shader_hash = 0xfedcba9876543210ull;
+    program.info.uses_external_call_fault = true;
+    program.info.uses_external_call_probe = true;
+    program.srt_plan_complete = program.resource_tracking_complete = program.shader_info_complete = true;
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto *block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+    BlockInfo info;
+    info.id = 0u;
+    info.terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Return;
+    program.block_info.push_back(info);
+    auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
+    Value ordinal(&lane);
+    if (wave == 64u) {
+      auto &half = block->AppendNewInst(ValueOpcode::ShiftRightLogical32, {ordinal, Value(5u)});
+      ordinal = Value(&half);
+    }
+    auto &aux_high = block->AppendNewInst(ValueOpcode::IAdd32, {ordinal, Value(0x12u)});
+    auto &aux = block->AppendNewInst(ValueOpcode::CompositeConstructU64, {Value(0x200300u), Value(&aux_high)});
+    auto &probe = block->AppendNewInst(ValueOpcode::ExternalCallProbe,
+        {Value(uint64_t{0x1300100000ull}), Value(&aux), ordinal, Value(11u), Value(0u), Value(0u)});
+    probe.SetFlags<uint64_t>(0x234abc8024ull);
+    AllocateBindings(program);
+    compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &test.compute_info});
+    ValidateSpirv(test.name, compiled.spirv);
+    auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    auto fault = vulkan.CreateStorageBuffer(test.name, std::vector<u32>(16u, 0u), 16u);
+    vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, &fault);
+    CompareWords(test, "synthetic mismatch performs no guest writes", test.initial,
+                 vulkan.ReadBuffer(test.name, output, test.initial.size()));
+    const auto event = vulkan.ReadBuffer(test.name, fault, 16u);
+    const u32 winner = event[8];
+    Require(test.name, "CAS winner ordinal", wave == 64u ? winner == 0u : winner < 32u,
+            "diagnostic winner did not come from a valid physical lane");
+    const std::vector<u32> expected {1u,3u,0x00100000u,0x13u,0x4abc8024u,0x23u,
+        0x76543210u,0xfedcba98u,winner,11u,0u,0u,0x200300u,0x12u+winner,1u,32u};
+    CompareWords(test, "physical scalar or virtual-half mismatch reported", expected, event);
+    vulkan.DestroyBuffer(&output);
+    vulkan.DestroyBuffer(&fault);
+  }
+  std::puts("ExternalProbeSyntheticMismatch: 2 GPU cases passed (physical scalar disagreement and virtual-half disagreement)");
 }
 
 void CheckExternalLeafCalls(VulkanHarness &vulkan) {
@@ -34165,7 +34424,9 @@ void CheckExternalLeafCalls(VulkanHarness &vulkan) {
           }
         }
         auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
-        auto fault = vulkan.CreateStorageBuffer(test.name, std::vector<u32>(8u, 0u), 8u);
+        // The production host now allocates 64 bytes; ordinary leaf faults
+        // still write only their original first eight DWORDs.
+        auto fault = vulkan.CreateStorageBuffer(test.name, std::vector<u32>(16u, 0u), 16u);
         vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr,
                         nullptr, {}, {}, &fault);
         const auto actual = vulkan.ReadBuffer(test.name, output, test.expected.size());
@@ -34176,19 +34437,23 @@ void CheckExternalLeafCalls(VulkanHarness &vulkan) {
             static_cast<u32>(caller_address + call_pc), static_cast<u32>((caller_address + call_pc) >> 32u),
             static_cast<u32>(shader_hash), static_cast<u32>(shader_hash >> 32u)};
         CompareWords(test, "call-fault CAS winner detail", expected_fault, fault_words);
+        const auto extended_words = vulkan.ReadBuffer(test.name, fault, 16u);
+        CompareWords(test, "ordinary fault leaves extended words untouched", std::vector<u32>(8u, 0u),
+                     std::vector<u32>(extended_words.begin() + 8u, extended_words.end()));
         vulkan.DestroyBuffer(&output);
         vulkan.DestroyBuffer(&fault);
         ++cases;
       }
       SetRuntimeTarget(unknown_address);
-      const std::vector<u32> first_fault {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
+      const std::vector<u32> first_fault {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
+                                          9u, 10u, 11u, 12u, 13u, 14u, 15u, 16u};
       auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
       auto fault = vulkan.CreateStorageBuffer(test.name, first_fault, first_fault.size());
       vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr,
                       nullptr, {}, {}, &fault);
       CompareWords(test, "unknown-target termination with prior fault", test.initial,
                    vulkan.ReadBuffer(test.name, output, test.initial.size()));
-      CompareWords(test, "first fault remains latched", first_fault, vulkan.ReadBuffer(test.name, fault, 8u));
+      CompareWords(test, "first fault remains latched", first_fault, vulkan.ReadBuffer(test.name, fault, 16u));
       vulkan.DestroyBuffer(&output);
       vulkan.DestroyBuffer(&fault);
       ++cases;
@@ -42164,12 +42429,14 @@ int main(int argc, char **argv) {
   const bool captured_synthetic_inputs =
       argc == 5 &&
       std::strcmp(argv[1], "--captured-external-translate-synthetic-only") == 0;
+  const bool captured_probe = argc == 5 &&
+      std::strcmp(argv[1], "--captured-external-probe-translate-only") == 0;
   const bool captured_translation_only =
-      captured_actual_inputs || captured_synthetic_inputs;
+      captured_actual_inputs || captured_synthetic_inputs || captured_probe;
   EnsureConfigInitialized(!captured_translation_only);
   if (captured_translation_only) {
     CheckCapturedExternalTranslation(argv[2], argv[3], argv[4],
-                                     captured_actual_inputs);
+                                     captured_actual_inputs || captured_probe, captured_probe);
     return 0;
   }
   CheckLeastRecentlyUsedCacheOrdering();
@@ -42914,6 +43181,17 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--external-call-probe-only") == 0) {
+    VulkanHarness vulkan;
+    CheckExternalCallProbe(vulkan);
+    CheckExternalProbeMismatch(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--external-call-probe-invalid-workgroup") == 0) {
+    VulkanHarness vulkan;
+    CheckExternalCallProbe(vulkan, true);
+    Fail("ExternalCallProbe", "incomplete workgroup", "partial physical subgroup was accepted");
   }
   if (argc == 2 && std::strcmp(argv[1], "--external-leaf-calls-only") == 0) {
     VulkanHarness vulkan;
