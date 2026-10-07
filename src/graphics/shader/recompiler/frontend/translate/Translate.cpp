@@ -803,9 +803,21 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 	}
 }
 
-void Translator::TranslateExternalCall(const Decoder::Instruction& inst, const CFG::Terminator& term) {
+void Translator::TranslateExternalCall(const Decoder::Instruction& inst, const CFG::Terminator& term,
+	                                   IR::U32 ordinal) {
 	// Read both halves before either write, including the aliased source/destination case.
 	instruction_indirect_target = ReadU64(inst.src0);
+	if (term.external_checked_call) {
+		if (term.external_auxiliary_sgpr > 104u || ordinal.IsEmpty())
+			EXIT("checked external call has no captured record ordinal or auxiliary pair");
+		const auto aux_low = ir.GetScalarReg(static_cast<IR::ScalarReg>(term.external_auxiliary_sgpr));
+		const auto aux_high = ir.GetScalarReg(static_cast<IR::ScalarReg>(term.external_auxiliary_sgpr + 1u));
+		const auto auxiliary = ir.Emit(IR::ValueOpcode::CompositeConstructU64, {aux_low, aux_high});
+		ir.Emit(IR::ValueOpcode::ExternalCallInputGuard,
+		        {instruction_indirect_target, auxiliary, ordinal, IR::Value(term.external_context_domain),
+		         ir.GetExecLo(), program.wave_size == 64u ? ir.GetExecHi() : IR::U32(IR::Value(0u))},
+		        term.external_guest_pc);
+	}
 	WriteU32Pair(inst.dst, {IR::U32(IR::Value(static_cast<uint32_t>(term.external_link_address))),
 	                       IR::U32(IR::Value(static_cast<uint32_t>(term.external_link_address >> 32u)))});
 }
@@ -1058,6 +1070,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		return block.terminator.external_transfer;
 	});
 	result.info.uses_external_call_probe = options.external_call_probe;
+	result.info.uses_external_probe_before_bvh = options.external_probe_before_bvh;
+	result.external_caller_address = options.external_caller_address;
+	result.info.uses_checked_external_calls = options.checked_external_calls;
 	for (const auto& entry: options.external_entries) {
 		const IR::ExternalCallContextBinding binding {entry.domain_id, entry.function_id};
 		if (std::ranges::find(result.external_context_bindings, binding) == result.external_context_bindings.end())
@@ -1395,9 +1410,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		external_entries.emplace(entry.pc, &entry);
 		external_record_loads.insert(entry.record_load_pc);
 	}
-	if (options.external_call_probe) {
+	if (options.external_call_probe || options.checked_external_calls) {
 		for (const auto& block: cfg.blocks)
-			if (block.terminator.external_call_probe)
+			if (block.terminator.external_call_probe || block.terminator.external_checked_call)
 				external_record_loads.insert(block.terminator.external_record_load_pc);
 	}
 	for (const auto& cfg_block: cfg.blocks) {
@@ -1432,18 +1447,20 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				continue;
 			}
 			if (instruction.opcode == Decoder::Opcode::S_SWAPPC_B64) {
-				if (cfg_block.terminator.external_call_probe) {
+				if (cfg_block.terminator.external_call_probe || cfg_block.terminator.external_checked_call) {
 					const auto ordinal = external_ordinals.find(cfg_block.terminator.external_record_load_pc);
 					if (ordinal == external_ordinals.end())
 						EXIT("external target probe has no captured load-time GPU record ordinal");
-					translator.TranslateExternalCallProbe(instruction, cfg_block.terminator, ordinal->second);
+					if (cfg_block.terminator.external_call_probe)
+						translator.TranslateExternalCallProbe(instruction, cfg_block.terminator, ordinal->second);
+					else translator.TranslateExternalCall(instruction, cfg_block.terminator, ordinal->second);
 				} else translator.TranslateExternalCall(instruction, cfg_block.terminator);
 			}
 			else translator.TranslateInstruction(instruction);
 		}
 		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
 	}
-	if (options.external_call_probe) {
+	if (options.external_call_probe || options.checked_external_calls) {
 		for (const auto* block: result.blocks)
 			for (const auto& inst: *block)
 				if (inst.GetOpcode() == IR::ValueOpcode::Barrier)

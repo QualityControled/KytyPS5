@@ -30,6 +30,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -38,6 +40,34 @@
 #include <vector>
 
 namespace Libs::Graphics {
+static bool OneGroupExternalProbeRequested() {
+	const auto* value = std::getenv("KYTY_EXTERNAL_PROBE_ONE_GROUP");
+	if (value == nullptr) return false;
+	if (std::strcmp(value, "1") != 0) {
+		EXIT("Invalid KYTY_EXTERNAL_PROBE_ONE_GROUP: expected 1 or an unset variable\n");
+	}
+	return true;
+}
+
+static void ValidateOneGroupExternalProbe(const ShaderComputeInputInfo& input,
+                                         uint32_t groups_x, uint32_t groups_y,
+                                         uint32_t groups_z) {
+	const auto& program = *input.stage.program;
+	const bool uses_grid_extent = std::ranges::any_of(program.info.inputs, [](const auto& value) {
+		return value.kind == ShaderRecompiler::IR::StageInputKind::NumWorkgroups;
+	});
+	if (!program.info.uses_external_call_probe || !program.info.uses_external_call_fault ||
+	    program.info.uses_checked_external_calls ||
+	    groups_x == 0 || groups_y != 1 || groups_z != 1 ||
+	    input.threads_num[1] != 1 || input.threads_num[2] != 1 ||
+	    input.dispatch_thread_dimensions || input.lds_storage || input.lds_size_dwords != 0 ||
+	    input.scratch_size_dwords != 0 || program.scratch_dwords != 0 ||
+	    input.tg_size_en || uses_grid_extent) {
+		EXIT("Single-workgroup external probe rejected: requires a direct 1D probe without "
+		     "dispatch extent inputs, LDS, scratch, or size-register semantics\n");
+	}
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -306,7 +336,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (resources.specialization_reads.empty() &&
+	if (!program.info.uses_external_call_probe && !program.info.uses_checked_external_calls &&
+	    resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                 thread_group_z, mode))) {
@@ -430,13 +461,29 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	const bool one_group_probe = program.info.uses_external_call_probe &&
+	    OneGroupExternalProbeRequested();
+	if (one_group_probe) {
+		if (unknown_mode_bits != 0) {
+			EXIT("Single-workgroup external-call probe rejects unknown dispatch initiator bits\n");
+		}
+		ValidateOneGroupExternalProbe(input_info, thread_group_x, thread_group_y, thread_group_z);
+		std::printf("Single-workgroup external-call probe: original_grid=%ux%ux%u dispatched_grid=1x1x1 "
+		            "shader=0x%016" PRIx64 "; partial diagnostic, no following consumers permitted\n",
+		            thread_group_x, thread_group_y, thread_group_z, program.shader_hash);
+		std::fflush(stdout);
+	}
+	vk_buffer.dispatch(one_group_probe ? 1u : thread_group_x, thread_group_y, thread_group_z);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
-	if (program.info.uses_external_call_probe) {
+	if (program.info.uses_external_call_probe || program.info.uses_checked_external_calls) {
 		m_context.GetBufferCache().ProcessShaderCallFaultBuffer(true);
+	}
+	if (one_group_probe) {
+		EXIT("Single-workgroup external-call diagnostic completed without a shader fault record; "
+		     "only native workgroup 0 ran, stopped before following PM4 consumers\n");
 	}
 }
 
@@ -463,6 +510,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
+	if (program.info.uses_external_call_probe && OneGroupExternalProbeRequested()) {
+		EXIT("Single-workgroup external-call probe rejects indirect dispatch before execution\n");
+	}
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -497,7 +547,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
-	if (program.info.uses_external_call_probe) {
+	if (program.info.uses_external_call_probe || program.info.uses_checked_external_calls) {
 		m_context.GetBufferCache().ProcessShaderCallFaultBuffer(true);
 	}
 }

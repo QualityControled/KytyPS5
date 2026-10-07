@@ -64,6 +64,7 @@ struct Terminator {
 	bool external_transfer = false;
 	bool external_call = false;
 	bool external_call_probe = false;
+	bool external_checked_call = false;
 	uint32_t external_record_load_pc = UINT32_MAX;
 	uint32_t external_auxiliary_sgpr = UINT32_MAX;
 	uint32_t external_context_domain = UINT32_MAX;
@@ -133,6 +134,7 @@ struct ExternalTransfer {
 	uint64_t link_address = 0;
 	bool call = false;
 	bool probe = false;
+	bool checked = false;
 	uint32_t record_load_pc = UINT32_MAX;
 	uint32_t auxiliary_sgpr = UINT32_MAX;
 	uint32_t context_domain = UINT32_MAX;

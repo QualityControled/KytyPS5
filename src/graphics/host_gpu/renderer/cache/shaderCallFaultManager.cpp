@@ -65,13 +65,35 @@ void ShaderCallFaultManager::Process(bool wait_for_completion) {
 			     record[14], record[15]);
 		}
 		if (record[1] == 5u) {
-			EXIT("Shader selected-call diagnostic layout rejection: detail0=%u detail1=%u "
+			EXIT("Shader checked external-call layout rejection: detail0=%u detail1=%u "
 			     "guest_pc=0x%016" PRIx64 " shader=0x%016" PRIx64
 			     " physical_local=%u subgroup_id=%u subgroup_lane=%u subgroup_size=%u "
 			     "physical_workgroup=%u expected_subgroup=%u guest_wave=%u host_width=%u"
 			     "; stopped before guest shader work\n", record[2], record[3], pc, hash,
 			     record[8], record[9], record[10], record[11], record[12], record[13],
 			     record[14], record[15]);
+		}
+		if (record[1] == 6u) {
+			EXIT("Shader external scalar call-input disagreement: target=0x%016" PRIx64
+			     " guest_pc=0x%016" PRIx64 " shader=0x%016" PRIx64
+			     "; stopped before selected callee or caller continuation\n", target, pc, hash);
+		}
+		if (record[1] == 7u) {
+			EXIT("Shader first-active BVH diagnostic stop: derived_node_address=0x%016" PRIx64
+			     " guest_pc=0x%016" PRIx64 " shader=0x%016" PRIx64
+			     " descriptor=[%08x,%08x,%08x,%08x] raw_node=0x%08x%08x exec=0x%08x%08x"
+			     "; stopped before intersection, BDA lookup, or following consumers\n",
+			     target, pc, hash, record[8], record[9], record[10], record[11],
+			     record[13], record[12], record[15], record[14]);
+		}
+		if (record[1] == 1u && record[15] == 32u && record[14] == 0u) {
+			const uint64_t auxiliary = uint64_t {record[12]} | (uint64_t {record[13]} << 32u);
+			EXIT("Shader checked external-call coverage stop: target=0x%016" PRIx64
+			     " guest_pc=0x%016" PRIx64 " shader=0x%016" PRIx64
+			     " ordinal=%u domain=%u exec=0x%08x%08x auxiliary=0x%016" PRIx64
+			     " host_subgroup=%u; selected function is outside verified coverage\n",
+			     target, pc, hash, record[8], record[9], record[11], record[10], auxiliary,
+			     record[15]);
 		}
 		EXIT("Shader external-call runtime fault: kind=%u target=0x%016" PRIx64
 		     " guest_pc=0x%016" PRIx64 " shader=0x%016" PRIx64 "\n",
@@ -81,8 +103,8 @@ void ShaderCallFaultManager::Process(bool wait_for_completion) {
 	const auto scheduled_tick = m_ticks[m_area];
 	m_area = (m_area + 1u) % MaxPending;
 	if (wait_for_completion) {
-		// Probe invocations deliberately stop at SWAPPC. Finish their dispatch and inspect
-		// the record before any following PM4 consumer can use incomplete results.
+		// Checked external calls may return early at a diagnostic fault. Finish their dispatch
+		// and inspect the record before following PM4 consumers can use incomplete results.
 		m_scheduler.Wait(scheduled_tick);
 		m_scheduler.PopPendingOperations();
 	}

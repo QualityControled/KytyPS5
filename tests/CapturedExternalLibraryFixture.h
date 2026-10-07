@@ -25,11 +25,12 @@ inline void RequireParse(bool condition, const std::string &failure) {
   Require(condition, failure.c_str());
 }
 
-inline std::vector<uint32_t> ReadWords(const std::filesystem::path &path) {
+inline std::vector<uint32_t> ReadWords(const std::filesystem::path &path,
+                                       size_t max_bytes = 1024u * 1024u) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   Require(bool(file), "cannot open explicitly selected captured binary");
   const auto bytes = file.tellg();
-  Require(bytes > 0 && bytes <= 1024 * 1024 && bytes % 4 == 0,
+  Require(bytes > 0 && bytes <= max_bytes && bytes % 4 == 0,
           "captured file exceeds bounded aligned input size");
   std::vector<uint32_t> words(static_cast<size_t>(bytes) / sizeof(uint32_t));
   file.seekg(0);
@@ -45,6 +46,8 @@ struct Region {
 
 struct CapturedMemory {
   std::vector<Region> regions;
+  bool report_unmapped = false;
+  size_t denied_read_requests = 0;
   void Merge() {
     std::ranges::sort(regions, {}, &Region::address);
     std::vector<Region> merged;
@@ -75,21 +78,31 @@ struct CapturedMemory {
   }
   static bool Read(void *context, uint64_t address,
                    std::span<uint32_t> output) {
-    const auto &regions = static_cast<CapturedMemory *>(context)->regions;
-    if (output.empty() || (address & 3u) != 0u)
+    auto &memory = *static_cast<CapturedMemory *>(context);
+    const auto &regions = memory.regions;
+    const auto unavailable = [&] {
+      ++memory.denied_read_requests;
+      if (memory.report_unmapped && memory.denied_read_requests <= 16u)
+        std::fprintf(
+            stderr,
+            "CapturedMemory: unmapped request address=0x%016llx dwords=%zu\n",
+            static_cast<unsigned long long>(address), output.size());
       return false;
+    };
+    if (output.empty() || (address & 3u) != 0u)
+      return unavailable();
     const auto after =
         std::upper_bound(regions.begin(), regions.end(), address,
                          [](uint64_t value, const Region &region) {
                            return value < region.address;
                          });
     if (after == regions.begin())
-      return false;
+      return unavailable();
     const auto &region = *std::prev(after);
     const uint64_t offset = (address - region.address) / 4u;
     if (offset > region.words.size() ||
         output.size() > region.words.size() - offset)
-      return false;
+      return unavailable();
     std::copy_n(region.words.begin() + static_cast<size_t>(offset),
                 output.size(), output.begin());
     return true;
@@ -99,11 +112,80 @@ struct CapturedMemory {
 struct Fixture {
   std::vector<uint32_t> caller;
   Shader::ExternalLibraryPlan library;
+  CapturedMemory memory;
+  DirectUserEntries direct_user;
   ComputeControls controls;
   size_t total_functions = 0;
   size_t total_records = 0;
   bool synthetic_inputs = false;
 };
+
+inline bool VerifyDirectUserOrigins(const DirectUserEntries &entries,
+                                    const Shader::Decoder::Program &caller,
+                                    const ComputeControls &controls,
+                                    CapturedMemory &memory,
+                                    std::string &failure) {
+  if (!entries.present)
+    return true; // Older captures remain translation-only inputs.
+  struct Reader {
+    CapturedMemory &memory;
+    const DirectUserEntries &entries;
+    static bool Read(void *context, uint64_t address,
+                     std::span<uint32_t> words) {
+      auto &self = *static_cast<Reader *>(context);
+      // Preserve a recorded failed read even if an unrelated captured region
+      // happens to cover it. Failed callbacks contribute no payload bytes.
+      for (const auto &entry : self.entries.loads)
+        if (!entry.rejected && entry.read_failed && entry.address == address &&
+            entry.dword_count == words.size())
+          return false;
+      return CapturedMemory::Read(&self.memory, address, words);
+    }
+  } reader{memory, entries};
+  const auto recreated = Shader::Diagnostics::CaptureDirectUserLoads(
+      true, caller, controls.user_data, Reader::Read, &reader,
+      controls.user_data_base);
+  if (recreated.loads.size() != entries.loads.size() ||
+      recreated.limit_reached != entries.limit_reached ||
+      recreated.requested_bytes != entries.requested_bytes) {
+    failure = "decoded direct-user origins differ from captured row "
+              "count/attempt accounting";
+    return false;
+  }
+  for (size_t i = 0; i < recreated.loads.size(); ++i) {
+    const auto &native = recreated.loads[i];
+    const auto &saved = entries.loads[i];
+    if (native.pc != saved.pc ||
+        native.destination_sgpr != saved.destination_sgpr ||
+        native.user_sgpr != saved.user_sgpr ||
+        native.dword_count != saved.dword_count ||
+        native.offset != saved.offset || native.address != saved.address ||
+        native.read_failed != saved.read_failed ||
+        (!native.rejection.empty()) != saved.rejected ||
+        (!saved.rejected && !saved.read_failed &&
+         native.words.size() != saved.dword_count)) {
+      failure = "direct-user snapshot does not match decoded instruction and "
+                "captured user-pointer provenance";
+      return false;
+    }
+  }
+  return true;
+}
+
+inline void AddDirectUserPayloads(const DirectUserEntries &entries,
+                                  const std::filesystem::path &folder,
+                                  CapturedMemory &memory) {
+  for (const auto &entry : entries.loads) {
+    if (entry.rejected || entry.read_failed)
+      continue;
+    auto words =
+        ReadWords(folder / entry.file, entry.dword_count * sizeof(uint32_t));
+    Require(words.size() == entry.dword_count,
+            "direct-user snapshot payload differs from its exact native DWORD "
+            "count");
+    memory.regions.push_back({entry.address, std::move(words)});
+  }
+}
 
 inline CaptureManifest ReadManifest(const std::filesystem::path &path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -293,11 +375,20 @@ inline Fixture Load(const char *caller_path, const char *folder_path,
               requested_targets == reserved_targets &&
               reserved_targets <= Shader::Diagnostics::MaxAggregateTargetBytes,
           "captured prefix accounting does not match complete bounded reads");
+  std::string direct_failure;
+  RequireParse(
+      ParseDirectUserEntries(manifest, fixture.direct_user, direct_failure),
+      direct_failure);
+  AddDirectUserPayloads(fixture.direct_user, folder, memory);
   memory.Merge();
   Shader::Decoder::Program caller;
   Shader::Decoder::DecodeProgram(fixture.caller, caller);
   Require(caller.instructions.size() == fixture.controls.decoded_instructions,
           "decoded caller count differs from this capture manifest");
+  RequireParse(VerifyDirectUserOrigins(fixture.direct_user, caller,
+                                       fixture.controls, memory,
+                                       direct_failure),
+               direct_failure);
   auto loaded = Shader::LoadExternalLibrary(
       caller, fixture.controls.caller_address, fixture.controls.user_data,
       fixture.controls.user_data_base, CapturedMemory::Read, &memory);
@@ -342,6 +433,7 @@ inline Fixture Load(const char *caller_path, const char *folder_path,
       selected.insert(record.function_address);
     site.candidate_addresses.assign(selected.begin(), selected.end());
   }
+  fixture.memory = std::move(memory);
   return fixture;
 }
 } // namespace CapturedExternalTest

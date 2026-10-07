@@ -3554,6 +3554,164 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+void TestCheckedFixedLaneDescriptorProvenance() {
+  for (const uint32_t wave : {32u, 64u}) {
+    for (const bool cycle : {false, true}) {
+      Fixture fixture;
+      fixture.program.wave_size = wave;
+      fixture.program.info.uses_checked_external_calls = true;
+      std::array<Value, 8> saved;
+      auto vector = fixture.Emit(ValueOpcode::UndefU32);
+      for (uint32_t word = 0; word < saved.size(); ++word) {
+        saved[word] = fixture.UserData(word);
+        vector = fixture.Emit(ValueOpcode::WriteLane,
+                              {vector, saved[word], Value(9u + word)});
+      }
+      if (cycle) {
+        auto *loop = fixture.AddBlock();
+        fixture.block->AddBranch(loop);
+        loop->AddBranch(loop);
+        auto &phi = loop->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+        const auto update = fixture.Emit(ValueOpcode::WriteLane,
+            {Value(&phi), Value(0xdecafbadU), Value(3u)}, 0, loop);
+        phi.AddPhiOperand(fixture.block, vector);
+        phi.AddPhiOperand(loop, update);
+        vector = Value(&phi);
+      }
+      std::array<Value, 8> words;
+      for (uint32_t word = 0; word < words.size(); ++word) {
+        words[word] = fixture.Emit(ValueOpcode::ReadLane, {vector, Value(9u + word)});
+        if (cycle) {
+          auto &phi = fixture.block->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+          phi.AddPhiOperand(fixture.block, saved[word]);
+          phi.AddPhiOperand(fixture.program.blocks[1], words[word]);
+          words[word] = Value(&phi);
+        }
+      }
+      const auto handle = fixture.Image(words, 0x1814u);
+      MemoryInfo memory{.kind = ResourceKind::Image,
+                        .image_dimension = Decoder::ImageDimension::Dim2D};
+      fixture.Emit(ValueOpcode::ImageRead,
+                   {handle, fixture.ImageAddress(), Value(true)},
+                   fixture.AddMemory(memory, 0x1814u));
+      fixture.PlanAndTrack();
+      Check(fixture.program.info.images.size() == 1u &&
+                fixture.program.info.uses_checked_external_calls,
+            "checked fixed-lane scalar save lost its image or contract flag");
+      const auto &source = fixture.program.descriptor_sources[
+          fixture.program.info.images[0].source];
+      Check(!source.indirect_descriptor && source.dword_count == 8u,
+            "fixed-lane metadata proof became a guessed indirect table");
+      for (uint32_t word = 0; word < words.size(); ++word) {
+        Check(source.dwords[word].Resolve() == saved[word] &&
+                  handle.TryInstruction()->Arg(word) == words[word],
+              "fixed-lane metadata proof changed executable descriptor values");
+      }
+      const auto plan = ExtractResourcePlan(fixture.program);
+      const std::array<uint32_t, 8> user_words{
+          0x101u, 0x202u, 0x303u, 0x404u, 0x505u, 0x606u, 0x707u, 0x808u};
+      SrtWalker evaluator(plan, SrtRuntime{.user_data = user_words});
+      DescriptorValue value;
+      Check(evaluator.EvaluateDescriptor(plan.info.images[0].source, value) &&
+                value.dwords == user_words,
+            "retained fixed-lane resource plan lost exact scalar save words");
+    }
+  }
+}
+
+void TestCheckedFixedLaneDescriptorRejections() {
+  for (uint32_t scenario = 0; scenario < 8u; ++scenario) {
+    Fixture fixture;
+    fixture.program.wave_size = 64u;
+    fixture.program.info.uses_checked_external_calls = scenario != 0u;
+    std::array<Value, 8> words;
+    auto vector = fixture.Emit(ValueOpcode::UndefU32);
+    for (uint32_t word = 0; word < words.size(); ++word)
+      vector = fixture.Emit(ValueOpcode::WriteLane,
+          {vector, fixture.UserData(word), Value(9u + word)});
+    if (scenario == 1u) {
+      const auto varying = fixture.Emit(ValueOpcode::LaneId);
+      const auto predicate = fixture.Emit(ValueOpcode::IEqual32, {varying, Value(0u)});
+      vector = fixture.Emit(ValueOpcode::SelectU32, {predicate, varying, vector});
+    } else if (scenario == 2u) {
+      vector = fixture.Emit(ValueOpcode::WriteLane,
+          {vector, Value(0u), fixture.Emit(ValueOpcode::LaneId)});
+    } else if (scenario >= 3u) {
+      auto &phi = fixture.block->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      if (scenario == 3u) {
+        const auto clobber = fixture.Emit(ValueOpcode::WriteLane,
+            {vector, fixture.UserData(8u), Value(9u)});
+        phi.AddPhiOperand(fixture.block, vector);
+        phi.AddPhiOperand(fixture.block, clobber);
+      } else if (scenario == 4u) {
+        phi.AddPhiOperand(fixture.block, Value(&phi));
+      } else {
+        auto &unanchored = fixture.block->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+        unanchored.AddPhiOperand(fixture.block, Value(&unanchored));
+        phi.AddPhiOperand(fixture.block, vector);
+        phi.AddPhiOperand(fixture.block, Value(&unanchored));
+      }
+      vector = Value(&phi);
+    }
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      const auto lane = scenario == 6u ? fixture.Emit(ValueOpcode::LaneId)
+                       : Value(scenario == 7u ? 64u : 9u + word);
+      words[word] = fixture.Emit(ValueOpcode::ReadLane, {vector, lane});
+    }
+    const auto handle = fixture.Image(words, 0x1814u);
+    MemoryInfo memory{.kind = ResourceKind::Image,
+                      .image_dimension = Decoder::ImageDimension::Dim2D};
+    fixture.Emit(ValueOpcode::ImageRead,
+                 {handle, fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(memory, 0x1814u));
+    CheckFatal([&] { fixture.PlanAndTrack(); },
+               "GetImageResource dword 0 is not a valid runtime value",
+               "unchecked/clobbered/dynamic/unanchored lane source was accepted");
+    Check(!fixture.program.resource_tracking_complete,
+          "failed fixed-lane provenance partially committed tracking");
+  }
+}
+void TestCheckedFixedLaneDescriptorBounds() {
+  for (const uint32_t writes : {8192u, 16384u}) {
+    Fixture fixture;
+    fixture.program.wave_size = 64u;
+    fixture.program.info.uses_checked_external_calls = true;
+    std::array<Value, 8> saved;
+    auto vector = fixture.Emit(ValueOpcode::UndefU32);
+    for (uint32_t word = 0; word < saved.size(); ++word) {
+      saved[word] = fixture.UserData(word);
+      vector = fixture.Emit(ValueOpcode::WriteLane,
+          {vector, saved[word], Value(9u + word)});
+    }
+    for (uint32_t write = 0; write < writes; ++write)
+      vector = fixture.Emit(ValueOpcode::WriteLane,
+          {vector, Value(write), Value(3u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word)
+      words[word] = fixture.Emit(ValueOpcode::ReadLane, {vector, Value(9u + word)});
+    const auto handle = fixture.Image(words, 0x1814u);
+    MemoryInfo memory{.kind = ResourceKind::Image,
+                      .image_dimension = Decoder::ImageDimension::Dim2D};
+    fixture.Emit(ValueOpcode::ImageRead,
+                 {handle, fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(memory, 0x1814u));
+    if (writes == 16384u) {
+      CheckFatal([&] { fixture.PlanAndTrack(); },
+                 "checked fixed-lane descriptor proof exceeds 16384 value/lane states",
+                 "fixed-lane proof accepted a truncated provenance graph");
+      Check(!fixture.program.resource_tracking_complete,
+            "over-budget fixed-lane graph partially committed tracking");
+    } else {
+      fixture.PlanAndTrack();
+      const auto &source = fixture.program.descriptor_sources[
+          fixture.program.info.images[0].source];
+      for (uint32_t word = 0; word < words.size(); ++word)
+        Check(source.dwords[word].Resolve() == saved[word] &&
+                  handle.TryInstruction()->Arg(word) == words[word],
+              "deep fixed-lane provenance lost exact save or executable graph");
+    }
+  }
+}
 void TestWorkgroupScalarBufferImageBounds() {
   Fixture fixture;
   std::array<Value, 4> table_words;
@@ -3921,6 +4079,9 @@ int main() {
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("workgroup scalar V# image bounds", TestWorkgroupScalarBufferImageBounds);
+    Run("checked fixed-lane descriptors", TestCheckedFixedLaneDescriptorProvenance);
+    Run("checked fixed-lane rejections", TestCheckedFixedLaneDescriptorRejections);
+    Run("checked fixed-lane bounds", TestCheckedFixedLaneDescriptorBounds);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("writable descriptor phi", TestWritableDescriptorPhi);

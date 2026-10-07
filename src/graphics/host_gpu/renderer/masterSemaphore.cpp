@@ -3,6 +3,8 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <cinttypes>
+
 namespace Libs::Graphics {
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
@@ -26,7 +28,10 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("GPU timeline counter failed: Vulkan result=%d device_lost=%d\n",
+		     static_cast<int>(result), result == vk::Result::eErrorDeviceLost);
+	}
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
 	while (known < counter &&
@@ -50,7 +55,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("GPU timeline wait failed: Vulkan result=%d device_lost=%d tick=%" PRIu64 "\n",
+		     static_cast<int>(result), result == vk::Result::eErrorDeviceLost, tick);
+	}
 	Refresh();
 }
 

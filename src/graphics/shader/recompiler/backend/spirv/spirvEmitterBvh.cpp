@@ -324,6 +324,77 @@ void DefineBvhIntersect(EmitterState& s) {
 	s.builder.AddFunction(spv::OpFunctionEnd);
 }
 
+void EmitExternalBvhProbe(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.half != 0u) return;
+	auto& s = ctx.state;
+	const auto* ray = ctx.ImageAddress(inst.Arg(1));
+	if (!s.program.info.uses_external_call_probe || !s.program.info.uses_external_probe_before_bvh ||
+	    s.program.stage != ShaderType::Compute || ray == nullptr ||
+	    !inst.Arg(3).IsImmediate() || inst.Arg(3).GetType() != IR::Type::U32 ||
+	    (inst.Arg(3).U32() != 1u && inst.Arg(3).U32() != 2u) ||
+	    ray->NumArgs() < inst.Arg(3).U32() + 10u)
+		ctx.Fail(inst, "before-BVH trap requires the explicit caller-only probe and raw ray inputs");
+	const auto node_words = inst.Arg(3).U32();
+	// Both halves' producers are already available. Ballot runs before any
+	// EXEC-dependent helper branch, so every physical invocation participates.
+	const auto exec = ctx.Ballot(inst.Arg(2));
+	const auto exec_lo = Extract(s, TypeU32(s), exec, 0u);
+	const auto exec_hi = Extract(s, TypeU32(s), exec, 1u);
+	const auto any_active = Binary(s, spv::OpINotEqual, TypeBool(s),
+	    Binary(s, spv::OpBitwiseOr, TypeU32(s), exec_lo, exec_hi), ConstantU32(s, 0));
+	const auto trap = s.builder.AllocateId();
+	const auto proceed = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpSelectionMerge, proceed, spv::SelectionControlMaskNone);
+	s.builder.AddFunction(spv::OpBranchConditional, any_active, trap, proceed);
+	EmitLabel(s, trap);
+	const auto active_low = ctx.Arg(inst, 2);
+	const auto active_high = ctx.other_half != nullptr
+	    ? ctx.other_half->Arg(inst, 2) : ConstantBool(s, false);
+	const auto local_active = Binary(s, spv::OpLogicalOr, TypeBool(s), active_low, active_high);
+	const auto choose_word = [&](uint32_t low, uint32_t high) {
+		return ctx.other_half == nullptr ? low : Select(s, TypeU32(s), active_low, low, high);
+	};
+	std::array<uint32_t, 4> descriptor;
+	for (uint32_t word = 0; word < descriptor.size(); ++word) {
+		const auto low = Extract(s, TypeU32(s), ctx.Arg(inst, 0), word);
+		const auto high = ctx.other_half != nullptr
+		    ? Extract(s, TypeU32(s), ctx.other_half->Arg(inst, 0), word) : low;
+		descriptor[word] = choose_word(low, high);
+	}
+	const auto node_lo = choose_word(ctx.Arg(*ray, 0), ctx.other_half != nullptr
+	    ? ctx.other_half->Arg(*ray, 0) : ctx.Arg(*ray, 0));
+	const auto node_hi = node_words == 2u
+	    ? choose_word(ctx.Arg(*ray, 1), ctx.other_half != nullptr
+	        ? ctx.other_half->Arg(*ray, 1) : ctx.Arg(*ray, 1))
+	    : ConstantU32(s, 0);
+	const auto node = PackU64(s, node_lo, node_hi);
+	const auto base = Binary(s, spv::OpShiftLeftLogical, TypeU64(s),
+	    PackU64(s, descriptor[0], Binary(s, spv::OpBitwiseAnd, TypeU32(s),
+	                                   descriptor[1], ConstantU32(s, 0xff))), ConstantU32(s, 8));
+	const auto address = Binary(s, spv::OpIAdd, TypeU64(s), base,
+	    Binary(s, spv::OpShiftLeftLogical, TypeU64(s),
+	        Binary(s, spv::OpShiftRightLogical, TypeU64(s), node, ConstantU32(s, 3)),
+	        ConstantU32(s, 6)));
+	const auto low_address = Unary(s, spv::OpUConvert, TypeU32(s), address);
+	const auto high_address = Unary(s, spv::OpUConvert, TypeU32(s),
+	    Binary(s, spv::OpShiftRightLogical, TypeU64(s), address, ConstantU32(s, 32)));
+	const std::array<uint32_t, 8> extra {
+	    descriptor[0], descriptor[1], descriptor[2], descriptor[3],
+	    node_lo, node_hi, exec_lo, exec_hi};
+	// An inactive physical lane cannot win with stale VGPR words. All lanes
+	// converge and return after the active winner(s) have attempted the CAS.
+	const auto winner = s.builder.AllocateId();
+	const auto recorded = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpSelectionMerge, recorded, spv::SelectionControlMaskNone);
+	s.builder.AddFunction(spv::OpBranchConditional, local_active, winner, recorded);
+	EmitLabel(s, winner);
+	RecordExternalDiagnosticFault(ctx, 7, low_address, high_address, inst.Flags<uint64_t>(), extra);
+	s.builder.AddFunction(spv::OpBranch, recorded);
+	EmitLabel(s, recorded);
+	s.builder.AddFunction(spv::OpReturn);
+	EmitLabel(s, proceed);
+}
+
 uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	const auto* ray = ctx.ImageAddress(inst.Arg(1));

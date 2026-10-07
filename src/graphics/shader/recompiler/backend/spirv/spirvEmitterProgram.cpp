@@ -13,6 +13,8 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+static std::array<uint32_t, 8> ExternalCallInputDetails(ValueEmitContext& ctx, const IR::Inst& inst,
+	                                                 uint32_t mismatch);
 namespace {
 
 [[noreturn]] void Fail(const char* reason) {
@@ -214,25 +216,29 @@ uint32_t LoadProbeU32(EmitterState& state, uint32_t variable) {
 	return value;
 }
 
-void EmitExternalProbeLayoutGuard(ValueEmitContext& ctx) {
+void EmitCheckedExternalLayoutGuard(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
-	if (!state.program.info.uses_external_call_probe) return;
+	if (!state.program.info.uses_external_call_probe && !state.program.info.uses_checked_external_calls) return;
+	for (const auto* block: state.program.blocks)
+		for (const auto& inst: *block)
+			if (inst.GetOpcode() == IR::ValueOpcode::Barrier)
+				Fail("checked external calls cannot terminate waves with workgroup barriers");
 	const auto* input = state.input_info.compute;
 	if (state.program.stage != ShaderType::Compute || input == nullptr ||
 	    input->host_subgroup_size != 32u ||
 	    (state.program.wave_size != 32u && state.program.wave_size != 64u))
-		Fail("external probe requires compute guest wave32/64 and host subgroup32");
+		Fail("checked external calls require compute guest wave32/64 and host subgroup32");
 	uint64_t total = 1;
 	for (const auto size: input->threads_num) {
 		if (size == 0 || total > UINT32_MAX / size)
-			Fail("external probe has invalid workgroup dimensions");
+			Fail("checked external calls have invalid workgroup dimensions");
 		total *= size;
 	}
 	const uint32_t physical_total = state.lane_count == 2u
 	                                    ? static_cast<uint32_t>(((total + 63u) / 64u) * 32u)
 	                                    : static_cast<uint32_t>(total);
 	if (physical_total == 0u || physical_total % 32u != 0u)
-		Fail("external probe requires complete physical subgroup slots");
+		Fail("checked external calls require complete physical subgroup slots");
 	const auto physical_index = LoadProbeU32(
 	    state, InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex));
 	const auto subgroup_id = LoadProbeU32(state, state.probe_subgroup_id_variable);
@@ -286,6 +292,40 @@ uint32_t EmitExternalDispatcherNextPc(ValueEmitContext&              ctx,
 	    term.indirect_guest_addresses.size() != term.indirect_targets.size())
 		Fail("external transfer has an invalid 64-bit target mapping");
 	const auto            selector = ctx.Def(info.indirect_target);
+	if (state.program.info.uses_checked_external_calls) {
+		const auto scope = ConstantU32(state, spv::ScopeSubgroup);
+		uint32_t mismatch = ConstantBool(state, false);
+		for (uint32_t word = 0; word < 2u; ++word) {
+			const auto component = Unary(state, spv::OpUConvert, TypeU32(state), word == 0u
+			    ? selector : Binary(state, spv::OpShiftRightLogical, TypeU64(state), selector,
+			                        ConstantU32(state, 32)));
+			const auto first = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst,
+			                          TypeU32(state), first, scope, component);
+			mismatch = Binary(state, spv::OpLogicalOr, TypeBool(state), mismatch,
+			    Binary(state, spv::OpINotEqual, TypeBool(state), component, first));
+		}
+		if (ctx.other_half != nullptr)
+			mismatch = Binary(state, spv::OpLogicalOr, TypeBool(state), mismatch,
+			    Binary(state, spv::OpINotEqual, TypeBool(state), selector,
+			           ctx.other_half->Def(info.indirect_target)));
+		const auto any_mismatch = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformAny, TypeBool(state), any_mismatch,
+		                          scope, mismatch);
+		const auto failure = state.builder.AllocateId();
+		const auto proceed = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelectionMerge, proceed, spv::SelectionControlMaskNone);
+		state.builder.AddFunction(spv::OpBranchConditional, any_mismatch, failure, proceed);
+		EmitLabel(state, failure);
+		const auto low = Unary(state, spv::OpUConvert, TypeU32(state), selector);
+		const auto high = Unary(state, spv::OpUConvert, TypeU32(state),
+		    Binary(state, spv::OpShiftRightLogical, TypeU64(state), selector, ConstantU32(state, 32)));
+		RecordShaderCallFault(ctx, 6, low, high, term.external_guest_pc);
+		// Every physical invocation takes this branch, including both virtual
+		// halves. A disagreed scalar target cannot execute a guessed callee.
+		EmitReturn(ctx);
+		EmitLabel(state, proceed);
+	}
 	const auto            merge    = state.builder.AllocateId();
 	const auto            fault    = state.builder.AllocateId();
 	std::vector<uint32_t> labels(term.indirect_targets.size());
@@ -313,7 +353,14 @@ uint32_t EmitExternalDispatcherNextPc(ValueEmitContext&              ctx,
 	const auto high = Unary(
 	    state, spv::OpUConvert, TypeU32(state),
 	    Binary(state, spv::OpShiftRightLogical, TypeU64(state), selector, ConstantU32(state, 32)));
-	RecordShaderCallFault(ctx, 1, low, high, term.external_guest_pc);
+	if (state.program.info.uses_checked_external_calls && term.external_checked_call) {
+		const IR::Inst* guard = nullptr;
+		for (const auto& inst: *block)
+			if (inst.GetOpcode() == IR::ValueOpcode::ExternalCallInputGuard) guard = &inst;
+		if (guard == nullptr) Fail("checked external call has no scalar input guard");
+		const auto extra = ExternalCallInputDetails(ctx, *guard, ConstantBool(state, false));
+		RecordShaderCallFault(ctx, 1, low, high, term.external_guest_pc, extra);
+	} else RecordShaderCallFault(ctx, 1, low, high, term.external_guest_pc);
 	phi.push_back(ConstantU32(state, UINT32_MAX));
 	phi.push_back(state.current_label);
 	state.builder.AddFunction(spv::OpBranch, merge);
@@ -628,11 +675,8 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 
 } // namespace
 
-void EmitExternalCallProbe(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.half != 0u) return; // A single native scalar event, including both virtual halves.
+static uint32_t ExternalCallInputMismatch(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
-	if (!state.program.info.uses_external_call_probe || state.program.stage != ShaderType::Compute)
-		ctx.Fail(inst, "target probe was emitted without its explicit diagnostic variant");
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	uint32_t mismatch = ConstantBool(state, false);
 	for (size_t index = 0; index < inst.NumArgs(); ++index) {
@@ -656,18 +700,64 @@ void EmitExternalCallProbe(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto any_mismatch = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformAny, TypeBool(state), any_mismatch, scope, mismatch);
+	return any_mismatch;
+}
+
+void RecordExternalDiagnosticFault(ValueEmitContext& ctx, uint32_t kind, uint32_t low,
+	                              uint32_t high, uint64_t guest_pc,
+	                              std::span<const uint32_t> extra) {
+	RecordShaderCallFault(ctx, kind, low, high, guest_pc, extra);
+}
+
+static std::array<uint32_t, 8> ExternalCallInputDetails(ValueEmitContext& ctx, const IR::Inst& inst,
+	                                                 uint32_t mismatch) {
+	auto& state = ctx.state;
 	const auto low_word = [&](uint32_t value) { return Unary(state, spv::OpUConvert, TypeU32(state), value); };
 	const auto high_word = [&](uint32_t value) {
 		return low_word(Binary(state, spv::OpShiftRightLogical, TypeU64(state), value, ConstantU32(state, 32)));
 	};
-	const auto target = ctx.Arg(inst, 0);
 	const auto auxiliary = ctx.Arg(inst, 1);
-	const std::array<uint32_t, 8> extra {
+	return {
 	    ctx.Arg(inst, 2), ctx.Arg(inst, 3), ctx.Arg(inst, 4), ctx.Arg(inst, 5),
 	    low_word(auxiliary), high_word(auxiliary),
-	    Select(state, TypeU32(state), any_mismatch, ConstantU32(state, 1), ConstantU32(state, 0)),
+	    Select(state, TypeU32(state), mismatch, ConstantU32(state, 1), ConstantU32(state, 0)),
 	    LoadProbeU32(state, state.probe_subgroup_size_variable)};
+}
+
+void EmitExternalCallProbe(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.half != 0u) return; // A single native scalar event, including both virtual halves.
+	auto& state = ctx.state;
+	if (!state.program.info.uses_external_call_probe || state.program.stage != ShaderType::Compute)
+		ctx.Fail(inst, "target probe was emitted without its explicit diagnostic variant");
+	const auto any_mismatch = ExternalCallInputMismatch(ctx, inst);
+	const auto extra = ExternalCallInputDetails(ctx, inst, any_mismatch);
+	const auto target = ctx.Arg(inst, 0);
+	const auto low_word = [&](uint32_t value) { return Unary(state, spv::OpUConvert, TypeU32(state), value); };
+	const auto high_word = [&](uint32_t value) {
+		return low_word(Binary(state, spv::OpShiftRightLogical, TypeU64(state), value, ConstantU32(state, 32)));
+	};
 	RecordShaderCallFault(ctx, 3, low_word(target), high_word(target), inst.Flags<uint64_t>(), extra);
+}
+
+void EmitExternalCallInputGuard(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.half != 0u) return;
+	auto& state = ctx.state;
+	if (!state.program.info.uses_checked_external_calls || state.program.stage != ShaderType::Compute)
+		ctx.Fail(inst, "scalar input guard was emitted without checked external coverage");
+	const auto mismatch = ExternalCallInputMismatch(ctx, inst);
+	const auto failure = state.builder.AllocateId();
+	const auto proceed = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, proceed, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, mismatch, failure, proceed);
+	EmitLabel(state, failure);
+	const auto target = ctx.Arg(inst, 0);
+	const auto low = Unary(state, spv::OpUConvert, TypeU32(state), target);
+	const auto high = Unary(state, spv::OpUConvert, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU64(state), target, ConstantU32(state, 32)));
+	const auto extra = ExternalCallInputDetails(ctx, inst, mismatch);
+	RecordShaderCallFault(ctx, 6, low, high, inst.Flags<uint64_t>(), extra);
+	EmitReturn(ctx);
+	EmitLabel(state, proceed);
 }
 
 void EmitExternalResourceFault(ValueEmitContext& ctx, uint32_t invalid, uint32_t ordinal,
@@ -1024,7 +1114,7 @@ void EmitProgram(EmitterState& state) {
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
 	}
-	EmitExternalProbeLayoutGuard(ctx);
+	EmitCheckedExternalLayoutGuard(ctx);
 	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,

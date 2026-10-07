@@ -3,6 +3,9 @@
 #include "graphics/shader/shader.h"
 
 #include <charconv>
+#include <bit>
+#include <array>
+#include <cstdio>
 #include <map>
 #include <string>
 #include <string_view>
@@ -224,6 +227,7 @@ struct CaptureManifest {
   Fields global;
   std::vector<Fields> tables;
   std::vector<Fields> targets;
+  std::vector<Fields> direct_user_loads;
 };
 
 inline bool ParseCaptureManifest(std::string_view text, CaptureManifest &result,
@@ -241,15 +245,17 @@ inline bool ParseCaptureManifest(std::string_view text, CaptureManifest &result,
     line = start == std::string_view::npos ? std::string_view{}
                                            : line.substr(start);
     if (!line.empty() && !line.starts_with("limits:")) {
-      if (line.starts_with("call[") || line.starts_with("target[")) {
+      if (line.starts_with("call[") || line.starts_with("target[") ||
+          line.starts_with("direct_user_load[")) {
         const bool table = line.starts_with("call[");
-        const size_t index_start = table ? 5u : 7u;
+        const bool direct = line.starts_with("direct_user_load[");
+        const size_t index_start = line.find('[') + 1u;
         const auto end = line.find("]:", index_start);
         size_t index = 0;
-        auto &rows = table ? parsed.tables : parsed.targets;
+        auto &rows = table ? parsed.tables : direct ? parsed.direct_user_loads : parsed.targets;
         if (end == std::string_view::npos ||
             !ParseNumber(line.substr(index_start, end - index_start), index) ||
-            index != rows.size() || rows.size() >= (table ? 64u : 2048u)) {
+            index != rows.size() || rows.size() >= (table ? 64u : direct ? 256u : 2048u)) {
           failure = "manifest row index is missing, repeated or out of bounds";
           return false;
         }
@@ -270,6 +276,120 @@ inline bool ParseCaptureManifest(std::string_view text, CaptureManifest &result,
   }
   if (parsed.tables.empty() || parsed.targets.empty()) {
     failure = "manifest has no captured function table or prefixes";
+    return false;
+  }
+  result = std::move(parsed);
+  return true;
+}
+
+struct DirectUserEntry {
+  uint32_t pc = 0;
+  uint32_t destination_sgpr = 0;
+  uint32_t user_sgpr = 0;
+  uint32_t dword_count = 0;
+  int32_t offset = 0;
+  uint64_t address = 0;
+  bool read_failed = false;
+  bool rejected = false;
+  std::string file;
+};
+struct DirectUserEntries {
+  bool present = false;
+  bool limit_reached = false;
+  size_t requested_bytes = 0;
+  std::vector<DirectUserEntry> loads;
+};
+
+inline bool ParseDirectUserEntries(const CaptureManifest &manifest,
+                                  DirectUserEntries &result,
+                                  std::string &failure) {
+  DirectUserEntries parsed;
+  failure.clear();
+  parsed.present = manifest.global.contains("direct_user_loads");
+  if (!parsed.present) {
+    if (!manifest.direct_user_loads.empty() ||
+        manifest.global.contains("direct_user_load_requested_bytes") ||
+        manifest.global.contains("direct_user_load_limit_reached") ||
+        manifest.global.contains("direct_user_load_limit") ||
+        manifest.global.contains("direct_user_load_max_dwords")) {
+      failure = "direct-user capture rows/limits lack their declared count";
+      return false;
+    }
+    result = std::move(parsed);
+    return true;
+  }
+  auto number = [&](const Fields &fields, const char *key, auto &output) {
+    const auto found = fields.find(key);
+    if (found == fields.end() || !ParseNumber(found->second, output)) {
+      failure = "missing or malformed direct-user capture field: " + std::string(key);
+      return false;
+    }
+    return true;
+  };
+  size_t declared = 0, limit = 0, max_dwords = 0;
+  const auto reached = manifest.global.find("direct_user_load_limit_reached");
+  if (!number(manifest.global, "direct_user_loads", declared) ||
+      !number(manifest.global, "direct_user_load_limit", limit) ||
+      !number(manifest.global, "direct_user_load_max_dwords", max_dwords) ||
+      !number(manifest.global, "direct_user_load_requested_bytes", parsed.requested_bytes) ||
+      reached == manifest.global.end() || !ParseBoolean(reached->second, parsed.limit_reached)) {
+    if (failure.empty()) failure = "missing or malformed direct-user limit state";
+    return false;
+  }
+  if (declared != manifest.direct_user_loads.size() || declared > 256u ||
+      limit != 256u || max_dwords != 16u || parsed.requested_bytes > 16384u) {
+    failure = "direct-user count or declared bounds differ from the capture contract";
+    return false;
+  }
+  size_t requested = 0;
+  for (const auto &fields : manifest.direct_user_loads) {
+    DirectUserEntry entry;
+    const auto failed = fields.find("read_failed");
+    const auto rejection = fields.find("rejection");
+    const auto file = fields.find("file");
+    if (!number(fields, "pc", entry.pc) ||
+        !number(fields, "destination_sgpr", entry.destination_sgpr) ||
+        !number(fields, "user_sgpr", entry.user_sgpr) ||
+        !number(fields, "dword_count", entry.dword_count) ||
+        !number(fields, "offset", entry.offset) ||
+        !number(fields, "address", entry.address) || failed == fields.end() ||
+        !ParseBoolean(failed->second, entry.read_failed) ||
+        rejection == fields.end() || rejection->second.empty() ||
+        file == fields.end() || file->second.empty()) {
+      if (failure.empty()) failure = "direct-user capture lacks explicit outcome or filename";
+      return false;
+    }
+    entry.rejected = rejection->second != "none";
+    entry.file = file->second;
+    if ((entry.pc & 3u) != 0u || entry.dword_count == 0u || entry.dword_count > 16u ||
+        !std::has_single_bit(entry.dword_count) ||
+        (!entry.rejected && (entry.destination_sgpr > 107u ||
+          entry.dword_count > 108u - entry.destination_sgpr || entry.user_sgpr > 106u || entry.address >= (uint64_t{1} << 48u) ||
+          (entry.address & 3u) != 0u || entry.dword_count * 4u > (uint64_t{1} << 48u) - entry.address))) {
+      failure = "direct-user load instruction or address span is out of bounds";
+      return false;
+    }
+    if (entry.rejected && entry.read_failed) {
+      failure = "rejected direct-user origin claims a memory read failure";
+      return false;
+    }
+    if ((entry.rejected || entry.read_failed) != (entry.file == "none")) {
+      failure = "direct-user payload presence disagrees with its captured outcome";
+      return false;
+    }
+    if (!entry.rejected && !entry.read_failed) {
+      std::array<char, 64> expected{};
+      std::snprintf(expected.data(), expected.size(), "direct_user_%03zu_%08x.bin", parsed.loads.size(), entry.pc);
+      if (entry.file != expected.data()) {
+        failure = "direct-user payload filename differs from its row index and native PC";
+        return false;
+      }
+    }
+    if (!entry.rejected) requested += entry.dword_count * 4u;
+    parsed.loads.push_back(std::move(entry));
+  }
+  if (requested != parsed.requested_bytes) {
+    failure = "direct-user attempted byte accounting differs from declared snapshots";
     return false;
   }
   result = std::move(parsed);

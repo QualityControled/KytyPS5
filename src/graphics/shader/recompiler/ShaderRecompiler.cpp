@@ -501,6 +501,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	if (options.external_call_probe &&
 	    (options.external_library == nullptr || options.stage != ShaderType::Compute))
 		EXIT("external call probe requires an explicit compute external-library plan");
+	if (options.external_probe_before_bvh && !options.external_call_probe)
+		EXIT("before-BVH diagnostic requires the explicit external call probe variant");
+	const bool checked_external = options.external_unwritten_vgpr != UINT32_MAX;
+	if (checked_external &&
+	    (options.external_library == nullptr || options.stage != ShaderType::Compute ||
+	     options.external_call_probe || options.external_unwritten_vgpr >= 256u))
+		EXIT("strict external coverage requires a compute library, a valid VGPR, and no target probe");
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
 	    options.stage != ShaderType::Pixel && options.stage != ShaderType::Mesh &&
 	    options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
@@ -558,14 +565,17 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                             options.external_library->call_sites.size()));
 		external_program = options.external_call_probe
 		                       ? BuildExternalCallProbe(decoded, *options.external_library)
-		                       : LinkExternalProgram(decoded, *options.external_library);
+		                       : LinkExternalProgram(decoded, *options.external_library,
+		                                             options.external_unwritten_vgpr);
 		if (!external_program.success)
 			EXIT("external shader linking failed: %s", external_program.failure.c_str());
 		decoded = std::move(external_program.program);
 		LogExternalPhase(options, "link-end", phase_ms(),
-		                 fmt::format("native_instructions={} entries={} transfers={}",
+		                 fmt::format("native_instructions={} entries={} transfers={} coverage_vgpr={} excluded={}",
 		                             decoded.instructions.size(), external_program.entries.size(),
-		                             external_program.transfers.size()));
+		                             external_program.transfers.size(),
+		                             external_program.coverage_vgpr,
+		                             external_program.excluded_addresses.size()));
 	}
 	LogExternalPhase(options, "decode-end", phase_ms());
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
@@ -596,10 +606,11 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     static_cast<uint64_t>(native_cfg.blocks.size()),
 	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
 	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
-	if (options.external_call_probe) {
+	if (options.external_call_probe || checked_external) {
 		// Structurization may replace Return terminators with a common exit.
 		// Keep the exact native call boundary and use the existing dispatcher.
-		LogExternalPhase(options, "probe-cfg", phase_ms(), "caller-only diagnostic dispatcher");
+		LogExternalPhase(options, "checked-cfg", phase_ms(), options.external_call_probe
+		    ? "caller-only diagnostic dispatcher" : "strict VGPR coverage dispatcher");
 	} else if (native_cfg.irreducible) {
 		LogDispatcherFallback(options, native_cfg, "build");
 	} else {
@@ -646,11 +657,24 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	    .external_entries = external_program.entries,
 	    .external_call_probe = options.external_call_probe,
+	    .external_probe_before_bvh = options.external_probe_before_bvh,
+	    .external_caller_address = options.external_library != nullptr
+	        ? options.external_library->caller_address : 0u,
+	    .checked_external_calls = checked_external,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	LogExternalPhase(options, "translate-begin", phase_ms());
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	ir.info.uses_checked_external_calls = checked_external;
+	if (checked_external) {
+		ir.dispatcher_fallback = true;
+		ir.info.uses_external_call_fault = true;
+		for (const auto* block: ir.blocks)
+			for (const auto& inst: *block)
+				if (inst.GetOpcode() == IR::ValueOpcode::Barrier)
+					EXIT("checked external coverage cannot terminate waves with workgroup barriers");
+	}
 	if (options.external_library != nullptr)
 		LogExternalPhase(options, "translate-end", phase_ms(),
 		                 fmt::format("blocks={} ir_instructions={}", ir.blocks.size(),

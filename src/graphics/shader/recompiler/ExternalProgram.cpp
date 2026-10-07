@@ -206,11 +206,29 @@ uint32_t AppendPc(LinkedExternalProgram& result, const Instruction& inst) {
 } // namespace
 
 LinkedExternalProgram LinkExternalProgram(const Decoder::Program&    caller,
-                                          const ExternalLibraryPlan& library) {
+                                          const ExternalLibraryPlan& library,
+                                          uint32_t unwritten_vgpr) {
 	LinkedExternalProgram result;
 	try {
+		const bool limited = unwritten_vgpr != UINT32_MAX;
+		if (limited && unwritten_vgpr >= 256u) Fail("external coverage VGPR is out of range");
+		result.coverage_vgpr = unwritten_vgpr;
 		if (!library.complete || library.call_sites.empty())
 			Fail("external library plan is incomplete or has no call sites");
+		if (limited && std::ranges::any_of(caller.instructions, [](const Instruction& inst) {
+			    return inst.opcode == Opcode::S_BARRIER;
+		    }))
+			Fail("checked external coverage cannot end waves in a caller with workgroup barriers");
+		if (limited && std::ranges::any_of(caller.instructions, [](const Instruction& inst) {
+			    const auto name = magic_enum::enum_name(inst.opcode);
+			    if (inst.opcode == Opcode::S_SETREG_B32 || inst.opcode == Opcode::V_MOVRELD_B32 ||
+			        inst.opcode == Opcode::V_MOVRELS_B32 || name.find("GPR_IDX") != std::string_view::npos)
+				    return true;
+			    for (const auto* operand: {&inst.dst, &inst.dst2, &inst.src0, &inst.src1, &inst.src2, &inst.src3})
+				    if (operand->kind == Decoder::OperandKind::M0) return true;
+			    return false;
+		    }))
+			Fail("checked external coverage cannot prove the caller's direct VGPR bank/index state");
 		if (caller.code.size() > UINT32_MAX / 4u)
 			Fail("caller shader exceeds 32-bit internal PC range");
 		const auto ranges = MakeRanges(library);
@@ -224,6 +242,7 @@ LinkedExternalProgram LinkExternalProgram(const Decoder::Program&    caller,
 				Fail("duplicate external function address or identity");
 		}
 		std::map<uint64_t, Body> bodies;
+		std::set<uint64_t>       denied_bodies, excluded;
 		size_t                   instruction_count = 0;
 		for (const auto& site: library.call_sites) {
 			if (!call_pcs.insert(site.caller_pc).second) Fail("duplicate external call site");
@@ -237,6 +256,13 @@ LinkedExternalProgram LinkExternalProgram(const Decoder::Program&    caller,
 			    (site.auxiliary_sgpr > 104u ||
 			     (site.auxiliary_sgpr <= site.return_sgpr + 1u && site.return_sgpr <= site.auxiliary_sgpr + 1u)))
 				Fail("external auxiliary pair overlaps the overwritten return link or is invalid");
+			if (limited) {
+				const auto load = std::ranges::find(caller.instructions, site.record_load_pc, &Instruction::pc);
+				if (load == caller.instructions.end() || load->opcode != Opcode::S_BUFFER_LOAD_DWORDX4 ||
+				    load->dst.kind != Decoder::OperandKind::Sgpr || load->dst.reg != site.record_sgpr ||
+				    site.auxiliary_sgpr > 104u || site.context_domain == UINT32_MAX || site.records.empty())
+					Fail("checked external coverage has no proved record load, auxiliary pair, or complete domain");
+			}
 			const auto continuation = Add(site.caller_pc, call->word_count * 4ull);
 			if (continuation > UINT32_MAX ||
 			    std::ranges::find(caller.instructions, static_cast<uint32_t>(continuation),
@@ -248,18 +274,47 @@ LinkedExternalProgram LinkExternalProgram(const Decoder::Program&    caller,
 			                                .guest_pc = Add(library.caller_address, site.caller_pc),
 			                                .link_address =
 			                                    Add(library.caller_address, continuation),
-			                                .call = true};
+			                                .call = true,
+			                                .checked = limited,
+			                                .record_load_pc = limited ? site.record_load_pc : UINT32_MAX,
+			                                .auxiliary_sgpr = limited ? site.auxiliary_sgpr : UINT32_MAX,
+			                                .context_domain = limited ? site.context_domain : UINT32_MAX};
 			std::set<uint64_t>    targets;
 			for (const auto target: site.candidate_addresses) {
 				if (!targets.insert(target).second) continue;
 				const auto function = functions.find(target);
 				if (function == functions.end())
 					Fail("call domain references an absent external function snapshot");
+				if (denied_bodies.contains(target)) { excluded.insert(target); continue; }
 				auto body = bodies.find(target);
-				if (body == bodies.end())
-					body =
-					    bodies.emplace(target, DecodeBody(ranges, target, instruction_count)).first;
-				ValidateLinks(body->second, target, site.return_sgpr);
+				if (body == bodies.end()) {
+					try {
+						auto decoded_body = DecodeBody(ranges, target, instruction_count);
+						if (limited && std::ranges::any_of(decoded_body, [&](const auto& item) {
+							    return item.second.inst.opcode == Opcode::S_BARRIER ||
+							           !Decoder::ProvesVgprUnwritten(item.second.inst, unwritten_vgpr);
+						    })) {
+							denied_bodies.insert(target);
+							excluded.insert(target);
+							continue;
+						}
+						body = bodies.emplace(target, std::move(decoded_body)).first;
+					} catch (const std::exception&) {
+						if (!limited) throw;
+						// Incomplete/unsupported bodies are outside this coverage variant.
+						// Their real addresses stay absent from the dispatcher mapping.
+						denied_bodies.insert(target);
+						excluded.insert(target);
+						continue;
+					}
+				}
+				try { ValidateLinks(body->second, target, site.return_sgpr); }
+				catch (const std::exception&) {
+					if (!limited) throw;
+					// Saved-link validity is specific to this call site's return pair.
+					excluded.insert(target);
+					continue;
+				}
 				std::map<uint64_t, uint32_t>             relocated;
 				std::vector<std::pair<uint64_t, size_t>> appended;
 				for (const auto& [address, native]: body->second) {
@@ -290,13 +345,16 @@ LinkedExternalProgram LinkExternalProgram(const Decoder::Program&    caller,
 				                          .domain_id      = site.context_domain,
 				                          .function_id    = function->second->function_id});
 			}
-			if (transfer.target_pcs.empty()) Fail("external call domain has no candidates");
+			if (transfer.target_pcs.empty())
+				Fail(limited ? "external call domain has no bodies satisfying strict VGPR coverage"
+				             : "external call domain has no candidates");
 			result.transfers.push_back(std::move(transfer));
 		}
 		for (const auto& inst: caller.instructions)
 			if (inst.opcode == Opcode::S_SWAPPC_B64 && !call_pcs.contains(inst.pc))
 				Fail("decoded SWAPPC has no complete external call domain");
 		result.program.code = result.code;
+		result.excluded_addresses.assign(excluded.begin(), excluded.end());
 		result.success      = true;
 	} catch (const std::exception& exception) {
 		result.failure = exception.what();

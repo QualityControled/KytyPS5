@@ -515,6 +515,122 @@ private:
 		std::abort();
 	}
 
+	Value CheckedFixedLaneDescriptorSource(Value value, uint32_t use_pc) const {
+		value = value.Resolve();
+		if (!m_program.info.uses_checked_external_calls || value.GetType() != Type::U32)
+			return value;
+		// This is metadata provenance, not executable lane folding. The checked variant
+		// emits a dense subgroup-layout guard before guest instructions. Every reaching
+		// definition of the selected fixed lane must still prove the same scalar save.
+		constexpr uint32_t ScalarValue = UINT32_MAX;
+		constexpr size_t MaxLaneProofStates = 16384u;
+		struct Key {
+			const Inst* inst;
+			uint32_t lane;
+			uint32_t immediate;
+			bool operator==(const Key&) const = default;
+		};
+		struct KeyHash {
+			size_t operator()(const Key& key) const {
+				return std::hash<const Inst*>{}(key.inst) ^
+				       (size_t(key.lane) * size_t(0x9e3779b9u)) ^ size_t(key.immediate);
+			}
+		};
+		struct Node {
+			Value value;
+			uint32_t lane;
+			std::vector<size_t> parents;
+			bool reaches_scalar = false;
+		};
+		std::vector<Node> nodes;
+		std::unordered_map<Key, size_t, KeyHash> indices;
+		bool invalid = false;
+		const auto add = [&](Value current, uint32_t lane) -> size_t {
+			current = current.Resolve();
+			if (current.GetType() != Type::U32) {
+				invalid = true;
+				return SIZE_MAX;
+			}
+			const auto* inst = current.TryInstruction();
+			if (inst == nullptr && !current.IsImmediate()) {
+				invalid = true;
+				return SIZE_MAX;
+			}
+			const Key key {inst, lane, inst == nullptr ? current.U32() : 0u};
+			if (const auto found = indices.find(key); found != indices.end()) return found->second;
+			if (nodes.size() == MaxLaneProofStates)
+				Fail(use_pc, "checked fixed-lane descriptor proof exceeds 16384 value/lane states");
+			const auto index = nodes.size();
+			indices.emplace(key, index);
+			nodes.push_back({current, lane});
+			return index;
+		};
+		if (add(value, ScalarValue) == SIZE_MAX) return value;
+		Value selected;
+		bool read_lane = false;
+		bool scalar_save = false;
+		std::vector<size_t> anchored;
+		for (size_t index = 0; index < nodes.size(); ++index) {
+			const auto current = nodes[index].value;
+			const auto lane = nodes[index].lane;
+			const auto* inst = current.TryInstruction();
+			const auto edge = [&](Value child, uint32_t selected_lane) {
+				const auto child_index = add(child, selected_lane);
+				if (child_index != SIZE_MAX) nodes[child_index].parents.push_back(index);
+			};
+			if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+				if (inst->NumArgs() == 0u) return value;
+				for (size_t operand = 0; operand < inst->NumArgs(); ++operand)
+					edge(inst->Arg(operand), lane);
+			} else if (lane == ScalarValue) {
+				if (inst != nullptr && inst->GetOpcode() == ValueOpcode::ReadLane) {
+					if (inst->NumArgs() != 2u) return value;
+					const auto target = inst->Arg(1).Resolve();
+					if (!target.IsImmediate() || target.GetType() != Type::U32 ||
+					    target.U32() >= m_program.wave_size)
+						return value;
+					read_lane = true;
+					edge(inst->Arg(0), target.U32());
+				} else {
+					if (!ValidateRuntimeValue(m_program, current, RuntimeValueType::Integer)) return value;
+					if (!selected.IsEmpty() && !EquivalentValue(m_program, selected, current)) return value;
+					selected = current;
+					nodes[index].reaches_scalar = true;
+					anchored.push_back(index);
+				}
+			} else {
+				if (inst == nullptr || inst->GetOpcode() != ValueOpcode::WriteLane ||
+				    inst->NumArgs() != 3u)
+					return value;
+				const auto target = inst->Arg(2).Resolve();
+				if (!target.IsImmediate() || target.GetType() != Type::U32 ||
+				    target.U32() >= m_program.wave_size)
+					return value;
+				if (target.U32() == lane) {
+					scalar_save = true;
+					edge(inst->Arg(1), ScalarValue);
+				} else {
+					edge(inst->Arg(0), lane);
+				}
+			}
+			if (invalid) return value;
+		}
+		if (!read_lane || !scalar_save || selected.IsEmpty()) return value;
+		// A visited cycle is not a proof. Every branch, including a separate cyclic
+		// Phi arm, must be connected to a validated scalar terminal definition.
+		while (!anchored.empty()) {
+			const auto index = anchored.back();
+			anchored.pop_back();
+			for (const auto parent: nodes[index].parents) {
+				if (nodes[parent].reaches_scalar) continue;
+				nodes[parent].reaches_scalar = true;
+				anchored.push_back(parent);
+			}
+		}
+		if (std::ranges::any_of(nodes, [](const Node& node) { return !node.reaches_scalar; })) return value;
+		return selected;
+	}
+
 	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc) const {
 		value = value.Resolve();
 		const auto* phi = value.TryInstruction();
@@ -702,8 +818,10 @@ private:
 		}
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
-			const auto value = base_reg != UINT32_MAX
-			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
+			const auto value = m_program.info.uses_checked_external_calls
+			    ? CheckedFixedLaneDescriptorSource(handle.Arg(i), pc)
+			    : base_reg != UINT32_MAX
+			        ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
 			descriptor.dwords[i] = LowerDescriptorPhi(value);
 		}
 		if (sample_adjust) {

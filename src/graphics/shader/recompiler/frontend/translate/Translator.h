@@ -18,7 +18,8 @@ public:
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source, IR::BlockInfo& info);
-	void TranslateExternalCall(const Decoder::Instruction& inst, const CFG::Terminator& term);
+	void TranslateExternalCall(const Decoder::Instruction& inst, const CFG::Terminator& term,
+	                           IR::U32 ordinal = {});
 	void TranslateExternalCallProbe(const Decoder::Instruction& inst, const CFG::Terminator& term,
 	                                IR::U32 ordinal);
 	IR::U32 CaptureExternalRecordOrdinal(const Decoder::Instruction& inst);

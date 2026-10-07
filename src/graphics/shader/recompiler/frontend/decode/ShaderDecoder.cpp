@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/frontend/decode/VectorAluOps.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <fmt/format.h>
 
@@ -201,6 +202,90 @@ bool IsConditionalBranch(Opcode opcode) {
 
 bool IsDirectBranch(Opcode opcode) {
 	return opcode == Opcode::S_BRANCH || IsConditionalBranch(opcode);
+}
+
+bool ProvesVgprUnwritten(const Instruction& inst, uint32_t vgpr) {
+	if (vgpr >= 256u || inst.family == Family::Unknown || inst.opcode == Opcode::UNKNOWN ||
+	    inst.opcode == Opcode::UNSUPPORTED || inst.opcode == Opcode::COUNT ||
+	    inst.word_count == 0u || inst.word_count > MaxInstructionRawWords ||
+	    inst.src_count > 4u)
+		return false;
+	const auto name = magic_enum::enum_name(inst.opcode);
+	if (name.empty() || !inst.unsupported_reason.empty()) return false;
+	const std::array sources {&inst.src0, &inst.src1, &inst.src2, &inst.src3};
+	for (uint32_t i = 0; i < inst.src_count; ++i)
+		if (sources[i]->kind == OperandKind::Unknown) return false;
+	// An index/bank-setting operation invalidates a nominal register-number proof.
+	// Reject M0 even when it is only read: relative writes can depend on it.
+	if (inst.opcode == Opcode::S_SETREG_B32 || inst.opcode == Opcode::V_MOVRELD_B32 ||
+	    inst.opcode == Opcode::V_MOVRELS_B32 || name.find("GPR_IDX") != std::string_view::npos)
+		return false;
+	for (const auto* operand: {&inst.dst, &inst.dst2, &inst.src0, &inst.src1, &inst.src2, &inst.src3})
+		if (operand->kind == OperandKind::M0) return false;
+	// RDNA2 MIMG TFE/LWE can append an unmodeled status result beyond DMASK;
+	// buffer TFE likewise changes its destination tuple. Reject those encodings
+	// rather than trusting the decoder's ordinary data_dwords count.
+	if (inst.family == Family::MIMG &&
+	    (inst.word_count < 2u || (inst.raw[0] & ((1u << 16u) | (1u << 17u))) != 0u))
+		return false;
+	if ((inst.family == Family::MUBUF || inst.family == Family::MTBUF) &&
+	    (inst.word_count < 2u || (inst.raw[1] & (1u << 23u)) != 0u))
+		return false;
+	if (inst.family == Family::MUBUF && (inst.raw[0] & (1u << 16u)) != 0u)
+		return false; // Unmodeled buffer-to-LDS destination mode.
+
+	uint32_t width = 1u;
+	bool vector_family = false;
+	switch (inst.family) {
+		case Family::VOP1:
+		case Family::VOP2:
+		case Family::VOP3:
+		case Family::VOP3P:
+		case Family::VOPC:
+		case Family::VINTRP:
+			vector_family = true;
+			if (!name.starts_with("V_")) return false;
+			// Include source-type suffixes as well as destination-type suffixes.
+			// The occasional extra word (e.g. CVT_F32_F64) narrows coverage safely.
+			if (name.find("64") != std::string_view::npos) width = 2u;
+			break;
+		case Family::MUBUF:
+		case Family::MTBUF:
+		case Family::FLAT:
+		case Family::DS:
+		case Family::MIMG:
+			vector_family = true;
+			if (inst.data_dwords == 0u || inst.data_dwords > 16u || inst.data_bits == 0u ||
+			    inst.data_bits > 64u || inst.data_components > 16u)
+				return false;
+			width = std::max(inst.data_dwords,
+			                 (inst.data_bits * std::max(inst.data_components, 1u) + 31u) / 32u);
+			if (width > 16u) return false;
+			// Some store decoders place source data in dst. Counting it as a
+			// possible write is deliberately conservative rather than guessing.
+			break;
+		case Family::SOP1:
+		case Family::SOP2:
+		case Family::SOPK:
+		case Family::SOPC:
+		case Family::SOPP:
+			if (!name.starts_with("S_")) return false;
+			break;
+		case Family::SMEM:
+			if (!name.starts_with("S_")) return false;
+			break;
+		default: return false;
+	}
+	if (vector_family && inst.dst.kind == OperandKind::Unknown && inst.opcode != Opcode::V_NOP)
+		return false;
+	const auto disjoint = [&](const Operand& operand, uint32_t count) {
+		if (operand.kind != OperandKind::Vgpr) return true;
+		if (!vector_family || operand.reg >= 256u || count > 256u - operand.reg) return false;
+		return vgpr < operand.reg || vgpr - operand.reg >= count;
+	};
+	// Carry/mask destinations normally are scalar pairs. A decoded secondary
+	// VGPR is still treated as a pair, so a neighboring register cannot escape.
+	return disjoint(inst.dst, width) && disjoint(inst.dst2, 2u);
 }
 
 const char* ImageDimensionToString(ImageDimension dimension) {

@@ -824,6 +824,10 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program);
 bool IsConditionalBranch(Opcode opcode);
 bool IsDirectBranch(Opcode opcode);
 
+// Conservative coverage proof for one decoded instruction. Unknown or indirect
+// register writes fail the proof; this never substitutes native register values.
+bool ProvesVgprUnwritten(const Instruction& inst, uint32_t vgpr);
+
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeVectorGpr(uint32_t reg, Operand& operand);

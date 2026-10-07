@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ExternalProgram.h"
 #include "graphics/shader/recompiler/ShaderCallDiagnostics.h"
+#include "CapturedExternalLibraryFixture.h"
 #include "common/assert.h"
 
 #include <algorithm>
@@ -42,6 +43,7 @@ namespace {
 namespace Shader = Libs::Graphics::ShaderRecompiler;
 namespace Decoder = Shader::Decoder;
 namespace CFG = Shader::CFG;
+size_t PeakWorkingSetBytes();
 
 void Check(bool value, const char* text) {
 	if (!value) { std::fprintf(stderr, "ExternalProgramTests: failed: %s\n", text); std::exit(1); }
@@ -221,6 +223,214 @@ void TestProbeRejectsBarriersAndUnplannedCalls() {
   Check(!unplanned.success &&
             unplanned.failure.find("without proved") != std::string::npos,
         "probe left an additional unplanned call executable");
+}
+
+void TestUnwrittenVgprExactRanges() {
+  Decoder::Instruction inst;
+  inst.family = Decoder::Family::VOP1;
+  inst.opcode = Decoder::Opcode::V_MOV_B32;
+  inst.dst = {.kind = Decoder::OperandKind::Vgpr, .reg = 27u};
+  inst.src0 = {.kind = Decoder::OperandKind::IntegerInlineConstant, .value = 1u};
+  inst.src_count = 1u;
+  for (uint32_t reg = 0; reg < 256u; ++reg)
+    Check(Decoder::ProvesVgprUnwritten(inst, reg) == (reg != 27u),
+          "one-word vector destination proof lost exact register identity");
+  inst.family = Decoder::Family::VOP3;
+  inst.opcode = Decoder::Opcode::V_ADD_F64;
+  inst.dst.reg = 26u;
+  for (uint32_t reg = 0; reg < 256u; ++reg)
+    Check(Decoder::ProvesVgprUnwritten(inst, reg) == (reg < 26u || reg > 27u),
+          "64-bit vector destination proof missed the adjacent register");
+  inst.family = Decoder::Family::MUBUF;
+  inst.word_count = 2u;
+  inst.opcode = Decoder::Opcode::BUFFER_LOAD_DWORDX4;
+  inst.data_dwords = 4u;
+  inst.data_components = 4u;
+  inst.dst.reg = 25u;
+  for (uint32_t reg = 0; reg < 256u; ++reg)
+    Check(Decoder::ProvesVgprUnwritten(inst, reg) == (reg < 25u || reg > 28u),
+          "memory vector destination proof narrowed its four-word width");
+  inst.opcode = Decoder::Opcode::BUFFER_STORE_DWORDX4;
+  Check(!Decoder::ProvesVgprUnwritten(inst, 27u),
+        "store data in a decoder destination bypassed conservative coverage");
+  inst.family = Decoder::Family::VOP1;
+  inst.opcode = Decoder::Opcode::V_MOV_B32;
+  inst.dst.reg = 3u;
+  inst.dst2 = {.kind = Decoder::OperandKind::Vgpr, .reg = 26u};
+  Check(!Decoder::ProvesVgprUnwritten(inst, 26u) &&
+            !Decoder::ProvesVgprUnwritten(inst, 27u) &&
+            Decoder::ProvesVgprUnwritten(inst, 28u),
+        "secondary vector pair proof lost its second register");
+}
+
+void TestUnwrittenVgprConservativeUnknownsAndIndexing() {
+  Decoder::Instruction valid;
+  valid.family = Decoder::Family::VOP1;
+  valid.opcode = Decoder::Opcode::V_MOV_B32;
+  valid.dst = {.kind = Decoder::OperandKind::Vgpr, .reg = 3u};
+  valid.src0 = {.kind = Decoder::OperandKind::IntegerInlineConstant, .value = 1u};
+  valid.src_count = 1u;
+  Check(Decoder::ProvesVgprUnwritten(valid, 27u), "valid disjoint move did not prove coverage");
+  for (uint32_t variant = 0; variant < 11u; ++variant) {
+    auto inst = valid;
+    switch (variant) {
+      case 0: inst.family = Decoder::Family::Unknown; break;
+      case 1: inst.opcode = Decoder::Opcode::UNKNOWN; break;
+      case 2: inst.opcode = Decoder::Opcode::UNSUPPORTED; break;
+      case 3: inst.word_count = 0; break;
+      case 4: inst.src_count = 5; break;
+      case 5: inst.src0.kind = Decoder::OperandKind::Unknown; break;
+      case 6: inst.dst.kind = Decoder::OperandKind::Unknown; break;
+      case 7: inst.src0.kind = Decoder::OperandKind::M0; break;
+      case 8: inst.opcode = Decoder::Opcode::V_MOVRELD_B32; break;
+      case 9: inst.opcode = Decoder::Opcode::V_MOVRELS_B32; break;
+      case 10: inst.unsupported_reason = "unproved encoding"; break;
+    }
+    Check(!Decoder::ProvesVgprUnwritten(inst, 27u),
+          "unknown width/index/operand state falsely proved a protected register unchanged");
+  }
+  auto scalar = valid;
+  scalar.family = Decoder::Family::SOPK;
+  scalar.opcode = Decoder::Opcode::S_SETREG_B32;
+  scalar.dst = {.kind = Decoder::OperandKind::Sgpr, .reg = 0u};
+  Check(!Decoder::ProvesVgprUnwritten(scalar, 27u) &&
+            !Decoder::ProvesVgprUnwritten(valid, 256u),
+        "register bank state or out-of-range protection was admitted");
+  auto memory = valid;
+  memory.family = Decoder::Family::MUBUF;
+  memory.opcode = Decoder::Opcode::BUFFER_LOAD_DWORDX4;
+  memory.data_dwords = 0u;
+  Check(!Decoder::ProvesVgprUnwritten(memory, 27u), "unknown memory width was admitted");
+  valid.dst.reg = 255u;
+  valid.opcode = Decoder::Opcode::V_ADD_F64;
+  valid.family = Decoder::Family::VOP3;
+  Check(!Decoder::ProvesVgprUnwritten(valid, 27u), "vector width overflow was admitted");
+}
+
+void TestUnwrittenVgprNativeStatusTuples() {
+  // Native v26 data plus an unmodeled status DWORD can touch protected v27.
+  // Ordinary one-word loads remain eligible; status/LDS modes do not.
+  const std::array<uint32_t, 2> image{0xf0000108u, 0x00001a14u};
+  Decoder::Instruction decoded;
+  Decoder::DecodeInstruction(image, 0u, decoded);
+  Check(decoded.opcode == Decoder::Opcode::IMAGE_LOAD && decoded.dst.reg == 26u &&
+            decoded.data_dwords == 1u && Decoder::ProvesVgprUnwritten(decoded, 27u),
+        "ordinary native one-word image load failed adjacent-register proof");
+  for (uint32_t status : {1u << 16u, 1u << 17u}) {
+    auto words = image;
+    words[0] |= status;
+    Decoder::Instruction inst;
+    Decoder::DecodeInstruction(words, 0u, inst);
+    Check(!Decoder::ProvesVgprUnwritten(inst, 27u),
+          "native image TFE/LWE tuple bypassed protected adjacent-register proof");
+  }
+  const std::array<uint32_t, 2> buffer{0xe0301000u, 0x80001a00u};
+  Decoder::Instruction normal;
+  Decoder::DecodeInstruction(buffer, 0u, normal);
+  Check(normal.opcode == Decoder::Opcode::BUFFER_LOAD_DWORD && normal.dst.reg == 26u &&
+            normal.data_dwords == 1u && Decoder::ProvesVgprUnwritten(normal, 27u),
+        "ordinary native one-word buffer load failed adjacent-register proof");
+  for (uint32_t mode = 0; mode < 2u; ++mode) {
+    auto words = buffer;
+    words[mode == 0u ? 1u : 0u] |= mode == 0u ? (1u << 23u) : (1u << 16u);
+    Decoder::Instruction inst;
+    Decoder::DecodeInstruction(words, 0u, inst);
+    Check(!Decoder::ProvesVgprUnwritten(inst, 27u),
+          "native buffer TFE or LDS destination bypassed conservative coverage");
+  }
+}
+
+void TestCheckedCoverageRetainsFullAddressAndStrictClosure() {
+  ProbeFixture fixture;
+  fixture.library.functions = {{0u, Fixture::A, {}}, {1u, Fixture::B, {}}};
+  fixture.library.functions[0].code_prefix = {0x7e0e0281u, 0xbe80200eu}; // v7 only
+  fixture.library.functions[1].code_prefix = {0x7e360282u, 0xbe80200eu}; // v27
+  const auto checked = Shader::LinkExternalProgram(fixture.caller, fixture.library, 27u);
+  Check(checked.success && checked.coverage_vgpr == 27u && checked.entries.size() == 1u &&
+            checked.excluded_addresses == std::vector<uint64_t>{Fixture::B},
+        "checked coverage failed to exclude a reachable write to exactly v27");
+  const auto call = std::ranges::find_if(checked.transfers, [](const auto &transfer) { return transfer.call; });
+  Check(call != checked.transfers.end() && call->guest_addresses == std::vector<uint64_t>{Fixture::A} &&
+            call->link_address == Fixture::Caller + 12u && call->target_sgpr == 14u && call->return_sgpr == 14u,
+        "checked dispatch narrowed high words or changed the aliased source/link semantics");
+  const auto normal = Shader::LinkExternalProgram(fixture.caller, fixture.library);
+  Check(normal.success && normal.entries.size() == 2u && normal.excluded_addresses.empty() &&
+            normal.coverage_vgpr == UINT32_MAX, "ordinary mode inherited a partial-coverage filter");
+  fixture.library.functions[1].code_prefix = {0xbf8a0000u, 0xbe80200eu}; // barrier
+  Check(Shader::LinkExternalProgram(fixture.caller, fixture.library, 27u).excluded_addresses ==
+            std::vector<uint64_t>{Fixture::B}, "barrier body was admitted to an early-ending checked wave");
+  fixture.library.functions[1].code_prefix = {0xbe8e0381u, 0xbe80200eu}; // saved link clobber
+  Check(Shader::LinkExternalProgram(fixture.caller, fixture.library, 27u).excluded_addresses ==
+            std::vector<uint64_t>{Fixture::B}, "protected VGPR proof bypassed saved-link closure");
+  fixture.library.functions[1].code_prefix = {0xbf820010u}; // uncovered branch
+  Check(Shader::LinkExternalProgram(fixture.caller, fixture.library, 27u).excluded_addresses ==
+            std::vector<uint64_t>{Fixture::B}, "uncovered branch body was silently admitted");
+  fixture.library.functions[0].code_prefix = {0x7e360281u, 0xbe80200eu};
+  const auto empty = Shader::LinkExternalProgram(fixture.caller, fixture.library, 27u);
+  Check(!empty.success && empty.failure.find("no bodies satisfying") != std::string::npos,
+        "empty checked domain incorrectly became successful call execution");
+}
+
+void TestCheckedCallerRejectsUnprovedBankAndBarrier() {
+  for (uint32_t variant = 0; variant < 4u; ++variant) {
+    Fixture fixture;
+    auto bank = fixture.caller.instructions.front();
+    bank.pc = 2u;
+    if (variant == 0u) bank.opcode = Decoder::Opcode::S_SETREG_B32;
+    if (variant == 1u) bank.opcode = Decoder::Opcode::V_MOVRELD_B32;
+    if (variant == 2u) bank.src0.kind = Decoder::OperandKind::M0;
+    if (variant == 3u) bank.opcode = Decoder::Opcode::S_BARRIER;
+    fixture.caller.instructions.push_back(bank);
+    const auto result = Shader::LinkExternalProgram(fixture.caller, fixture.library, 27u);
+    Check(!result.success && result.failure.find(variant == 3u ? "barriers" : "bank/index") != std::string::npos,
+          "checked body proof ignored caller-wide bank/index state or synchronization");
+  }
+}
+
+void TestActualCapturedCheckedCoverage(const char *caller_path, const char *folder_path, const char *count_text) {
+  size_t count = 0;
+  const auto parsed = std::from_chars(count_text, count_text + std::strlen(count_text), count);
+  Check(parsed.ec == std::errc{} && parsed.ptr == count_text + std::strlen(count_text),
+        "actual coverage count must be a decimal integer");
+  const auto started = std::chrono::steady_clock::now();
+  auto fixture = CapturedExternalTest::Load(caller_path, folder_path, count, true);
+  Check(count == fixture.total_functions && !fixture.synthetic_inputs,
+        "coverage measurement requires every candidate and actual input metadata");
+  Decoder::Program caller;
+  Decoder::DecodeProgram(fixture.caller, caller);
+  const auto loaded = std::chrono::steady_clock::now();
+  const auto checked = Shader::LinkExternalProgram(caller, fixture.library, 27u);
+  if (!checked.success) std::fprintf(stderr, "actual checked coverage rejection: %s\n", checked.failure.c_str());
+  Check(checked.success, "actual complete candidate library failed strict checked linkage");
+  const auto graph = CFG::BuildGraph(checked.program, checked.transfers);
+  Check(!graph.unsupported && graph.irreducible, "actual checked CFG failed its dispatcher protocol");
+  const auto finished = std::chrono::steady_clock::now();
+  std::printf("ActualCheckedCoverage: total=%zu admitted=%zu excluded=%zu protected_vgpr=%u native_instructions=%zu blocks=%zu caller_base=0x%016llx\n",
+              fixture.total_functions, checked.entries.size(), checked.excluded_addresses.size(), checked.coverage_vgpr,
+              checked.program.instructions.size(), graph.blocks.size(),
+              static_cast<unsigned long long>(fixture.controls.caller_address));
+  Check(checked.entries.size() + checked.excluded_addresses.size() == fixture.total_functions,
+        "actual coverage candidate accounting is incomplete");
+  std::printf("ActualCheckedCoverage: preparation_seconds=%.3f linkage_and_cfg_seconds=%.3f peak_working_set_bytes=%zu\n",
+              std::chrono::duration<double>(loaded - started).count(),
+              std::chrono::duration<double>(finished - loaded).count(), PeakWorkingSetBytes());
+  std::puts("ActualCheckedCoverage: full captured candidate classification; excluded targets fault at runtime; no IR/SPIRV/GPU execution");
+}
+
+void TestCheckedCoverageRequiresScalarRecordProvenance() {
+  for (uint32_t missing = 0; missing < 5u; ++missing) {
+    ProbeFixture fixture;
+    fixture.library.functions = {{0u, Fixture::A, {0xbe80200eu}}, {1u, Fixture::B, {0xbe80200eu}}};
+    auto &site = fixture.library.call_sites[0];
+    if (missing == 0u) site.record_load_pc = UINT32_MAX;
+    if (missing == 1u) site.record_sgpr = 4u;
+    if (missing == 2u) site.auxiliary_sgpr = UINT32_MAX;
+    if (missing == 3u) site.context_domain = UINT32_MAX;
+    if (missing == 4u) site.records.clear();
+    const auto result = Shader::LinkExternalProgram(fixture.caller, fixture.library, 27u);
+    Check(!result.success && result.failure.find("proved record load") != std::string::npos,
+          "checked scalar guard was constructed without complete record/auxiliary provenance");
+  }
 }
 
 void TestDistinctPairAndCopiedReturn() {
@@ -416,6 +626,34 @@ void TestFullCapturedLibraryLink(const char* caller_path, const char* folder_pat
 } // namespace
 
 int main(int argc, char **argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--checked-dominance-rejection") {
+    ProbeFixture fixture;
+    fixture.library.functions = {{0u, Fixture::A, {0xbe80200eu}}, {1u, Fixture::B, {0xbe80200eu}}};
+    fixture.code.insert(fixture.code.begin(), 0xbf850002u);
+    fixture.Decode();
+    fixture.library.call_sites[0].record_load_pc = 4u;
+    fixture.library.call_sites[0].caller_pc = 12u;
+    const auto checked = Shader::LinkExternalProgram(fixture.caller, fixture.library, 27u);
+    Check(checked.success, "checked dominance fixture did not reach CFG validation");
+    (void)CFG::BuildGraph(checked.program, checked.transfers);
+    Check(false, "checked call accepted a path skipping its scalar record load");
+  }
+  const bool checked_only = argc == 2 && std::string_view(argv[1]) == "--checked-only";
+  const bool captured_checked = argc == 5 && std::string_view(argv[1]) == "--captured-checked-library";
+  if (argc == 1 || checked_only || captured_checked) {
+    TestUnwrittenVgprExactRanges();
+    TestUnwrittenVgprConservativeUnknownsAndIndexing();
+    TestUnwrittenVgprNativeStatusTuples();
+    TestCheckedCoverageRetainsFullAddressAndStrictClosure();
+    TestCheckedCallerRejectsUnprovedBankAndBarrier();
+    TestCheckedCoverageRequiresScalarRecordProvenance();
+    std::puts("ExternalProgramTests: all six checked-coverage groups passed (CPU native proof/linkage; no guest execution)");
+    if (checked_only) return 0;
+    if (captured_checked) {
+      TestActualCapturedCheckedCoverage(argv[2], argv[3], argv[4]);
+      return 0;
+    }
+  }
   if (argc == 2 && std::strcmp(argv[1], "--probe-dominance-rejection") == 0) {
     ProbeFixture fixture;
     fixture.code.insert(fixture.code.begin(), 0xbf850002u);
@@ -450,7 +688,7 @@ int main(int argc, char **argv) {
   TestSavedLinkMustSurviveEveryReturnPath();
   TestProvenanceAndCandidateSetValidation();
   TestUncoveredAndTruncatedBranchClosure();
-  std::puts("ExternalProgramTests: all twelve groups passed (offline native "
+  std::puts("ExternalProgramTests: all eighteen groups passed (offline native "
             "linkage/probe/CFG only)");
   if (argc == 4)
     TestFullCapturedLibraryLink(argv[2], argv[3]);

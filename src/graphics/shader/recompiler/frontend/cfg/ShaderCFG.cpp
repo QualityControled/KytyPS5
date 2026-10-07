@@ -1644,6 +1644,7 @@ Graph BuildGraph(const Decoder::Program& program, std::span<const ExternalTransf
 			term.external_transfer = true;
 			term.external_call = transfer.call;
 			term.external_call_probe = transfer.probe;
+			term.external_checked_call = transfer.checked;
 			term.external_record_load_pc = transfer.record_load_pc;
 			term.external_auxiliary_sgpr = transfer.auxiliary_sgpr;
 			term.external_context_domain = transfer.context_domain;
@@ -1753,7 +1754,7 @@ Graph BuildGraph(const Decoder::Program& program, std::span<const ExternalTransf
 
 	RecomputeAnalyses(graph);
 	for (const auto& block: graph.blocks) {
-		if (!block.terminator.external_call_probe) continue;
+		if (!block.terminator.external_call_probe && !block.terminator.external_checked_call) continue;
 		const auto load_pc = block.terminator.external_record_load_pc;
 		const auto load = std::ranges::find_if(graph.blocks, [load_pc](const BasicBlock& candidate) {
 			return candidate.start_pc <= load_pc && load_pc < candidate.end_pc;
@@ -1761,7 +1762,7 @@ Graph BuildGraph(const Decoder::Program& program, std::span<const ExternalTransf
 		if (load == graph.blocks.end() || !graph.Dominates(load->id, block.id) ||
 		    load_pc >= program.instructions[block.inst_end - 1u].pc)
 			ExitBuildFailure(graph, FailureKind::InvalidInput, block.id,
-			                 "external probe record load does not dominate its actual call");
+			                 "checked external record load does not dominate its actual call");
 	}
 
 	if (indirect_setpc) {

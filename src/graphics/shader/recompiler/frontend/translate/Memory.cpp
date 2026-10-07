@@ -938,8 +938,19 @@ void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {
 void Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
 		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
+			const auto descriptor = ConstructU32x4(inst.src1, 4);
+			const auto ray = MakeImageAddress(inst, inst.src0);
+			const auto active = ir.GetExec();
+			if (program.info.uses_external_probe_before_bvh) {
+				if (!program.info.uses_external_call_probe ||
+				    inst.pc > UINT64_MAX - program.external_caller_address)
+					EXIT("before-BVH probe has no valid caller-only native address");
+				ir.Emit(IR::ValueOpcode::ExternalBvhProbe,
+				    {descriptor, ray, active, IR::Value(inst.image_address_components - 10u)},
+				    program.external_caller_address + inst.pc);
+			}
 			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
-			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()},
+			    {descriptor, ray, active},
 			    inst.image_address_components - 10u);
 			for (uint32_t component = 0; component < 4; ++component) {
 				WriteOperand(OffsetOperand(inst.dst, component),

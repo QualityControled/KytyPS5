@@ -149,6 +149,146 @@ void TestCapturedMemoryBounds() {
               !CapturedMemory::Read(&memory, 0xffcu, words),
           "offline reader accessed uncaptured or unaligned bytes");
 }
+
+CaptureManifest AuthoredDirectManifest() {
+  constexpr std::string_view text =
+      "stage=cs direct_user_loads=2 direct_user_load_limit=256 "
+      "direct_user_load_max_dwords=16 direct_user_load_limit_reached=false "
+      "direct_user_load_requested_bytes=72\n"
+      "direct_user_load[0]: pc=0x0 destination_sgpr=68 user_sgpr=0 dword_count=16 "
+      "offset=408 address=0x1198 read_failed=false rejection=none file=direct_user_000_00000000.bin\n"
+      "direct_user_load[1]: pc=0x8 destination_sgpr=16 user_sgpr=0 dword_count=2 "
+      "offset=336 address=0x1150 read_failed=false rejection=none file=direct_user_001_00000008.bin\n"
+      "call[0]: pc=0xc\ntarget[0]: raw_address=0x1300000000\n";
+  CaptureManifest manifest;
+  std::string failure;
+  RequireParse(ParseCaptureManifest(text, manifest, failure), failure);
+  Require(manifest.direct_user_loads.size() == 2u &&
+              !manifest.global.contains("destination_sgpr") &&
+              manifest.global.at("direct_user_loads") == "2",
+          "direct-user row fields escaped into global/table fields");
+  return manifest;
+}
+
+void TestDirectUserMetadataAndCaps() {
+  const auto complete = AuthoredDirectManifest();
+  DirectUserEntries entries;
+  std::string failure;
+  RequireParse(ParseDirectUserEntries(complete, entries, failure), failure);
+  Require(entries.present && !entries.limit_reached && entries.loads.size() == 2u &&
+              entries.requested_bytes == 72u && entries.loads[0].address == 0x1198u,
+          "direct-user snapshots lost exact origin/outcome/byte fields");
+  for (const auto &[key, value] : std::vector<std::pair<std::string, std::string>>{
+           {"direct_user_loads", "1"}, {"direct_user_load_limit", "257"},
+           {"direct_user_load_max_dwords", "17"}, {"direct_user_load_limit_reached", "1"},
+           {"direct_user_load_requested_bytes", "71"}, {"direct_user_load_requested_bytes", "16385"}}) {
+    auto bad = complete;
+    bad.global[key] = value;
+    Require(!ParseDirectUserEntries(bad, entries, failure), "invalid direct-user bounds/accounting accepted");
+  }
+  for (const auto &key : {"pc", "destination_sgpr", "user_sgpr", "dword_count", "offset", "address",
+                         "read_failed", "rejection", "file"}) {
+    auto bad = complete;
+    bad.direct_user_loads[0].erase(key);
+    Require(!ParseDirectUserEntries(bad, entries, failure), "missing direct-user field was accepted");
+  }
+  for (const auto &[key, value] : std::vector<std::pair<std::string, std::string>>{
+           {"pc", "0x1"}, {"dword_count", "3"}, {"dword_count", "32"},
+           {"destination_sgpr", "100"}, {"user_sgpr", "107"},
+           {"address", "0x1199"}, {"address", "0xfffffffffffc"},
+           {"address", "0x1000000000000"}, {"read_failed", "true"},
+           {"rejection", "modified"}, {"file", "none"},
+           {"file", "../direct_user_000_00000000.bin"}, {"file", "direct_user_001_00000000.bin"}}) {
+    auto bad = complete;
+    bad.direct_user_loads[0][key] = value;
+    Require(!ParseDirectUserEntries(bad, entries, failure), "malformed direct-user span/outcome/filename accepted");
+  }
+  auto failed = complete;
+  failed.direct_user_loads[1]["read_failed"] = "true";
+  failed.direct_user_loads[1]["file"] = "none";
+  RequireParse(ParseDirectUserEntries(failed, entries, failure), failure);
+  Require(entries.requested_bytes == 72u && entries.loads[1].read_failed,
+          "failed read replenished the requested-byte budget");
+  auto rejected = failed;
+  rejected.direct_user_loads[1]["read_failed"] = "false";
+  rejected.direct_user_loads[1]["rejection"] = "base";
+  rejected.direct_user_loads[1]["address"] = "0";
+  rejected.global["direct_user_load_requested_bytes"] = "64";
+  RequireParse(ParseDirectUserEntries(rejected, entries, failure), failure);
+  Require(entries.loads[1].rejected && entries.requested_bytes == 64u,
+          "rejected origin was mapped or charged as a read");
+  auto capped = complete;
+  const auto first_row = capped.direct_user_loads[0];
+  capped.direct_user_loads.assign(256u, first_row);
+  for (size_t i = 0; i < capped.direct_user_loads.size(); ++i) {
+    char filename[64];
+    std::snprintf(filename, sizeof(filename), "direct_user_%03zu_00000000.bin", i);
+    capped.direct_user_loads[i]["file"] = filename;
+  }
+  capped.global["direct_user_loads"] = "256";
+  capped.global["direct_user_load_requested_bytes"] = "16384";
+  capped.global["direct_user_load_limit_reached"] = "true";
+  RequireParse(ParseDirectUserEntries(capped, entries, failure), failure);
+  Require(entries.limit_reached && entries.loads.size() == 256u,
+          "exact capture cap lost its explicit partial state");
+  capped.direct_user_loads.push_back(capped.direct_user_loads.front());
+  capped.global["direct_user_loads"] = "257";
+  Require(!ParseDirectUserEntries(capped, entries, failure), "257 direct-user attempts accepted");
+  CaptureManifest old;
+  RequireParse(ParseDirectUserEntries(old, entries, failure), failure);
+  Require(!entries.present && entries.loads.empty(), "legacy absence was treated as captured payload proof");
+  old.direct_user_loads = complete.direct_user_loads;
+  Require(!ParseDirectUserEntries(old, entries, failure), "orphan payload rows accepted");
+  CaptureManifest parsed;
+  Require(!ParseCaptureManifest("direct_user_load[1]: pc=0\ncall[0]: pc=0\ntarget[0]: raw_address=0\n", parsed, failure),
+          "noncontiguous direct-user row index accepted");
+  Require(!ParseCaptureManifest("direct_user_load[0]: pc=0 pc=0\ncall[0]: pc=0\ntarget[0]: raw_address=0\n", parsed, failure),
+          "duplicate direct-user machine field accepted");
+}
+
+void TestDirectUserNativeOriginVerification() {
+  auto manifest = AuthoredDirectManifest();
+  DirectUserEntries entries;
+  std::string failure;
+  RequireParse(ParseDirectUserEntries(manifest, entries, failure), failure);
+  Shader::Decoder::Program caller;
+  const std::vector<uint32_t> code{0xf4101100u,0xfa000198u,0xf4040400u,0xfa000150u,0xbf810000u};
+  Shader::Decoder::DecodeProgram(code, caller);
+  ComputeControls controls;
+  controls.user_data = {0x1000u,0u};
+  CapturedMemory memory{{{0x1198u,std::vector<uint32_t>(16u,0xabcdefu)},{0x1150u,{7u,8u}}}};
+  memory.Merge();
+  RequireParse(VerifyDirectUserOrigins(entries,caller,controls,memory,failure),failure);
+  for (size_t mutation = 0; mutation < 8u; ++mutation) {
+    auto changed = entries;
+    auto &row = changed.loads[0];
+    switch (mutation) {
+      case 0: row.pc=4u; break;
+      case 1: row.destination_sgpr=64u; break;
+      case 2: row.user_sgpr=2u; break;
+      case 3: row.dword_count=8u; break;
+      case 4: row.offset=404; break;
+      case 5: row.address=0x1194u; break;
+      case 6: row.rejected=true; break;
+      case 7: changed.requested_bytes=64u; break;
+    }
+    Require(!VerifyDirectUserOrigins(changed,caller,controls,memory,failure),
+            "captured metadata changed decoded instruction or pointer provenance");
+  }
+  auto relocated_controls = controls;
+  relocated_controls.user_data[0] += 4u;
+  Require(!VerifyDirectUserOrigins(entries,caller,relocated_controls,memory,failure),
+          "changed captured pointer reused old snapshot addresses");
+  CapturedMemory missing{{{0x1198u,std::vector<uint32_t>(16u,1u)}}};
+  Require(!VerifyDirectUserOrigins(entries,caller,controls,missing,failure),
+          "uncaptured direct payload was replaced by zeros or trusted metadata");
+  manifest.direct_user_loads[1]["read_failed"]="true";
+  manifest.direct_user_loads[1]["file"]="none";
+  RequireParse(ParseDirectUserEntries(manifest,entries,failure),failure);
+  RequireParse(VerifyDirectUserOrigins(entries,caller,controls,memory,failure),failure);
+  Require(entries.loads[1].read_failed,
+          "failed capture was silently promoted by unrelated overlapping saved bytes");
+}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -157,7 +297,9 @@ int main(int argc, char **argv) {
   TestMalformedAndOutOfRange();
   TestManifestRowsAndDuplicates();
   TestCapturedMemoryBounds();
-  std::puts("CapturedComputeManifestTests: all five groups passed (strict "
+  TestDirectUserMetadataAndCaps();
+  TestDirectUserNativeOriginVerification();
+  std::puts("CapturedComputeManifestTests: all seven groups passed (strict "
             "captured inputs; no GPU/guest execution)");
   if (argc == 5 && std::strcmp(argv[1], "--inspect") == 0) {
     size_t limit = 0;

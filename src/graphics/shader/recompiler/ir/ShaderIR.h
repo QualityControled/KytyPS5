@@ -482,6 +482,8 @@ struct ShaderInfo {
 	bool                             uses_dma           = false;
 	bool                             uses_external_call_fault = false;
 	bool                             uses_external_call_probe = false;
+	bool                             uses_external_probe_before_bvh = false;
+	bool                             uses_checked_external_calls = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -642,6 +644,7 @@ struct Program: ResourcePlan {
 	BlockList                           blocks;
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
+	uint64_t                      external_caller_address = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;

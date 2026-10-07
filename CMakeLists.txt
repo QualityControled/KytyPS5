@@ -506,6 +506,7 @@ target_include_directories(ir_use_tests PRIVATE ${inc_headers})
 
 add_executable(external_program_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ExternalProgramTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ExternalLibrary.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ExternalProgram.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ShaderCallDiagnostics.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp"
@@ -687,6 +688,8 @@ if(BUILD_TESTING)
 	add_test(NAME external_program COMMAND $<TARGET_FILE:external_program_tests>)
 	add_test(NAME shader_external_leaf_calls COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --external-leaf-calls-only)
 	add_test(NAME shader_external_call_probe COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --external-call-probe-only)
+	add_test(NAME shader_external_checked_calls COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --external-checked-call-only)
+	add_test(NAME shader_external_before_bvh_probe COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --external-before-bvh-probe-only)
 	add_test(NAME shader_scalar_branch_restores COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-branch-restores-only)
 	add_test(NAME shader_cfg_spirv_size COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-size-only)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)

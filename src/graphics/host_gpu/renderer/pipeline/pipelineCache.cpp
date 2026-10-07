@@ -28,6 +28,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +51,30 @@ namespace {
 bool ExternalProbeRequested() {
 	const auto* value = std::getenv("KYTY_PROBE_EXTERNAL_CALL_TARGET");
 	return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+bool ExternalBvhProbeRequested() {
+	const auto* value = std::getenv("KYTY_PROBE_EXTERNAL_BEFORE_BVH");
+	if (value == nullptr) return false;
+	if (std::strcmp(value, "1") != 0 || !ExternalProbeRequested()) {
+		EXIT("KYTY_PROBE_EXTERNAL_BEFORE_BVH requires value 1 and the external-call probe\n");
+	}
+	return true;
+}
+
+uint32_t ExternalUnwrittenVgprRequested() {
+	const auto* value = std::getenv("KYTY_EXTERNAL_UNWRITTEN_VGPR");
+	if (value == nullptr) return std::numeric_limits<uint32_t>::max();
+	uint32_t index = 0;
+	const auto length = std::strlen(value);
+	const auto parsed = std::from_chars(value, value + length, index);
+	if (length == 0 || parsed.ec != std::errc {} || parsed.ptr != value + length || index >= 256u) {
+		EXIT("Invalid KYTY_EXTERNAL_UNWRITTEN_VGPR: expected an integer from 0 to 255\n");
+	}
+	if (ExternalProbeRequested()) {
+		EXIT("External-call probe and checked unwritten-VGPR mode cannot be combined\n");
+	}
+	return index;
 }
 
 bool HasExternalCall(std::span<const uint32_t> code) {
@@ -415,13 +440,17 @@ struct PipelineCache::ProgramCache {
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
 		bool                  external_call_probe = false;
+		bool                  external_probe_before_bvh = false;
+		uint32_t              external_unwritten_vgpr = std::numeric_limits<uint32_t>::max();
 		std::vector<uint32_t> static_state;
 		std::shared_ptr<const ShaderRecompiler::ExternalLibraryPlan> external_library;
 
 		bool operator==(const ProgramKey& other) const {
 			if (stage != other.stage || hash != other.hash || user_data_count != other.user_data_count ||
 			    code_size != other.code_size || static_state != other.static_state ||
-			    external_call_probe != other.external_call_probe) return false;
+			    external_call_probe != other.external_call_probe ||
+			    external_probe_before_bvh != other.external_probe_before_bvh ||
+			    external_unwritten_vgpr != other.external_unwritten_vgpr) return false;
 			if (external_library == other.external_library) return true;
 			if (!external_library || !other.external_library) return false;
 			// The bucket hash is not an identity: all addresses and bytes must agree.
@@ -459,6 +488,8 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.external_call_probe);
+			PipelineKeyHash::Mix(hash, key.external_probe_before_bvh);
+			PipelineKeyHash::Mix(hash, key.external_unwritten_vgpr);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
 			if (key.external_library) {
 				PipelineKeyHash::Mix(hash, key.external_library->caller_address);
@@ -595,6 +626,8 @@ struct PipelineCache::ProgramCache {
 		}
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		const bool requested_bvh_probe = ExternalBvhProbeRequested();
+		const auto requested_checked_vgpr = ExternalUnwrittenVgprRequested();
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
@@ -602,6 +635,8 @@ struct PipelineCache::ProgramCache {
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		lookup_key.external_library.reset();
 		lookup_key.external_call_probe = false;
+		lookup_key.external_probe_before_bvh = false;
+		lookup_key.external_unwritten_vgpr = std::numeric_limits<uint32_t>::max();
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			const bool could_call = std::ranges::any_of(params.code, [](uint32_t word) {
 				return ((word >> 23u) & 0x1ffu) == 0x17du && ((word >> 8u) & 0xffu) == 0x21u &&
@@ -633,6 +668,10 @@ struct PipelineCache::ProgramCache {
 			}
 			if (could_call) lookup_key.external_library = LoadLibrary(params, user_data);
 			lookup_key.external_call_probe = lookup_key.external_library && ExternalProbeRequested();
+			lookup_key.external_probe_before_bvh = lookup_key.external_call_probe && requested_bvh_probe;
+			if (lookup_key.external_library) {
+				lookup_key.external_unwritten_vgpr = requested_checked_vgpr;
+			}
 		}
 		auto                                         entry = programs.find(lookup_key);
 		std::vector<ShaderRecompiler::IR::ExternalCallContextDomain> context_domains;
@@ -706,6 +745,8 @@ struct PipelineCache::ProgramCache {
 		options.input_info  = stage_input;
 		options.external_library = lookup_key.external_library.get();
 		options.external_call_probe = lookup_key.external_call_probe;
+		options.external_probe_before_bvh = lookup_key.external_probe_before_bvh;
+		options.external_unwritten_vgpr = lookup_key.external_unwritten_vgpr;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -820,6 +861,8 @@ PipelineCache::~PipelineCache() {
 }
 
 void PipelineCache::InitializeDriverCache() {
+	const auto checked_vgpr = ExternalUnwrittenVgprRequested();
+	const bool requested_bvh_probe = ExternalBvhProbeRequested();
 	const auto title_id = PipelineCacheTitleId();
 	if (title_id.empty()) {
 		return;
@@ -839,8 +882,11 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") /
-	    (title_id + (ExternalProbeRequested() ? "-external-probe.bin" : ".bin"));
+	const auto cache_suffix = requested_bvh_probe ? std::string("-external-probe-bvh.bin") :
+	    ExternalProbeRequested() ? std::string("-external-probe.bin") :
+	    checked_vgpr != std::numeric_limits<uint32_t>::max() ?
+	        fmt::format("-external-vgpr{}.bin", checked_vgpr) : std::string(".bin");
+	m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + cache_suffix);
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -1312,7 +1358,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
-	if (input_info.stage.program->info.uses_external_call_probe) {
+	if (input_info.stage.program->info.uses_external_call_probe ||
+	    input_info.stage.program->info.uses_checked_external_calls) {
 		// Capture the newly compiled diagnostic as well as the earlier startup pipelines.
 		// The live cache remains valid for future pipeline creation and normal shutdown.
 		Checkpoint();

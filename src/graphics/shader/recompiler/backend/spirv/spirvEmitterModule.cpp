@@ -444,7 +444,7 @@ void DefineInputs(EmitterState& state) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
-	if (state.lane_count == 2 || state.program.info.uses_external_call_probe) {
+	if (state.lane_count == 2 || state.program.info.uses_external_call_probe || state.program.info.uses_checked_external_calls) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
 			    return input.kind == IR::StageInputKind::GlobalInvocationId;
@@ -527,7 +527,7 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.requirements.subgroup_local_invocation_id || state.program.info.uses_external_call_probe) {
+	if (state.requirements.subgroup_local_invocation_id || state.program.info.uses_external_call_probe || state.program.info.uses_checked_external_calls) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -537,7 +537,7 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
 	}
-	if (state.program.info.uses_external_call_probe) {
+	if (state.program.info.uses_external_call_probe || state.program.info.uses_checked_external_calls) {
 		state.probe_subgroup_id_variable = DefineInterfaceVariable(
 		    state, TypeU32(state), spv::StorageClassInput, "probe_SubgroupId");
 		state.builder.AddAnnotation(spv::OpDecorate, state.probe_subgroup_id_variable,
@@ -735,10 +735,10 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_barrier ||
 	    state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
-	    state.requirements.subgroup_local_invocation_id || state.program.info.uses_external_call_probe) {
+	    state.requirements.subgroup_local_invocation_id || state.program.info.uses_external_call_probe || state.program.info.uses_checked_external_calls) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.program.info.uses_external_call_probe) {
+	if (state.program.info.uses_external_call_probe || state.program.info.uses_checked_external_calls) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 	}

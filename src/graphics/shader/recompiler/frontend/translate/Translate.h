@@ -32,6 +32,9 @@ struct TranslateOptions {
 	const EmbeddedFetchPlan*      embedded_fetch = nullptr;
 	std::span<const ExternalFunctionEntry> external_entries;
 	bool external_call_probe = false;
+	bool external_probe_before_bvh = false;
+	uint64_t external_caller_address = 0;
+	bool checked_external_calls = false;
 };
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
