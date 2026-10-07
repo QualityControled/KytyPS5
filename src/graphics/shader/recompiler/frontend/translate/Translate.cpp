@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -772,7 +773,18 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 	}
 	const auto& term = source.terminator;
 	if (term.kind == CFG::TerminatorKind::IndirectBranch) {
-		if (term.indirect_selector_code != UINT32_MAX) {
+		if (term.external_transfer) {
+			if (term.external_call) {
+				if (instruction_indirect_target.IsEmpty()) EXIT("external call target was not captured before its link write");
+				info.indirect_target = instruction_indirect_target;
+			} else {
+				const auto low = ir.GetScalarReg(static_cast<IR::ScalarReg>(term.indirect_pc_sgpr));
+				const auto high = ir.GetScalarReg(static_cast<IR::ScalarReg>(term.indirect_pc_sgpr + 1u));
+				info.indirect_target = ir.Emit(IR::ValueOpcode::CompositeConstructU64, {low, high});
+			}
+			ir.Emit(IR::ValueOpcode::ReferenceU64, {info.indirect_target});
+			return;
+		} else if (term.indirect_selector_code != UINT32_MAX) {
 			info.indirect_target = ReadScalarCode(term.indirect_selector_code);
 		} else if (term.indirect_pc_sgpr != UINT32_MAX) {
 			info.indirect_target = ir.GetScalarReg(static_cast<IR::ScalarReg>(term.indirect_pc_sgpr));
@@ -788,6 +800,30 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 		                           : native_condition(term.condition);
 		info.condition = condition;
 		ir.Emit(IR::ValueOpcode::Reference, {condition});
+	}
+}
+
+void Translator::TranslateExternalCall(const Decoder::Instruction& inst, const CFG::Terminator& term) {
+	// Read both halves before either write, including the aliased source/destination case.
+	instruction_indirect_target = ReadU64(inst.src0);
+	WriteU32Pair(inst.dst, {IR::U32(IR::Value(static_cast<uint32_t>(term.external_link_address))),
+	                       IR::U32(IR::Value(static_cast<uint32_t>(term.external_link_address >> 32u)))});
+}
+
+IR::U32 Translator::CaptureExternalRecordOrdinal(const Decoder::Instruction& inst) {
+	if (inst.opcode != Decoder::Opcode::S_BUFFER_LOAD_DWORDX4)
+		EXIT("external record provenance is not a four-word scalar buffer load");
+	const auto offset = ir.IAdd(ReadU32(inst.src1), IR::U32(IR::Value(inst.offset)));
+	return ir.ShiftRightLogical(offset, IR::U32(IR::Value(4u)));
+}
+
+void Translator::MarkExternalContext(const ExternalFunctionEntry& entry, IR::U32 ordinal) {
+	for (uint32_t half = 0; half < 2u; ++half) {
+		const auto reg = static_cast<IR::ScalarReg>(entry.auxiliary_sgpr + half);
+		const auto raw = ir.GetScalarReg(reg);
+		const auto marked = ir.Emit(IR::ValueOpcode::ExternalCallContextWord,
+		    {raw, IR::Value(entry.domain_id), ordinal, IR::Value(2u + half), IR::Value(entry.function_id)});
+		ir.SetScalarReg(reg, IR::U32(marked));
 	}
 }
 
@@ -1001,6 +1037,14 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
 	result.cfg_failure_kind    = cfg.failure_kind;
 	result.fallback_reason     = cfg.unsupported_reason;
+	result.info.uses_external_call_fault = std::ranges::any_of(cfg.blocks, [](const auto& block) {
+		return block.terminator.external_transfer;
+	});
+	for (const auto& entry: options.external_entries) {
+		const IR::ExternalCallContextBinding binding {entry.domain_id, entry.function_id};
+		if (std::ranges::find(result.external_context_bindings, binding) == result.external_context_bindings.end())
+			result.external_context_bindings.push_back(binding);
+	}
 	if (options.embedded_fetch != nullptr) {
 		result.info.vertex_offset_sgpr   = options.embedded_fetch->vertex_offset_sgpr;
 		result.info.instance_offset_sgpr = options.embedded_fetch->instance_offset_sgpr;
@@ -1325,11 +1369,27 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
 	                             (options.input_info.compute->float_mode & 0x10u) == 0;
+	std::unordered_map<uint32_t, IR::U32> external_ordinals;
+	std::unordered_map<uint32_t, const ExternalFunctionEntry*> external_entries;
+	std::unordered_set<uint32_t> external_record_loads;
+	for (const auto& entry: options.external_entries) {
+		if (entry.auxiliary_sgpr == UINT32_MAX) continue;
+		external_entries.emplace(entry.pc, &entry);
+		external_record_loads.insert(entry.record_load_pc);
+	}
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
+		if (const auto found = external_entries.find(cfg_block.start_pc); found != external_entries.end()) {
+			const auto& entry = *found->second;
+			const auto ordinal = external_ordinals.find(entry.record_load_pc);
+			if (ordinal == external_ordinals.end()) EXIT("external entry has no captured GPU record ordinal");
+			translator.MarkExternalContext(entry, ordinal->second);
+		}
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
+			if (external_record_loads.contains(instruction.pc))
+				external_ordinals.insert_or_assign(instruction.pc, translator.CaptureExternalRecordOrdinal(instruction));
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
 				continue;
 			}
@@ -1348,7 +1408,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                  options.input_info.vertex->resources[resource]);
 				continue;
 			}
-			translator.TranslateInstruction(instruction);
+			if (instruction.opcode == Decoder::Opcode::S_SWAPPC_B64)
+				translator.TranslateExternalCall(instruction, cfg_block.terminator);
+			else translator.TranslateInstruction(instruction);
 		}
 		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
 	}

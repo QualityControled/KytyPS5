@@ -60,6 +60,7 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x1eu, Opcode::S_BITSET1_B64},
     {0x1fu, Opcode::S_GETPC_B64},
     {0x20u, Opcode::S_SETPC_B64},
+    {0x21u, Opcode::S_SWAPPC_B64},
     {0x24u, Opcode::S_AND_SAVEEXEC_B64},
     {0x28u, Opcode::S_ORN2_SAVEEXEC_B64},
     {0x2du, Opcode::S_QUADMASK_B64},
@@ -155,6 +156,7 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	switch (inst.opcode) {
 		case Opcode::S_GETPC_B64:
+			inst.data_dwords = 2;
 			inst.src_count = 0;
 			DecodeScalarDestination(sdst, pc, inst.dst);
 			return;
@@ -162,6 +164,13 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 			inst.src_count = 1;
 			inst.dst.kind  = OperandKind::Null;
 			DecodeScalarSource(ssrc0, pc, inst.src0);
+			ReadLiteralOperands(code, word_index, inst);
+			return;
+		case Opcode::S_SWAPPC_B64:
+			inst.data_dwords = 2;
+			inst.src_count = 1;
+			DecodeScalarSource(ssrc0, pc, inst.src0);
+			DecodeScalarDestination(sdst, pc, inst.dst);
 			ReadLiteralOperands(code, word_index, inst);
 			return;
 		default: break;

@@ -16,6 +16,12 @@ struct SharedMemoryResources {
 SharedMemoryResources CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers);
 bool UsesFlattenedSrt(const Program& program);
 
+struct DescriptorBindingLimits;
+// Counts actual allocated descriptors, including mip views and helper buffers.
+// The renderer remains responsible for descriptor-set totals across stages.
+bool ValidateDescriptorBindingLimits(const Program& program, const DescriptorBindingLimits& limits,
+                                     std::string& failure);
+
 const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBindingKind kind);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

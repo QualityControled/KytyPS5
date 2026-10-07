@@ -61,6 +61,27 @@ uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t ResourceForDescriptor(const EmitterState& state, IR::DescriptorBindingKind kind,
                                uint32_t resource) {
+	if (kind == IR::DescriptorBindingKind::Samplers) {
+		if (resource >= state.program.info.samplers.size())
+			ExitDescriptorBindingFailure(state, kind, resource, "sampler index is out of range");
+		const auto alias = state.program.info.samplers[resource].binding_alias;
+		if (alias != UINT32_MAX) {
+			if (alias >= resource || state.program.info.samplers[alias].binding_alias != UINT32_MAX)
+				ExitDescriptorBindingFailure(state, kind, resource,
+				                             "invalid canonical sampler alias");
+			resource = alias;
+		}
+	} else if (IR::ImageBindingResourceClass(kind) != IR::ImageResourceClass::None) {
+		if (resource >= state.program.info.images.size())
+			ExitDescriptorBindingFailure(state, kind, resource, "image index is out of range");
+		const auto alias = state.program.info.images[resource].binding_alias;
+		if (alias != UINT32_MAX) {
+			if (alias >= resource || state.program.info.images[alias].binding_alias != UINT32_MAX)
+				ExitDescriptorBindingFailure(state, kind, resource,
+				                             "invalid canonical image alias");
+			resource = alias;
+		}
+	}
 	const auto* descriptor = IR::FindBinding(state.program.bindings, kind);
 	if (descriptor == nullptr) {
 		ExitDescriptorBindingFailure(state, kind, resource, "descriptor group was not allocated");
@@ -188,7 +209,7 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
 		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
 		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
-		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
+		DecorateNonUniform(state, sampled_image);
 	}
 	return sampled_image;
 }

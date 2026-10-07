@@ -21,16 +21,17 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-struct InputBinding : IR::StageInput {
+struct InputBinding: IR::StageInput {
 	uint32_t variable_id = 0;
 };
 
-struct OutputBinding : IR::StageOutput {
+struct OutputBinding: IR::StageOutput {
 	uint32_t variable_id        = 0;
 	uint32_t mesh_data_variable = 0;
 };
@@ -92,76 +93,83 @@ struct EmitterState {
 		}
 	}
 
-	Builder                                          builder;
-	const IR::Program&                               program;
-	ShaderStageInputInfo                             input_info;
-	uint32_t                                        void_type = 0;
-	uint32_t                                        bool_type = 0;
-	uint32_t                                        u32_type = 0;
-	uint32_t                                        u64_type = 0;
-	uint32_t                                        i32_type = 0;
-	uint32_t                                        f32_type = 0;
-	uint32_t                                        f64_type = 0;
-	uint32_t                                        u32_pair_type = 0;
-	uint32_t                                        i32_pair_type = 0;
-	uint32_t                                        function_type = 0;
-	std::array<uint32_t, 3>                          bool_vector_types {};
-	std::array<uint32_t, 3>                          u32_vector_types {};
-	std::array<uint32_t, 3>                          i32_vector_types {};
-	std::array<uint32_t, 3>                          f32_vector_types {};
-	std::array<uint32_t, 6>                          tess_variables {};
-	uint32_t                                         tess_inner_variable = 0;
-	uint32_t                                         tess_patch_base     = 0;
+	Builder                 builder;
+	const IR::Program&      program;
+	ShaderStageInputInfo    input_info;
+	uint32_t                void_type     = 0;
+	uint32_t                bool_type     = 0;
+	uint32_t                u32_type      = 0;
+	uint32_t                u64_type      = 0;
+	uint32_t                i32_type      = 0;
+	uint32_t                f32_type      = 0;
+	uint32_t                f64_type      = 0;
+	uint32_t                u32_pair_type = 0;
+	uint32_t                i32_pair_type = 0;
+	uint32_t                function_type = 0;
+	std::array<uint32_t, 3> bool_vector_types {};
+	std::array<uint32_t, 3> u32_vector_types {};
+	std::array<uint32_t, 3> i32_vector_types {};
+	std::array<uint32_t, 3> f32_vector_types {};
+	std::array<uint32_t, 6> tess_variables {};
+	uint32_t                tess_inner_variable = 0;
+	uint32_t                tess_patch_base     = 0;
 
 	const SpirvRequirements                          requirements;
-	uint32_t                                         lane_count              = 1;
-	uint32_t                                         lane_half               = 0;
-	uint32_t                                         storage_buffer_variable = 0;
-	uint32_t                                         storage_buffer_u8_variable = 0;
+	uint32_t                                         lane_count                  = 1;
+	uint32_t                                         lane_half                   = 0;
+	uint32_t                                         storage_buffer_variable     = 0;
+	uint32_t                                         storage_buffer_u8_variable  = 0;
 	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
-	uint32_t                                         bda_pagetable_variable  = 0;
-	uint32_t                                         fault_buffer_variable   = 0;
-	uint32_t                                         bda_pointer_function    = 0;
-	uint32_t                                         bvh_intersect_function  = 0;
-	uint32_t                                         gds_variable            = 0;
-	uint32_t                                         gds_length              = 0;
-	uint32_t                                         push_constant_variable  = 0;
-	uint32_t                                         shader_data_storage_variable = 0;
-	uint32_t                                         flattened_srt_variable  = 0;
+	uint32_t                                         bda_pagetable_variable            = 0;
+	uint32_t                                         fault_buffer_variable             = 0;
+	uint32_t                                         shader_call_fault_buffer_variable = 0;
+	uint32_t                                         bda_pointer_function              = 0;
+	uint32_t                                         bvh_intersect_function            = 0;
+	uint32_t                                         gds_variable                      = 0;
+	uint32_t                                         gds_length                        = 0;
+	uint32_t                                         push_constant_variable            = 0;
+	uint32_t                                         shader_data_storage_variable      = 0;
+	uint32_t                                         flattened_srt_variable            = 0;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
-	uint32_t                                         lds_base_dwords         = 0;
-	uint32_t                                         lds_variable            = 0;
-	uint32_t                                         lds_u64_variable        = 0;
+	uint32_t                                         lds_base_dwords   = 0;
+	uint32_t                                         lds_variable      = 0;
+	uint32_t                                         lds_u64_variable  = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
-	uint32_t                   sampler_variable                      = 0;
-	uint32_t                   main_func                             = 0;
-	uint32_t                   mesh_guest_func                       = 0;
-	uint32_t                   mesh_allocation                       = 0;
-	uint32_t                   mesh_primitive_data                   = 0;
-	uint32_t                   mesh_primitives                       = 0;
-	uint32_t                   mesh_cull                             = 0;
-	uint32_t                   entry_label                           = 0;
-	uint32_t                   current_label                         = 0;
-	const IR::Block*           current_block                         = nullptr;
-	uint32_t                   pixel_valid_mask_variable             = 0;
-	uint32_t                   subgroup_local_invocation_id_variable = 0;
-	uint32_t                   per_vertex_variable                   = 0;
-	uint32_t                   point_size_variable                   = 0;
-	uint32_t                   clip_distance_variable                = 0;
-	uint32_t                   invalid_position_clip_distance        = UINT32_MAX;
-	uint32_t                   cull_distance_variable                = 0;
-	uint32_t                   layer_variable                        = 0;
-	uint32_t                   viewport_index_variable               = 0;
-	uint32_t                   depth_variable                        = 0;
-	uint32_t                   sample_mask_variable                  = 0;
-	std::vector<InputBinding>  inputs;
-	std::vector<OutputBinding> outputs;
-	std::vector<uint32_t>      interface_variables;
-	std::unordered_map<const IR::Block*, uint32_t> labels;
+	uint32_t                                         sampler_variable          = 0;
+	uint32_t                                         main_func                 = 0;
+	uint32_t                                         mesh_guest_func           = 0;
+	uint32_t                                         mesh_allocation           = 0;
+	uint32_t                                         mesh_primitive_data       = 0;
+	uint32_t                                         mesh_primitives           = 0;
+	uint32_t                                         mesh_cull                 = 0;
+	uint32_t                                         entry_label               = 0;
+	uint32_t                                         current_label             = 0;
+	const IR::Block*                                 current_block             = nullptr;
+	uint32_t                                         pixel_valid_mask_variable = 0;
+	uint32_t                                         subgroup_local_invocation_id_variable = 0;
+	uint32_t                                         per_vertex_variable                   = 0;
+	uint32_t                                         point_size_variable                   = 0;
+	uint32_t                                         clip_distance_variable                = 0;
+	uint32_t                                         invalid_position_clip_distance = UINT32_MAX;
+	uint32_t                                         cull_distance_variable         = 0;
+	uint32_t                                         layer_variable                 = 0;
+	uint32_t                                         viewport_index_variable        = 0;
+	uint32_t                                         depth_variable                 = 0;
+	uint32_t                                         sample_mask_variable           = 0;
+	std::vector<InputBinding>                        inputs;
+	std::vector<OutputBinding>                       outputs;
+	std::vector<uint32_t>                            interface_variables;
+	std::unordered_map<const IR::Block*, uint32_t>   labels;
+	std::unordered_set<uint32_t>                     nonuniform_ids;
 };
+
+inline void DecorateNonUniform(EmitterState& state, uint32_t id) {
+	if (state.nonuniform_ids.insert(id).second)
+		state.builder.AddAnnotation(spv::OpDecorate, id, spv::DecorationNonUniform);
+}
 
 uint32_t TypeVoid(EmitterState& state);
 uint32_t TypeBool(EmitterState& state);
@@ -305,7 +313,6 @@ uint32_t VertexParameterComponentCount(const InputBinding& input);
 
 uint32_t VertexParameterScalarType(EmitterState& state, VertexInputScalarKind kind);
 
-
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp);
 
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
@@ -360,6 +367,9 @@ uint32_t ConstantF32Value(EmitterState& state, float value);
 uint32_t ConstantBool(EmitterState& state, bool value);
 
 uint32_t ConstantU64(EmitterState& state, uint64_t value);
+// Invalid context keys are recorded once and reported by the host after completion.
+void EmitExternalResourceFault(ValueEmitContext& ctx, uint32_t invalid, uint32_t ordinal,
+                               uint32_t domain, uint64_t guest_pc = 0);
 
 uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 
@@ -418,15 +428,15 @@ uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryIn
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
-void EnsureLdsStorage(EmitterState& state);
+void     EnsureLdsStorage(EmitterState& state);
 
 struct MemoryResourceAccess {
-	IR::ResourceKind      kind             = IR::ResourceKind::None;
-	uint32_t              object_pointer   = 0;
-	uint32_t              length           = 0;
-	uint32_t              byte_offset      = 0;
-	uint32_t              element_bits     = 32;
-	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	IR::ResourceKind      kind           = IR::ResourceKind::None;
+	uint32_t              object_pointer = 0;
+	uint32_t              length         = 0;
+	uint32_t              byte_offset    = 0;
+	uint32_t              element_bits   = 32;
+	spv::MemoryAccessMask memory_access  = spv::MemoryAccessMaskNone;
 };
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
@@ -533,17 +543,17 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
 
-void DefineGetBdaPointer(EmitterState& state);
-void DefineBvhIntersect(EmitterState& state);
+void     DefineGetBdaPointer(EmitterState& state);
+void     DefineBvhIntersect(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
-auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
-                        uint32_t result_type, Fn&& emit) {
+auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count, uint32_t result_type,
+                     Fn&& emit) {
 	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
 	EXIT_IF(count == 0u);
-	const auto merge_label = state.builder.AllocateId();
+	const auto            merge_label = state.builder.AllocateId();
 	std::vector<uint32_t> labels(count);
 	std::vector<uint32_t> words {spv::OpSwitch, index, merge_label};
 	for (uint32_t item = 0; item < count; item++) {
@@ -593,7 +603,7 @@ template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
 	const auto then_label  = state.builder.AllocateId();
-	const auto header     = state.current_label;
+	const auto header      = state.current_label;
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);

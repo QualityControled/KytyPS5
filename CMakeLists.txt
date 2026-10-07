@@ -477,6 +477,35 @@ add_executable(shader_call_capture_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_call_capture_tests fmt::fmt)
 target_include_directories(shader_call_capture_tests PRIVATE ${inc_headers})
 
+add_executable(external_library_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ExternalLibraryTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ExternalLibrary.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ShaderCallDiagnostics.cpp"
+	${shader_call_capture_decoder_sources}
+)
+target_link_libraries(external_library_tests fmt::fmt)
+target_include_directories(external_library_tests PRIVATE ${inc_headers})
+
+add_executable(external_program_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ExternalProgramTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ExternalProgram.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ShaderCallDiagnostics.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/cfg/ShaderCFG.cpp"
+	${shader_call_capture_decoder_sources}
+)
+target_link_libraries(external_program_tests fmt::fmt)
+if(WIN32)
+	target_link_libraries(external_program_tests psapi)
+endif()
+target_include_directories(external_program_tests PRIVATE ${inc_headers})
+if(KYTY_CLANG_CL)
+	set_source_files_properties("${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ExternalProgram.cpp"
+		PROPERTIES COMPILE_OPTIONS "/EHsc")
+else()
+	set_source_files_properties("${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ExternalProgram.cpp"
+		PROPERTIES COMPILE_OPTIONS "-fexceptions")
+endif()
+
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
@@ -572,6 +601,9 @@ target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
+if(WIN32)
+	target_link_libraries(shader_recompiler_compute_tests psapi)
+endif()
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
 set(gpu_test_ms_depth_source
@@ -601,7 +633,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests shader_call_capture_tests)
+			virtual_memory_allocation_tests shader_call_capture_tests external_library_tests external_program_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 endif()
@@ -631,6 +663,11 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME shader_call_capture COMMAND $<TARGET_FILE:shader_call_capture_tests>)
+	add_test(NAME external_library COMMAND $<TARGET_FILE:external_library_tests>)
+	add_test(NAME external_program COMMAND $<TARGET_FILE:external_program_tests>)
+	add_test(NAME shader_external_leaf_calls COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --external-leaf-calls-only)
+	add_test(NAME shader_scalar_branch_restores COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-branch-restores-only)
+	add_test(NAME shader_cfg_spirv_size COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-size-only)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
@@ -709,6 +746,8 @@ if(BUILD_TESTING)
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		shader_call_capture_tests
+		external_library_tests
+		external_program_tests
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests

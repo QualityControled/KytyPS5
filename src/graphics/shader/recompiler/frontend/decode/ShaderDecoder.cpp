@@ -532,6 +532,9 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_SETPC_B64:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setpc_b64 {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str()));
+		case Opcode::S_SWAPPC_B64:
+			return fmt::format("0x{:08x}: s_swappc_b64 {}, {}", inst.pc,
+			                   OperandToString(inst.dst), OperandToString(inst.src0));
 		case Opcode::S_SETREG_B32:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setreg_b32 {}, {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str(),

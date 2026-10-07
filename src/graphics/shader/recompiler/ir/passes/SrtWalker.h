@@ -11,6 +11,33 @@ class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 
+// A context is one complete native function-table record. Code and auxiliary words retain their
+// original bits; records sharing code remain separate when their auxiliary pointers differ.
+struct ExternalCallContextRecord {
+	uint32_t                ordinal     = 0;
+	uint32_t                function_id = 0;
+	std::array<uint32_t, 4> words {};
+};
+
+struct ExternalCallContextDomain {
+	uint32_t                                   domain_id = 0;
+	bool                                       complete  = false;
+	std::span<const ExternalCallContextRecord> records;
+};
+
+struct SrtExternalContext {
+	uint32_t                         domain_id = 0;
+	const ExternalCallContextRecord* record    = nullptr;
+};
+
+struct DescriptorBindingLimits {
+	uint32_t sampled_images  = UINT32_MAX;
+	uint32_t storage_images  = UINT32_MAX;
+	uint32_t samplers        = UINT32_MAX;
+	uint32_t storage_buffers = UINT32_MAX;
+	uint32_t total_resources = UINT32_MAX;
+};
+
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
@@ -18,12 +45,15 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	std::span<const ExternalCallContextDomain> external_context_domains;
+	DescriptorBindingLimits                    descriptor_limits;
 };
 
 enum class RuntimeValueType { Any, Integer };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
-                          RuntimeValueType type = RuntimeValueType::Any);
+                          RuntimeValueType                          type = RuntimeValueType::Any,
+                          std::optional<ExternalCallContextBinding> external_context = {});
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
@@ -32,7 +62,7 @@ class SrtWalker {
 public:
 	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, SrtWalker* clean_evaluator = nullptr,
-	          Value active_mask = {});
+	          Value active_mask = {}, std::optional<SrtExternalContext> external_context = {});
 	~SrtWalker();
 	SrtWalker(const SrtWalker&)            = delete;
 	SrtWalker& operator=(const SrtWalker&) = delete;
@@ -57,6 +87,7 @@ private:
 	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	std::optional<SrtExternalContext> m_external_context;
 	ResourcePlan::EvaluationContext& m_context;
 };
 

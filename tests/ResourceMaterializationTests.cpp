@@ -7,6 +7,8 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -637,6 +639,330 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+struct ExternalMaterialFixture {
+  using Program = Libs::Graphics::ShaderRecompiler::IR::Program;
+  using Value = Libs::Graphics::ShaderRecompiler::IR::Value;
+  using Inst = Libs::Graphics::ShaderRecompiler::IR::Inst;
+  using Record =
+      Libs::Graphics::ShaderRecompiler::IR::ExternalCallContextRecord;
+  using Domain =
+      Libs::Graphics::ShaderRecompiler::IR::ExternalCallContextDomain;
+  Program program;
+  std::unordered_map<uint64_t, uint32_t> words;
+  std::vector<uint64_t> requested;
+  std::array<Record, 3> records{{{.ordinal = 3,
+                                  .function_id = 7,
+                                  .words = {0x12340000u, 0u, 0x2000u, 0u}},
+                                 {.ordinal = 9,
+                                  .function_id = 7,
+                                  .words = {0x12340000u, 0u, 0x3000u, 0u}},
+                                 {.ordinal = 21,
+                                  .function_id = 7,
+                                  .words = {0x12340000u, 0u, 0x2000u, 0u}}}};
+  std::array<Domain, 1> domains;
+  Inst *low = nullptr;
+  Inst *high = nullptr;
+  Value lane;
+  uint64_t reject_address = UINT64_MAX;
+
+  ExternalMaterialFixture() {
+    using namespace Libs::Graphics::ShaderRecompiler::IR;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.shader_hash = 0x13579bdfu;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    program.external_context_bindings.push_back({11u, 7u});
+    auto &block = AddValueBlock(program);
+    lane = Value(&block.AppendNewInst(ValueOpcode::LaneId));
+    low = &block.AppendNewInst(ValueOpcode::ExternalCallContextWord,
+                               {lane, Value(11u), lane, Value(2u), Value(7u)});
+    high = &block.AppendNewInst(ValueOpcode::ExternalCallContextWord,
+                                {lane, Value(11u), lane, Value(3u), Value(7u)});
+    program.memory_info.push_back(
+        {.kind = ResourceKind::ScalarAddress, .planning_only = true});
+    const auto Read = [&](Value lo, Value hi, uint32_t offset) {
+      auto &address =
+          block.AppendNewInst(ValueOpcode::GetAddressResource, {lo, hi});
+      auto &read = block.AppendNewInst(
+          ValueOpcode::LoadAddressU32,
+          {Value(&address), Value(offset), Value(0u), Value(true)});
+      read.SetFlags(MemoryFlags{.index = 0u, .pc = 0x40u + offset});
+      return Value(&read);
+    };
+    const auto nested_low = Read(Value(low), Value(high), 0u);
+    const auto nested_high = Read(Value(low), Value(high), 4u);
+    DescriptorSource expression;
+    expression.dword_count = 4u;
+    for (uint32_t word = 0; word < 4u; ++word)
+      expression.dwords[word] = Read(nested_low, nested_high, word * 4u);
+    program.descriptor_sources.push_back(expression);
+    DescriptorSource source;
+    source.dword_count = 4u;
+    source.dwords.fill(Value(0u));
+    source.indirect_descriptor.emplace();
+    source.indirect_descriptor->external_context.emplace(
+        DescriptorSource::IndirectDescriptor::ExternalContext{11u, 7u, 0u});
+    program.descriptor_sources.push_back(source);
+    program.info.samplers.push_back({.source = 1u});
+    domains[0] = {11u, true, records};
+    words[0x2000u] = 0x4000u;
+    words[0x2004u] = 0u;
+    words[0x3000u] = 0x5000u;
+    words[0x3004u] = 0u;
+    for (uint32_t offset = 0; offset < 16u; offset += 4u) {
+      words[0x4000u + offset] = offset == 0u ? 0x1110u : 0u;
+      words[0x5000u + offset] = offset == 0u ? 0x2220u : 0u;
+    }
+  }
+
+  static bool Read(void *userdata, uint64_t address,
+                   std::span<uint32_t> output) {
+    auto &fixture = *static_cast<ExternalMaterialFixture *>(userdata);
+    fixture.requested.push_back(address);
+    if (address == fixture.reject_address)
+      return false;
+    for (size_t i = 0; i < output.size(); ++i) {
+      const auto found = fixture.words.find(address + i * sizeof(uint32_t));
+      if (found == fixture.words.end())
+        return false;
+      output[i] = found->second;
+    }
+    return true;
+  }
+
+  Libs::Graphics::ShaderRecompiler::IR::SrtRuntime Runtime() {
+    return {.read_memory = Read,
+            .userdata = this,
+            .read_specialization_memory = Read,
+            .external_context_domains = domains};
+  }
+};
+
+void TestExternalContextNestedDescriptors() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ExternalMaterialFixture fixture;
+  Check(!ValidateRuntimeValue(fixture.program, Value(fixture.low)),
+        "external context marker was accepted without an explicit context");
+  Check(ValidateRuntimeValue(fixture.program, Value(fixture.low),
+                             RuntimeValueType::Integer,
+                             ExternalCallContextBinding{11u, 7u}),
+        "explicit external context marker was rejected");
+  auto plan = ExtractResourcePlan(fixture.program);
+  auto runtime = fixture.Runtime();
+  DescriptorValue descriptor;
+  Check(!SrtWalker(plan, runtime).EvaluateDescriptor(0u, descriptor) &&
+            fixture.requested.empty(),
+        "default host evaluator read a selected GPU context");
+  {
+    SrtWalker evaluator(plan, CleanRuntime(runtime), {}, nullptr, {},
+                        SrtExternalContext{11u, &fixture.records[1]});
+    Check(evaluator.EvaluateDescriptor(0u, descriptor) &&
+              descriptor.dwords[0] == 0x2220u,
+          "context descriptor did not preserve the selected record auxiliary "
+          "pointer");
+  }
+  Check(
+      fixture.low->Arg(0) == fixture.lane &&
+          fixture.low->Arg(2) == fixture.lane &&
+          fixture.high->Arg(0) == fixture.lane &&
+          fixture.high->Arg(2) == fixture.lane,
+      "host extraction changed executable raw auxiliary or GPU ordinal values");
+  fixture.requested.clear();
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "complete external nested descriptor materialization failed");
+  Check(snapshot.samplers.size() == 3u &&
+            specialization.samplers.size() == 3u &&
+            snapshot.samplers[1].dwords[0] == 0x1110u &&
+            snapshot.samplers[2].dwords[0] == 0x2220u,
+        "same native function lost distinct auxiliary resource payloads");
+  const auto &root = specialization.samplers[0];
+  const auto offset = root.indirect_mapping_offset;
+  Check(
+      root.indirect_root == 0u && root.indirect_search_iterations == 2u &&
+          snapshot.flattened_srt.size() >= offset + 7u &&
+          std::vector<uint32_t>(snapshot.flattened_srt.begin() + offset,
+                                snapshot.flattened_srt.begin() + offset + 7u) ==
+              std::vector<uint32_t>{3u, 3u, 1u, 9u, 2u, 21u, 1u},
+      "sparse record keys were dropped or duplicate payload keys were merged");
+  Check(fixture.requested.size() == 18u,
+        "nested context descriptor dependencies were read repeatedly within "
+        "one context");
+  Check(snapshot.external_descriptor_candidate_count == 3u &&
+            snapshot.external_descriptor_read_bytes == 72u,
+        "external planning counters did not report actual candidate tuples and "
+        "requested bytes");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  Check(fixture.program.info.samplers[0].indirect_resources ==
+            std::vector<uint32_t>{0u, 1u, 2u},
+        "external sampler specialization did not preserve candidate ordinals");
+}
+
+void TestExternalDefaultSamplerRetainsKeyDomain() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ExternalMaterialFixture fixture;
+  for (uint32_t offset = 0; offset < 16u; offset += 4u) {
+    fixture.words[0x4000u + offset] = 0u;
+    fixture.words[0x5000u + offset] = 0u;
+  }
+  auto plan = ExtractResourcePlan(fixture.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(
+      MaterializeResources(plan, fixture.Runtime(), snapshot, specialization) &&
+          snapshot.samplers.size() == 1u &&
+          specialization.samplers[0].indirect_root == 0u,
+      "default sampler discarded its external context mapping");
+  const auto offset = specialization.samplers[0].indirect_mapping_offset;
+  Check(
+      std::vector<uint32_t>(snapshot.flattened_srt.begin() + offset,
+                            snapshot.flattened_srt.begin() + offset + 7u) ==
+          std::vector<uint32_t>{3u, 3u, 0u, 9u, 0u, 21u, 0u},
+      "default sampler lost valid sparse keys or invented a child descriptor");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  Check(
+      fixture.program.info.samplers[0].indirect_resources ==
+          std::vector<uint32_t>{0u},
+      "default sampler cannot preserve its single-candidate runtime dispatch");
+}
+
+void TestExternalContextRejectsIncompleteOrUnprovedReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  for (uint32_t variant = 0; variant < 6u; ++variant) {
+    ExternalMaterialFixture fixture;
+    if (variant == 0u)
+      fixture.domains[0].complete = false;
+    if (variant == 1u)
+      fixture.domains[0].domain_id = 12u;
+    if (variant == 2u)
+      fixture.records[2].ordinal = fixture.records[0].ordinal;
+    if (variant == 3u)
+      fixture.reject_address = 0x5008u;
+    if (variant == 4u) {
+      fixture.high->SetArg(4u, Value(8u));
+      fixture.program.external_context_bindings.push_back({11u, 8u});
+    }
+    auto plan = ExtractResourcePlan(fixture.program);
+    auto runtime = fixture.Runtime();
+    if (variant == 5u)
+      runtime.read_specialization_memory = nullptr;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "incomplete, mixed or unreadable external resource context was "
+          "accepted");
+    if (variant == 3u) {
+      Check(!fixture.requested.empty() && fixture.requested.back() == 0x5008u,
+            "external nested read failure was reported at a different guest "
+            "address");
+    } else {
+      Check(fixture.requested.empty(),
+            "invalid context or missing strict reader fell back to ordinary "
+            "guest reads");
+    }
+  }
+}
+
+void TestExternalTypedNullImageRetainsKeyDomain() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::TextureNumericClass;
+  using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  for (const bool concrete_type : {true, false}) {
+    ExternalMaterialFixture fixture;
+    for (uint32_t offset = 0; offset < 16u; offset += 4u) {
+      fixture.words[0x4000u + offset] = 0u;
+      fixture.words[0x5000u + offset] = 0u;
+    }
+    fixture.program.info.samplers.clear();
+    auto &expression = fixture.program.descriptor_sources[0];
+    expression.dword_count = 8u;
+    for (uint32_t word = 4u; word < 8u; ++word)
+      expression.dwords[word] = Value(0u);
+    fixture.program.descriptor_sources[1].dword_count = 8u;
+    fixture.program.info.images.push_back(
+        {.source = 1u,
+         .resource_class = ImageResourceClass::Sampled,
+         .numeric_class = concrete_type ? TextureNumericClass::Uint
+                                        : TextureNumericClass::Unsupported,
+         .dimension = ImageDimension::Dim3D,
+         .read = true});
+    auto plan = ExtractResourcePlan(fixture.program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const auto result =
+        MaterializeResources(plan, fixture.Runtime(), snapshot, specialization);
+    if (!concrete_type) {
+      Check(!result,
+            "all-null external image invented an unproved numeric format");
+      continue;
+    }
+    Check(result && snapshot.images.size() == 1u &&
+              specialization.images[0].indirect_root == 0u &&
+              specialization.images[0].numeric_class ==
+                  TextureNumericClass::Uint &&
+              specialization.images[0].dimension == ImageDimension::Dim3D,
+          "typed-null external image lost its proven class or context mapping");
+    ApplyResourceSpecialization(fixture.program, specialization);
+    Check(fixture.program.info.images[0].indirect_resources ==
+              std::vector<uint32_t>{0u},
+          "typed-null image did not retain its single-candidate runtime "
+          "dispatch");
+  }
+}
+
+void TestExternalBindingAliasesRemainStructural() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = MixedSamplerProgram();
+  program.external_context_bindings.push_back({11u, 7u});
+  const auto valid = program.descriptor_sources[1];
+  program.descriptor_sources[0] = valid;
+  auto &block = *program.blocks[0];
+  auto &address = block.AppendNewInst(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(2))});
+  program.descriptor_sources[1].dwords[0] = Value(&address);
+  std::array<uint32_t, 3> user_data{0x1230u, 0x1230u, 1u};
+  auto plan = ExtractResourcePlan(program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization first, changed;
+  const SrtRuntime runtime{.user_data = user_data};
+  Check(MaterializeResources(plan, runtime, snapshot, first) &&
+            first.images[1].binding_alias == 0u &&
+            first.sampler_binding_aliases.size() == 2u &&
+            first.sampler_binding_aliases[1] == 0u,
+        "equivalent descriptors across distinct roots did not share canonical "
+        "bindings");
+  user_data[2] = 2u;
+  user_data[1] = 0x1240u;
+  Check(MaterializeResources(plan, runtime, snapshot, changed) &&
+            changed != first && changed.images[1].binding_alias == UINT32_MAX &&
+            changed.sampler_binding_aliases[1] == UINT32_MAX,
+        "changed runtime descriptor equality did not change cache binding "
+        "topology");
+  user_data[2] = 1u;
+  user_data[1] = 0x1230u;
+  Check(MaterializeResources(plan, runtime, snapshot, changed) &&
+            changed == first,
+        "canonical binding pattern depended on absolute descriptor payload "
+        "identity");
+  ApplyResourceSpecialization(program, changed);
+  Check(program.info.images[1].binding_alias == 0u &&
+            program.info.samplers[1].binding_alias == 0u,
+        "binding aliases were not carried into executable resource metadata");
+
+  auto mixed = MixedSamplerProgram();
+  mixed.external_context_bindings.push_back({11u, 7u});
+  auto mixed_plan = ExtractResourcePlan(mixed);
+  ResourceSpecialization classes;
+  user_data[0] = user_data[1] = 0u;
+  Check(
+      MaterializeResources(mixed_plan, runtime, snapshot, classes) &&
+          classes.sampler_binding_aliases.size() == 3u &&
+          classes.sampler_binding_aliases[1] == 0u &&
+          classes.sampler_binding_aliases[2] == UINT32_MAX,
+      "integer point-filtering sampler class aliased a float sampler binding");
+}
+
 } // namespace
 
 namespace Common {
@@ -668,6 +994,11 @@ int main(int argc, char **argv) {
   TestFiniteImageRefreshReusesScalarReads();
   TestSupportedIndirectImageOperationsSpecialize();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestExternalContextNestedDescriptors();
+  TestExternalDefaultSamplerRetainsKeyDomain();
+  TestExternalContextRejectsIncompleteOrUnprovedReads();
+  TestExternalTypedNullImageRetainsKeyDomain();
+  TestExternalBindingAliasesRemainStructural();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

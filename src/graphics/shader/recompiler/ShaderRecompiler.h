@@ -11,6 +11,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler {
 
+struct ExternalLibraryPlan;
+
 struct CompileOptions {
 	ShaderType                  stage           = ShaderType::Compute;
 	uint32_t                    wave_size       = 64;
@@ -22,6 +24,7 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	const ExternalLibraryPlan*  external_library = nullptr;
 };
 
 struct TranslateResult {

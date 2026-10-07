@@ -67,6 +67,7 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::Gds:
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
+		case BindingKind::ShaderCallFaultBuffer:
 		case BindingKind::FlattenedSrt:
 		case BindingKind::ShaderData:
 		case BindingKind::SharedMemory: return vk::DescriptorType::eStorageBuffer;
@@ -1140,6 +1141,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						                             : cache.GetFaultBuffer();
 						m_descriptor_buffers.emplace_back(bda_buffer->Handle(), 0,
 						                                  bda_buffer->Size());
+						break;
+					}
+					case BindingKind::ShaderCallFaultBuffer: {
+						const auto* fault = m_context.GetBufferCache().GetShaderCallFaultBuffer();
+						m_descriptor_buffers.emplace_back(fault->Handle(), 0, fault->Size());
 						break;
 					}
 					case BindingKind::FlattenedSrt:

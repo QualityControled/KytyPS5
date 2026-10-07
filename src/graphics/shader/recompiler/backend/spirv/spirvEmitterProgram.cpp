@@ -1,10 +1,12 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
 #include "common/assert.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
 #include <functional>
+#include <map>
 #include <optional>
 #include <type_traits>
 #include <unordered_set>
@@ -12,6 +14,11 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
+
+[[noreturn]] void Fail(const char* reason) {
+	EXIT("external shader dispatcher emission failed: %s", reason);
+	std::abort();
+}
 
 void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 	const auto kill_label  = state.builder.AllocateId();
@@ -57,11 +64,11 @@ struct StructuredFunctionState {
 
 struct DispatcherFunctionState {
 	std::array<std::unordered_map<const IR::Inst*, uint32_t>, 2> spills;
-	uint32_t                                      header_label       = 0;
-	uint32_t                                      select_label       = 0;
-	uint32_t                                      after_switch_label = 0;
-	uint32_t                                      continue_label     = 0;
-	uint32_t                                      merge_label        = 0;
+	uint32_t                                                     header_label       = 0;
+	uint32_t                                                     select_label       = 0;
+	uint32_t                                                     after_switch_label = 0;
+	uint32_t                                                     continue_label     = 0;
+	uint32_t                                                     merge_label        = 0;
 };
 
 void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
@@ -99,7 +106,7 @@ void EmitReturn(ValueEmitContext& ctx) {
 
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
-	const auto& program = ctx.state.program;
+	const auto& program    = ctx.state.program;
 	const auto& term       = info.terminator;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
@@ -157,6 +164,91 @@ void EmitDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& 
 	}
 }
 
+void RecordShaderCallFault(ValueEmitContext& ctx, uint32_t kind, uint32_t low, uint32_t high,
+                           uint64_t guest_pc) {
+	auto& state = ctx.state;
+	if (state.shader_call_fault_buffer_variable == 0)
+		Fail("external call has no dedicated fault buffer");
+	const auto pointer = [&](uint32_t word) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          result, state.shader_call_fault_buffer_variable,
+		                          ConstantU32(state, 0), ConstantU32(state, word));
+		return result;
+	};
+	const auto previous = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpAtomicCompareExchange, TypeU32(state), previous, pointer(0),
+	    ConstantU32(state, spv::ScopeDevice),
+	    ConstantU32(state,
+		            spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsUniformMemoryMask),
+	    ConstantU32(state, spv::MemorySemanticsAcquireMask | spv::MemorySemanticsUniformMemoryMask),
+	    ConstantU32(state, 1), ConstantU32(state, 0));
+	const auto won = Binary(state, spv::OpIEqual, TypeBool(state), previous, ConstantU32(state, 0));
+	const auto write_label = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, won, write_label, merge_label);
+	EmitLabel(state, write_label);
+	const std::array<uint32_t, 7> details {
+	    ConstantU32(state, kind),
+	    low,
+	    high,
+	    ConstantU32(state, static_cast<uint32_t>(guest_pc)),
+	    ConstantU32(state, static_cast<uint32_t>(guest_pc >> 32u)),
+	    ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash)),
+	    ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash >> 32u))};
+	for (uint32_t i = 0; i < details.size(); ++i)
+		state.builder.AddFunction(spv::OpStore, pointer(i + 1u), details[i]);
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
+}
+
+uint32_t EmitExternalDispatcherNextPc(ValueEmitContext&              ctx,
+                                      const DispatcherFunctionState& dispatcher,
+                                      const IR::Block* block, const IR::BlockInfo& info) {
+	auto&       state = ctx.state;
+	const auto& term  = info.terminator;
+	if (info.indirect_target.IsEmpty() ||
+	    term.indirect_guest_addresses.size() != term.indirect_targets.size())
+		Fail("external transfer has an invalid 64-bit target mapping");
+	const auto            selector = ctx.Def(info.indirect_target);
+	const auto            merge    = state.builder.AllocateId();
+	const auto            fault    = state.builder.AllocateId();
+	std::vector<uint32_t> labels(term.indirect_targets.size());
+	if (labels.size() > 16383u)
+		Fail("external address dispatch exceeds the SPIR-V universal switch-case limit");
+	std::vector<uint32_t> words {spv::OpSwitch, selector, fault};
+	for (size_t i = 0; i < labels.size(); ++i) {
+		labels[i] = state.builder.AllocateId();
+		words.push_back(static_cast<uint32_t>(term.indirect_guest_addresses[i]));
+		words.push_back(static_cast<uint32_t>(term.indirect_guest_addresses[i] >> 32u));
+		words.push_back(labels[i]);
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(words);
+	std::vector<uint32_t> phi {spv::OpPhi, TypeU32(state), state.builder.AllocateId()};
+	for (size_t i = 0; i < labels.size(); ++i) {
+		EmitLabel(state, labels[i]);
+		EmitDispatcherTarget(ctx, dispatcher, block, term.indirect_targets[i]);
+		phi.push_back(ConstantU32(state, term.indirect_targets[i]));
+		phi.push_back(state.current_label);
+		state.builder.AddFunction(spv::OpBranch, merge);
+	}
+	EmitLabel(state, fault);
+	const auto low  = Unary(state, spv::OpUConvert, TypeU32(state), selector);
+	const auto high = Unary(
+	    state, spv::OpUConvert, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU64(state), selector, ConstantU32(state, 32)));
+	RecordShaderCallFault(ctx, 1, low, high, term.external_guest_pc);
+	phi.push_back(ConstantU32(state, UINT32_MAX));
+	phi.push_back(state.current_label);
+	state.builder.AddFunction(spv::OpBranch, merge);
+	EmitLabel(state, merge);
+	state.builder.AddFunction(phi);
+	return phi[2];
+}
+
 uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
                               const IR::Block* block, const IR::BlockInfo& info) {
 	const auto& term = info.terminator;
@@ -174,6 +266,8 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 			return selected;
 		}
 		case CFG::TerminatorKind::IndirectBranch: {
+			if (term.external_transfer)
+				return EmitExternalDispatcherNextPc(ctx, dispatcher, block, info);
 			for (const auto target: term.indirect_targets) {
 				EmitDispatcherTarget(ctx, dispatcher, block, target);
 			}
@@ -244,7 +338,7 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
-	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
+	                      inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
 		// Both operations already combine both emulated halves into one whole-wave result.
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
@@ -273,7 +367,7 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 		}
 		structured.deferred_phis.push_back(
 		    {ctx.state.builder.AddDeferredPhi(type, ctx.Result(inst), inst.NumArgs()), &inst,
-		     ctx.half});
+			 ctx.half});
 		return;
 	}
 	EmitDirectInstruction(ctx, inst);
@@ -340,7 +434,7 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 }
 
 void EmitStructuredFunction(ValueEmitContext& ctx) {
-	const auto& program = ctx.state.program;
+	const auto&             program = ctx.state.program;
 	StructuredFunctionState structured;
 	ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(program.blocks.front()));
 	for (size_t index = 0; index < program.blocks.size(); index++) {
@@ -380,27 +474,75 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	                          dispatcher.select_label);
 
 	EmitLabel(state, dispatcher.select_label);
-	state.builder.AddFunction(spv::OpSelectionMerge, dispatcher.after_switch_label,
-	                          spv::SelectionControlMaskNone);
-	std::vector<uint32_t> words {spv::OpSwitch, pc, dispatcher.after_switch_label};
-	for (size_t index = 1; index < state.program.blocks.size(); index++) {
-		words.push_back(state.program.block_info[index].id);
-		words.push_back(ctx.Label(state.program.blocks[index]));
-	}
-	state.builder.AddFunction(words);
 	std::vector<uint32_t> next_pc_words {spv::OpPhi, TypeU32(state), next_pc,
 	                                     ConstantU32(state, UINT32_MAX), dispatcher.select_label};
-
-	for (size_t index = 1; index < state.program.blocks.size(); index++) {
+	const auto emit_case = [&](size_t index, uint32_t merge, std::vector<uint32_t>& phi) {
 		EmitBlock(ctx, state.program.blocks[index],
 		          [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			          EmitDispatcherInstruction(lane, dispatcher, inst);
 		          });
 		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, state.program.blocks[index],
 		                                           state.program.block_info[index]);
-		next_pc_words.push_back(selected);
-		next_pc_words.push_back(state.current_label);
-		state.builder.AddFunction(spv::OpBranch, dispatcher.after_switch_label);
+		phi.push_back(selected);
+		phi.push_back(state.current_label);
+		state.builder.AddFunction(spv::OpBranch, merge);
+	};
+	// Stay within the universal OpSwitch case limit as well as the 16-bit
+	// instruction word count. Each selection owns its result phi.
+	constexpr uint32_t MaxSingleSwitchCases = 16383u;
+	if (state.program.blocks.size() - 1u <= MaxSingleSwitchCases) {
+		state.builder.AddFunction(spv::OpSelectionMerge, dispatcher.after_switch_label,
+		                          spv::SelectionControlMaskNone);
+		std::vector<uint32_t> words {spv::OpSwitch, pc, dispatcher.after_switch_label};
+		for (size_t index = 1; index < state.program.blocks.size(); ++index) {
+			words.push_back(state.program.block_info[index].id);
+			words.push_back(ctx.Label(state.program.blocks[index]));
+		}
+		state.builder.AddFunction(words);
+		for (size_t index = 1; index < state.program.blocks.size(); ++index)
+			emit_case(index, dispatcher.after_switch_label, next_pc_words);
+	} else {
+		std::map<uint32_t, std::vector<size_t>> shards;
+		for (size_t index = 1; index < state.program.blocks.size(); ++index)
+			shards[state.program.block_info[index].id / MaxSingleSwitchCases].push_back(index);
+		const auto shard = Binary(state, spv::OpUDiv, TypeU32(state), pc,
+		                          ConstantU32(state, MaxSingleSwitchCases));
+		if (shards.size() > MaxSingleSwitchCases)
+			Fail("internal dispatcher exceeds the SPIR-V universal switch-case limit");
+		std::vector<uint32_t> labels;
+		std::vector<uint32_t> outer {spv::OpSwitch, shard, dispatcher.after_switch_label};
+		for (const auto& [key, indices]: shards) {
+			const auto label = state.builder.AllocateId();
+			labels.push_back(label);
+			outer.push_back(key);
+			outer.push_back(label);
+		}
+		state.builder.AddFunction(spv::OpSelectionMerge, dispatcher.after_switch_label,
+		                          spv::SelectionControlMaskNone);
+		state.builder.AddFunction(outer);
+		size_t shard_index = 0;
+		for (const auto& [key, indices]: shards) {
+			const auto label  = labels[shard_index++];
+			const auto merge  = state.builder.AllocateId();
+			const auto result = state.builder.AllocateId();
+			EmitLabel(state, label);
+			std::vector<uint32_t> inner {spv::OpSwitch, pc, merge};
+			for (const auto index: indices) {
+				inner.push_back(state.program.block_info[index].id);
+				inner.push_back(ctx.Label(state.program.blocks[index]));
+			}
+			state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+			state.builder.AddFunction(inner);
+			std::vector<uint32_t> phi {spv::OpPhi, TypeU32(state), result,
+			                           ConstantU32(state, UINT32_MAX), label};
+			for (const auto index: indices)
+				emit_case(index, merge, phi);
+			EmitLabel(state, merge);
+			state.builder.AddFunction(phi);
+			next_pc_words.push_back(result);
+			next_pc_words.push_back(merge);
+			state.builder.AddFunction(spv::OpBranch, dispatcher.after_switch_label);
+		}
 	}
 	EmitLabel(state, dispatcher.after_switch_label);
 	state.builder.AddFunction(next_pc_words);
@@ -412,6 +554,18 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 }
 
 } // namespace
+
+void EmitExternalResourceFault(ValueEmitContext& ctx, uint32_t invalid, uint32_t ordinal,
+                               uint32_t domain, uint64_t guest_pc) {
+	const auto fault = ctx.state.builder.AllocateId();
+	const auto merge = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+	ctx.state.builder.AddFunction(spv::OpBranchConditional, invalid, fault, merge);
+	EmitLabel(ctx.state, fault);
+	RecordShaderCallFault(ctx, 2, ordinal, domain, guest_pc);
+	ctx.state.builder.AddFunction(spv::OpBranch, merge);
+	EmitLabel(ctx.state, merge);
+}
 
 uint32_t TypeId(EmitterState& state, IR::Type type) {
 	switch (type) {
@@ -536,9 +690,9 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	}
 	const auto physical_lane =
 	    EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
-	const auto high          = state.builder.AllocateId();
-	const auto in_high       = state.builder.AllocateId();
-	const auto value         = state.builder.AllocateId();
+	const auto high    = state.builder.AllocateId();
+	const auto in_high = state.builder.AllocateId();
+	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope,
 	                          HalfArg(inst, index, 0), physical_lane);
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, high, scope,
@@ -698,6 +852,20 @@ void EmitProgram(EmitterState& state) {
 			break;
 		}
 	}
+	if (state.program.info.uses_external_call_fault && dispatcher.has_value()) {
+		const auto spill_variables = dispatcher->spills[0].size() + dispatcher->spills[1].size();
+		const auto main_variables  = spill_variables + (state.requirements.function_lds ? 1u : 0u) +
+		                             (state.requirements.function_scratch ? state.lane_count : 0u) +
+		                             (state.pixel_valid_mask_variable != 0 ? 1u : 0u) +
+		                             (ctx.scratch_u32_variable != 0 ? 1u : 0u) +
+		                             (high.scratch_u32_variable != 0 ? 1u : 0u);
+		std::printf("[external-shader] stage=%u hash=0x%016" PRIx64
+		            " phase=dispatcher-layout blocks=%zu spills=%zu main_function_variables=%zu "
+		            "emulated_halves=%u\n",
+		            static_cast<unsigned>(state.program.stage), state.program.shader_hash,
+		            state.program.blocks.size(), spill_variables, main_variables, state.lane_count);
+		std::fflush(stdout);
+	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
@@ -756,10 +924,12 @@ void EmitProgram(EmitterState& state) {
 		const auto group_z = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 2);
 		const auto count_x = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 0);
 		const auto count_y = EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, 1);
-		const auto row = EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
-		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
-		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
-		                                     ConstantU32(state, LdsDwordCount(state)));
+		const auto row =
+		    EmitAddU32(state, group_y, EmitBinaryU32(state, spv::OpIMul, group_z, count_y));
+		const auto index =
+		    EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
+		state.lds_base_dwords =
+		    EmitBinaryU32(state, spv::OpIMul, index, ConstantU32(state, LdsDwordCount(state)));
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {

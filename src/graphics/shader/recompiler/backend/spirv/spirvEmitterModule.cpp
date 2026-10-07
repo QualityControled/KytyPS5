@@ -259,6 +259,9 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable = Define(StorageBufferType(state), "fault_buffer");
 				break;
+			case IR::DescriptorBindingKind::ShaderCallFaultBuffer:
+				state.shader_call_fault_buffer_variable = Define(StorageBufferType(state), "shader_call_fault_buffer");
+				break;
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state), "shader_data");

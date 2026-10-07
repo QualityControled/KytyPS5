@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
 #include <array>
@@ -17,7 +18,7 @@ namespace {
 
 void CollectShaderData(const Program& program, BindingLayout& layout) {
 	std::array<bool, NumScalarRegs> registers {};
-	bool uses_dispatch_threads = false;
+	bool                            uses_dispatch_threads = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (!inst.HasUses()) {
@@ -56,9 +57,10 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 
 } // namespace
 
-SharedMemoryResources CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers) {
+SharedMemoryResources CollectMemoryResources(const Program&         program,
+                                             std::vector<uint32_t>& buffers) {
 	std::array<bool, ShaderInfo::MaxBuffers> live_buffers {};
-	SharedMemoryResources shared;
+	SharedMemoryResources                    shared;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto op = inst.GetOpcode();
@@ -82,7 +84,8 @@ SharedMemoryResources CollectMemoryResources(const Program& program, std::vector
 				}
 				shared.gds |= memory.kind == ResourceKind::Gds;
 				shared.lds |= memory.kind == ResourceKind::Lds;
-			} else if (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer) {
+			} else if (memory.kind == ResourceKind::Buffer ||
+			           memory.kind == ResourceKind::ScalarBuffer) {
 				EXIT_IF(memory.resource >= program.info.buffers.size());
 				live_buffers.at(memory.resource) = true;
 				for (const auto child: program.info.buffers[memory.resource].indirect_resources) {
@@ -103,27 +106,29 @@ bool UsesFlattenedSrt(const Program& program) {
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
 	};
-	return std::ranges::any_of(program.blocks, [](const Block* block) {
-		return std::ranges::any_of(*block, [](const Inst& inst) {
-			return inst.GetOpcode() == ValueOpcode::ReadConst;
-		});
-	}) || std::ranges::any_of(program.info.buffers, uses_mapping) ||
-	       std::ranges::any_of(program.info.images, uses_mapping);
+	return std::ranges::any_of(program.blocks,
+	                           [](const Block* block) {
+		                           return std::ranges::any_of(*block, [](const Inst& inst) {
+			                           return inst.GetOpcode() == ValueOpcode::ReadConst;
+		                           });
+	                           }) ||
+	       std::ranges::any_of(program.info.buffers, uses_mapping) ||
+	       std::ranges::any_of(program.info.images, uses_mapping) ||
+	       std::ranges::any_of(program.info.samplers, uses_mapping);
 }
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
-		                                             : "binding layout already allocated");
+													 : "binding layout already allocated");
 	}
-	BindingLayout next;
+	BindingLayout         next;
 	std::vector<uint32_t> buffers;
-	const auto shared = CollectMemoryResources(program, buffers);
+	const auto            shared = CollectMemoryResources(program, buffers);
 	CollectShaderData(program, next);
-	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
-	next.push_data_start_dword =
-	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
+	next.memory_offset_count   = static_cast<uint32_t>(buffers.size());
+	next.push_data_start_dword = PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
 	if (!buffers.empty()) {
 		// Draw binding accesses this first group directly when memory_offset_count is nonzero.
@@ -135,6 +140,18 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		const auto kind = DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			EXIT("shader binding layout failed: image %u has an invalid binding class", i);
+		}
+		const auto& image = program.info.images[i];
+		if (image.binding_alias != UINT32_MAX) {
+			if (image.binding_alias >= i)
+				BindingFail("image alias must name an earlier canonical resource");
+			const auto& canonical = program.info.images[image.binding_alias];
+			if (canonical.binding_alias != UINT32_MAX ||
+			    DescriptorBindingForImage(canonical) != kind ||
+			    image.mip_mode != canonical.mip_mode || image.mip_count != canonical.mip_count ||
+			    image.cube != canonical.cube || image.r128 != canonical.r128)
+				BindingFail("image alias has an incompatible canonical view");
+			continue;
 		}
 		const auto group = ImageBindingIndex(*kind);
 		if (group >= image_groups.size()) {
@@ -157,9 +174,21 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	}
 
 	if (!program.info.samplers.empty()) {
-		std::vector<uint32_t> resources(program.info.samplers.size());
-		for (uint32_t i = 0; i < resources.size(); i++) {
-			resources[i] = i;
+		std::vector<uint32_t> resources;
+		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+			const auto& sampler = program.info.samplers[i];
+			if (sampler.binding_alias != UINT32_MAX) {
+				if (sampler.binding_alias >= i)
+					BindingFail("sampler alias must name an earlier canonical resource");
+				const auto& canonical = program.info.samplers[sampler.binding_alias];
+				if (canonical.binding_alias != UINT32_MAX ||
+				    sampler.depth_compare != canonical.depth_compare ||
+				    sampler.integer_border != canonical.integer_border ||
+				    sampler.force_point_filtering != canonical.force_point_filtering ||
+				    sampler.gather_lod != canonical.gather_lod)
+					BindingFail("sampler alias has incompatible canonical class flags");
+			} else
+				resources.push_back(i);
 		}
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
@@ -172,6 +201,9 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	if (program.info.uses_dma) {
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);
 		AddBinding(next, DescriptorBindingKind::FaultBuffer);
+	}
+	if (program.info.uses_external_call_fault) {
+		AddBinding(next, DescriptorBindingKind::ShaderCallFaultBuffer);
 	}
 	if (UsesFlattenedSrt(program)) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
@@ -192,6 +224,41 @@ const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBind
 		}
 	}
 	return nullptr;
+}
+
+bool ValidateDescriptorBindingLimits(const Program& program, const DescriptorBindingLimits& limits,
+                                     std::string& failure) {
+	if (!program.binding_layout_complete) {
+		failure = "descriptor limits checked before layout allocation";
+		return false;
+	}
+	uint64_t storage_buffers = 0, sampled_images = 0, storage_images = 0, samplers = 0;
+	for (const auto& binding: program.bindings.descriptors) {
+		const uint64_t count = binding.resources.empty() ? 1u : binding.resources.size();
+		if (binding.kind == DescriptorBindingKind::Samplers)
+			samplers += count;
+		else if (ImageBindingResourceClass(binding.kind) == ImageResourceClass::Sampled)
+			sampled_images += count;
+		else if (ImageBindingResourceClass(binding.kind) == ImageResourceClass::Storage)
+			storage_images += count;
+		else
+			storage_buffers += count;
+	}
+	const auto check = [&](uint64_t count, uint32_t limit, const char* category) {
+		if (count <= limit) return true;
+		failure = std::string(category) + " descriptor count " + std::to_string(count) +
+		          " exceeds per-stage limit " + std::to_string(limit);
+		return false;
+	};
+	if (!check(storage_buffers, limits.storage_buffers, "storage-buffer") ||
+	    !check(sampled_images, limits.sampled_images, "sampled-image") ||
+	    !check(storage_images, limits.storage_images, "storage-image") ||
+	    !check(samplers, limits.samplers, "sampler") ||
+	    !check(storage_buffers + sampled_images + storage_images, limits.total_resources,
+	           "total-resource"))
+		return false;
+	failure.clear();
+	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

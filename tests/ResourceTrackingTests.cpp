@@ -16,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -3304,7 +3305,9 @@ void TestImageBindingAbi() {
             static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 53u &&
             static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 54u &&
             static_cast<uint32_t>(DescriptorBindingKind::SharedMemory) == 55u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u,
+            static_cast<uint32_t>(
+                DescriptorBindingKind::ShaderCallFaultBuffer) == 56u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 57u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{
@@ -3551,6 +3554,344 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+void TestWorkgroupScalarBufferImageBounds() {
+  Fixture fixture;
+  std::array<Value, 4> table_words;
+  for (uint32_t word = 0; word < 4u; ++word)
+    table_words[word] = fixture.UserData(word);
+  const auto table = fixture.Buffer(table_words);
+  const auto key = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+  const auto offset = fixture.Emit(ValueOpcode::IMul32, {key, Value(32u)});
+  std::array<Value, 8> words;
+  for (uint32_t word = 0; word < 8u; ++word) {
+    MemoryInfo read{.kind = ResourceKind::ScalarBuffer, .offset = word * 4u};
+    words[word] = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+                               fixture.AddMemory(read, 0x200u));
+  }
+  const auto dimensions =
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {words[2], Value(0x3fffu)});
+  fixture.Emit(ValueOpcode::ReferenceU32, {dimensions});
+  const auto image = fixture.Image(words, 0x240u);
+  MemoryInfo access{.kind = ResourceKind::Image,
+                    .image_dimension = Decoder::ImageDimension::Dim2D};
+  fixture.Emit(ValueOpcode::ImageRead,
+               {image, fixture.ImageAddress(), Value(true)},
+               fixture.AddMemory(access, 0x240u));
+  fixture.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture.program);
+  const auto &indirect =
+      plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
+  Check(
+      indirect && indirect->workgroup_axis == 0u && !indirect->table_scalar &&
+          indirect->table_stride == 32u &&
+          dimensions.TryInstruction()
+                  ->Arg(0)
+                  .Resolve()
+                  .TryInstruction()
+                  ->GetOpcode() == ValueOpcode::ReadConstBuffer,
+      "scalar V# image table lost its workgroup bound or live dimensions read");
+  LinearTestMemory memory;
+  memory.watched_address = memory.base;
+  memory.fail_address = memory.base + 64u;
+  // Native V# range is deliberately larger than the dispatch domain. Read only
+  // the two reachable descriptor records, leaving its inaccessible tail alone.
+  std::array<uint32_t, 4> user_data{0x1000u, 0u, 0x100000u, 0u};
+  for (uint32_t record = 0; record < 2u; ++record) {
+    const auto at = record * 8u;
+    memory.words[at] = 0x20u + record;
+    memory.words[at + 1u] =
+        static_cast<uint32_t>(
+            Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+        << 20u;
+    memory.words[at + 3u] =
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+         << 28u);
+  }
+  const std::array<uint32_t, 3> groups{2u, 1u, 1u};
+  const SrtRuntime runtime{.user_data = user_data,
+                           .workgroup_counts = groups,
+                           .read_memory = ReadLinearTestMemory,
+                           .userdata = &memory,
+                           .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u && memory.reads == 2u &&
+            memory.descriptor_reads == 2u && memory.watched_dwords == 8u,
+        "scalar V# workgroup image materialization read beyond dispatch bounds");
+}
+
+void TestDeepScalarPlanningCycleRejected() {
+  Fixture fixture;
+  auto cycle = fixture.Emit(ValueOpcode::IAdd32, {Value(1u), Value(0u)});
+  cycle.TryInstruction()->SetArg(0, cycle);
+  auto descriptor_word = cycle;
+  // Greater than the native stack depth observed in the captured library. The
+  // planner must reach the bad leaf and report it without overflowing first.
+  for (uint32_t depth = 0; depth < 16384u; ++depth)
+    descriptor_word =
+        fixture.Emit(ValueOpcode::IAdd32, {descriptor_word, Value(1u)});
+  const auto handle =
+      fixture.Image({descriptor_word, Value(0u), Value(0u), Value(0u),
+                     Value(0u), Value(0u), Value(0u), Value(0u)},
+                    0x7dcu);
+  MemoryInfo memory{.kind = ResourceKind::Image,
+                    .image_dimension = Decoder::ImageDimension::Dim2D};
+  fixture.Emit(ValueOpcode::ImageRead,
+               {handle, fixture.ImageAddress(), Value(true)},
+               fixture.AddMemory(memory, 0x7dcu));
+  CheckFatal([&] { fixture.PlanAndTrack(); },
+             "cyclic typed planning value without a phi",
+             "deep scalar dependency planning did not reject its non-Phi cycle");
+  Check(!fixture.program.resource_tracking_complete &&
+            fixture.program.info.images.empty(),
+        "deep scalar cycle failure partially committed resource tracking");
+}
+
+void TestExternalContextResourceProvenance() {
+  Fixture fixture;
+  fixture.program.external_context_bindings.push_back({11u, 7u});
+  const auto key = fixture.Emit(ValueOpcode::LaneId);
+  const auto low = fixture.Emit(
+      ValueOpcode::ExternalCallContextWord,
+      {fixture.UserData(0u), Value(11u), key, Value(2u), Value(7u)});
+  const auto high = fixture.Emit(
+      ValueOpcode::ExternalCallContextWord,
+      {fixture.UserData(1u), Value(11u), key, Value(3u), Value(7u)});
+  const auto Read = [&](Value lo, Value hi, uint32_t offset) {
+    MemoryInfo memory{.kind = ResourceKind::ScalarAddress, .offset = offset};
+    return fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {fixture.Address(lo, hi), Value(0u), Value(0u), Value(true)},
+        fixture.AddMemory(memory, 0x40u + offset));
+  };
+  const auto image_low = Read(low, high, 0u);
+  const auto image_high = Read(low, high, 4u);
+  std::array<Value, 8> image_words;
+  std::array<Value, 4> sampler_words, buffer_words;
+  for (uint32_t word = 0; word < 8u; ++word)
+    image_words[word] = Read(image_low, image_high, word * 4u);
+  for (uint32_t word = 0; word < 4u; ++word) {
+    sampler_words[word] = Read(low, high, 32u + word * 4u);
+    buffer_words[word] = Read(low, high, 48u + word * 4u);
+  }
+  const auto image = fixture.Image(image_words, 0x100u);
+  const auto sampler = fixture.Sampler(sampler_words, 0x100u);
+  const auto buffer = fixture.Buffer(buffer_words, 0x108u);
+  MemoryInfo sample{.kind = ResourceKind::Image,
+                    .image_dimension = Decoder::ImageDimension::Dim2D};
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(sample, 0x100u));
+  MemoryInfo formatted{
+      .kind = ResourceKind::Buffer, .data_dwords = 4u, .formatted = true};
+  const auto buffer_flags = fixture.AddMemory(formatted, 0x108u);
+  const auto loaded = fixture.Emit(
+      ValueOpcode::LoadBufferU32x4,
+      {buffer, Value(0u), Value(0u), Value(0u), Value(true)}, buffer_flags);
+  fixture.Emit(
+      ValueOpcode::ReferenceU32,
+      {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {loaded, Value(0u)})});
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.images.size() == 1u &&
+            fixture.program.info.samplers.size() == 1u &&
+            fixture.program.info.buffers.empty() &&
+            fixture.program.info.uses_dma &&
+            fixture.program.memory_info[buffer_flags.index].kind ==
+                ResourceKind::IndirectBuffer &&
+            fixture.program.memory_info[buffer_flags.index]
+                    .dynamic_descriptor_source != UINT32_MAX,
+        "external dynamic material resources were frozen into ordinary "
+        "descriptor roots");
+  Check(image.TryInstruction()->Arg(0) == key &&
+            sampler.TryInstruction()->Arg(0) == key &&
+            buffer.TryInstruction()->Arg(0) == buffer_words[0] &&
+            buffer.TryInstruction()->Arg(3) == buffer_words[3],
+        "resource planning changed the GPU record ordinal or raw BDA buffer "
+        "descriptor");
+  const auto &image_source =
+      fixture.program.descriptor_sources[fixture.program.info.images[0].source];
+  const auto &sampler_source =
+      fixture.program
+          .descriptor_sources[fixture.program.info.samplers[0].source];
+  Check(image_source.indirect_descriptor &&
+            image_source.indirect_descriptor->external_context &&
+            sampler_source.indirect_descriptor &&
+            sampler_source.indirect_descriptor->external_context &&
+            image_source.indirect_descriptor->external_context->domain_id ==
+                11u &&
+            image_source.indirect_descriptor->external_context->function_id ==
+                7u,
+        "tracker did not preserve external image/sampler context provenance");
+  const auto &buffer_source = fixture.program.descriptor_sources[
+      fixture.program.memory_info[buffer_flags.index].dynamic_descriptor_source];
+  Check(buffer_source.indirect_descriptor &&
+            buffer_source.indirect_descriptor->external_context &&
+            buffer_source.indirect_descriptor->external_context
+                    ->expression_source !=
+                sampler_source.indirect_descriptor->external_context
+                    ->expression_source,
+        "external sampler and buffer wrappers aliased distinct raw descriptor "
+        "expressions");
+
+  struct Memory {
+    std::unordered_map<uint64_t, uint32_t> words;
+    static bool Read(void *data, uint64_t address, std::span<uint32_t> values) {
+      const auto &memory = *static_cast<Memory *>(data);
+      for (size_t i = 0; i < values.size(); ++i) {
+        const auto found = memory.words.find(address + i * sizeof(uint32_t));
+        if (found == memory.words.end())
+          return false;
+        values[i] = found->second;
+      }
+      return true;
+    }
+  } memory;
+  namespace Prospero = Libs::Graphics::Prospero;
+  std::array<ExternalCallContextRecord, 3> records{
+      {{3u, 7u, {0x12340000u, 0u, 0x2000u, 0u}},
+       {9u, 7u, {0x12340000u, 0u, 0x3000u, 0u}},
+       {21u, 7u, {0x12340000u, 0u, 0x2000u, 0u}}}};
+  std::array<ExternalCallContextDomain, 1> domains{{{11u, true, records}}};
+  for (uint32_t candidate = 0; candidate < 2u; ++candidate) {
+    const uint64_t aux = 0x2000u + candidate * 0x1000u;
+    const uint64_t pointer = 0x6000u + candidate * 0x1000u;
+    memory.words[aux] = static_cast<uint32_t>(pointer);
+    memory.words[aux + 4u] = 0u;
+    for (uint32_t word = 0; word < 8u; ++word)
+      memory.words[pointer + word * 4u] = 0u;
+    memory.words[pointer] = 0x20u + candidate;
+    memory.words[pointer + 4u] =
+        static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[pointer + 12u] =
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+    for (uint32_t word = 0; word < 4u; ++word) {
+      memory.words[aux + 32u + word * 4u] =
+          word == 0u ? 0x1230u + candidate : 0u;
+      memory.words[aux + 48u + word * 4u] = 0u;
+    }
+    memory.words[aux + 48u] = 0x8000u + candidate * 0x1000u;
+    memory.words[aux + 52u] = 16u << 16u;
+    memory.words[aux + 56u] = 4u;
+    memory.words[aux + 60u] =
+        Libs::Graphics::DstSel(7, 6, 5, 4) |
+        (static_cast<uint32_t>(candidate == 0u
+                                   ? Prospero::BufferFormat::k32_32_32_32Float
+                                   : Prospero::BufferFormat::k8_8_8_8UNorm)
+         << 12u);
+  }
+  auto plan = ExtractResourcePlan(fixture.program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const SrtRuntime runtime{.read_memory = Memory::Read,
+                           .userdata = &memory,
+                           .read_specialization_memory = Memory::Read,
+                           .external_context_domains = domains};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 3u && snapshot.samplers.size() == 3u &&
+            specialization.dynamic_buffer_formats.size() == 1u,
+        "tracker-generated external sources did not materialize complete "
+        "resource contexts");
+  const auto &formats = specialization.dynamic_buffer_formats[0];
+  const auto float_format =
+      static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float);
+  const auto unorm_format =
+      static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm);
+  std::fprintf(
+      stderr,
+      "external formats: memory=%u expected_memory=%u expected=[%u,%u] actual=",
+      formats.memory_index, buffer_flags.index,
+      std::min(float_format, unorm_format),
+      std::max(float_format, unorm_format));
+  for (const auto format : formats.formats)
+    std::fprintf(stderr, " %u", format);
+  std::fprintf(stderr, "\n");
+  Check(formats.memory_index == buffer_flags.index &&
+            formats.formats ==
+                std::vector<uint32_t>{std::min(float_format, unorm_format),
+                                      std::max(float_format, unorm_format)},
+        "finite dynamic buffer formats lost a distinct context or duplicated "
+        "repeated records");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  ShaderComputeInputInfo input{};
+  CollectShaderInfo(fixture.program, {.compute = &input});
+  AllocateBindings(fixture.program);
+  DescriptorBindingLimits limits;
+  limits.sampled_images = 2u;
+  std::string failure;
+  Check(!ValidateDescriptorBindingLimits(fixture.program, limits, failure) &&
+            failure.find("sampled") != std::string::npos,
+        "actual allocated context image descriptors bypassed physical binding "
+        "limits");
+}
+
+void TestCanonicalDescriptorLimitsCountMipsAndHelpers() {
+  Fixture fixture;
+  auto &program = fixture.program;
+  program.resource_tracking_complete = true;
+  program.srt_plan_complete = true;
+  program.shader_info_complete = true;
+  program.info.uses_dma = true;
+  program.info.uses_external_call_fault = true;
+  ImageResource image;
+  image.resource_class = ImageResourceClass::Storage;
+  image.numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float;
+  image.dimension = Decoder::ImageDimension::Dim2D;
+  image.mip_mode = ImageMipMode::Dynamic;
+  image.mip_count = 3u;
+  program.info.images = {image, image};
+  program.info.images[1].binding_alias = 0u;
+  program.info.samplers.resize(2u);
+  program.info.samplers[1].binding_alias = 0u;
+  AllocateBindings(program);
+  const auto kind = DescriptorBindingForImage(image);
+  const auto *images = kind ? FindBinding(program.bindings, *kind) : nullptr;
+  const auto *samplers =
+      FindBinding(program.bindings, DescriptorBindingKind::Samplers);
+  Check(
+      images != nullptr &&
+          images->resources == std::vector<uint32_t>{0u, 0u, 0u} &&
+          samplers != nullptr &&
+          samplers->resources == std::vector<uint32_t>{0u},
+      "canonical aliases duplicated dynamic mip views or sampler descriptors");
+  DescriptorBindingLimits limits{.storage_images = 3u,
+                                 .samplers = 1u,
+                                 .storage_buffers = 3u,
+                                 .total_resources = 6u};
+  std::string failure;
+  Check(ValidateDescriptorBindingLimits(program, limits, failure),
+        "samplers were counted in total resources or helper buffers were "
+        "counted incorrectly");
+  auto rejected = limits;
+  rejected.samplers = 0u;
+  Check(!ValidateDescriptorBindingLimits(program, rejected, failure) &&
+            failure.find("sampler descriptor") != std::string::npos,
+        "sampler own per-stage limit was bypassed by its exclusion from total "
+        "resources");
+  rejected = limits;
+  rejected.storage_buffers = 2u;
+  Check(!ValidateDescriptorBindingLimits(program, rejected, failure) &&
+            failure.find("storage-buffer") != std::string::npos,
+        "BDA and dedicated call-fault helper buffers bypassed per-stage "
+        "descriptor limits");
+  rejected = limits;
+  rejected.storage_images = 2u;
+  Check(
+      !ValidateDescriptorBindingLimits(program, rejected, failure) &&
+          failure.find("storage-image") != std::string::npos,
+      "dynamic mip views were counted as a single canonical image descriptor");
+  rejected = limits;
+  rejected.total_resources = 5u;
+  Check(!ValidateDescriptorBindingLimits(program, rejected, failure) &&
+            failure.find("total-resource") != std::string::npos,
+        "actual canonical images and helper buffers bypassed the "
+        "total-resource limit");
+}
+
 } // namespace
 
 int main() {
@@ -3579,6 +3920,7 @@ int main() {
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
+    Run("workgroup scalar V# image bounds", TestWorkgroupScalarBufferImageBounds);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("writable descriptor phi", TestWritableDescriptorPhi);
@@ -3599,6 +3941,11 @@ int main() {
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("image binding ABI", TestImageBindingAbi);
     Run("graphics push constants", TestGraphicsPushConstantLayout);
+    Run("external context resource provenance",
+        TestExternalContextResourceProvenance);
+    Run("deep scalar planning cycle", TestDeepScalarPlanningCycleRejected);
+    Run("canonical descriptor limits",
+        TestCanonicalDescriptorLimitsCountMipsAndHelpers);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
   } catch (const std::exception &exception) {

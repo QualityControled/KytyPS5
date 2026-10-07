@@ -36,6 +36,79 @@ bool HasFlag(const IR::MemoryInfo& mem, uint32_t flag) {
 	return (mem.image_sample_flags & flag) != 0u;
 }
 
+uint32_t LoadContextSampler(ValueEmitContext& ctx, const IR::Inst& inst,
+                            const IR::MemoryInfo& mem) {
+	auto&       state   = ctx.state;
+	const auto& sampler = state.program.info.samplers.at(mem.sampler);
+	if (sampler.indirect_root != mem.sampler) return LoadSamplerDescriptor(state, mem.sampler);
+	const auto* handle = inst.NumArgs() > 1u ? inst.Arg(1).ResolveInstruction() : nullptr;
+	if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetSamplerResource ||
+	    handle->NumArgs() == 0u || sampler.indirect_resources.empty() ||
+	    state.flattened_srt_variable == 0u || sampler.indirect_search_iterations == 0u)
+		ctx.Fail(inst, "has no indirect sampler context mapping");
+	const auto selected_raw =
+	    EmitIndirectResourceIndex(state, ctx.Arg(*handle, 0), sampler.indirect_mapping_offset,
+		                          sampler.indirect_search_iterations, UINT32_MAX);
+	const auto invalid =
+	    Binary(state, spv::OpIEqual, TypeBool(state), selected_raw, ConstantU32(state, UINT32_MAX));
+	const auto* source = sampler.source < state.program.descriptor_sources.size()
+	                         ? &state.program.descriptor_sources[sampler.source]
+	                         : nullptr;
+	if (source == nullptr || !source->indirect_descriptor ||
+	    !source->indirect_descriptor->external_context)
+		ctx.Fail(inst, "has invalid indirect sampler context provenance");
+	EmitExternalResourceFault(
+	    ctx, invalid, ctx.Arg(*handle, 0),
+	    ConstantU32(state, source->indirect_descriptor->external_context->domain_id));
+	const auto selected = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, invalid,
+	                          ConstantU32(state, 0u), selected_raw);
+	auto slot = ConstantU32(state, ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers,
+	                                                     sampler.indirect_resources[0]));
+	for (uint32_t ordinal = 1; ordinal < sampler.indirect_resources.size(); ++ordinal) {
+		const auto matches =
+		    Binary(state, spv::OpIEqual, TypeBool(state), selected, ConstantU32(state, ordinal));
+		const auto next = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpSelect, TypeU32(state), next, matches,
+		    ConstantU32(state, ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers,
+			                                         sampler.indirect_resources[ordinal])),
+		    slot);
+		slot = next;
+	}
+	const auto sampler_type = state.builder.Type(spv::OpTypeSampler);
+	const auto pointer_type =
+	    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, sampler_type);
+	const auto pointer = DescriptorElementPointer(state, pointer_type, state.sampler_variable, slot,
+	                                              IR::DescriptorBindingKind::Samplers, mem.sampler,
+	                                              "sampler descriptor array was not emitted");
+	const auto result  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, sampler_type, result, pointer);
+	state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+	state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+	DecorateNonUniform(state, slot);
+	DecorateNonUniform(state, pointer);
+	DecorateNonUniform(state, result);
+	return result;
+}
+
+uint32_t MakeContextSampledImage(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                 uint32_t resource, uint32_t sampler_id, uint32_t mip = 0u,
+                                 uint32_t array_index = 0u) {
+	auto&      state   = ctx.state;
+	const auto sampled = MakeSampledImage(state, resource, sampler_id, mip, array_index);
+	if (array_index == 0u && mem.sampler < state.program.info.samplers.size() &&
+	    state.program.info.samplers[mem.sampler].indirect_root == mem.sampler) {
+		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+		// MakeSampledImage already decorates dynamic image selection. A constant
+		// image candidate still requires this decoration for a dynamic sampler.
+		DecorateNonUniform(state, sampled);
+	}
+	return sampled;
+}
+
 uint32_t AddressU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                     uint32_t component) {
 	const auto layout = Decoder::ImageAddressComponentLayout(mem.image_sample_flags, component);
@@ -300,7 +373,7 @@ uint32_t LoadSelectedImageDescriptor(EmitterState& state, uint32_t resource, uin
 		                                        IR::ImageResourceClass::Storage
 		                                    ? spv::CapabilityStorageImageArrayNonUniformIndexing
 											: spv::CapabilitySampledImageArrayNonUniformIndexing);
-		state.builder.AddAnnotation(spv::OpDecorate, image, spv::DecorationNonUniform);
+		DecorateNonUniform(state, image);
 	}
 	return image;
 }
@@ -526,7 +599,8 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 }
 
 uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                                    uint32_t coord, Prospero::TextureNumericClass numeric_class) {
+                                    uint32_t coord, Prospero::TextureNumericClass numeric_class,
+                                    uint32_t sampler_id) {
 	auto& state = ctx.state;
 	state.builder.RequireCapability(spv::CapabilityImageQuery);
 	const auto image = LoadImageDescriptor(state, mem.resource);
@@ -542,8 +616,7 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 	                                 Binary(state, spv::OpFMul, TypeF32(state), coord, width_f32),
 	                                 ConstantF32(state, 0x3f000000u)));
 
-	const auto sampled = MakeSampledImage(state, mem.resource,
-	                                     LoadSamplerDescriptor(state, mem.sampler));
+	const auto sampled     = MakeContextSampledImage(ctx, mem, mem.resource, sampler_id);
 	const auto vector_type = ImageVectorType(state, numeric_class, 4);
 	const auto scalar_type = ImageScalarType(state, numeric_class);
 	const auto component = ImageGatherSource(state, mem);
@@ -656,15 +729,28 @@ auto EmitImageCandidateRuns(ValueEmitContext& ctx, const IR::Inst& inst, const I
 			return 0u;
 	}
 	const auto key = ctx.Def(handle->Arg(0));
-	if (state.flattened_srt_variable == 0 || image.indirect_resources.size() < 2u) {
+	if (state.flattened_srt_variable == 0 || image.indirect_resources.empty() ||
+	    (image.indirect_resources.size() < 2u && !source->indirect_descriptor->external_context)) {
 		ctx.Fail(inst, "has no indirect image runtime mapping");
 		if constexpr (std::is_void_v<Result>)
 			return;
 		else
 			return 0u;
 	}
-	const auto selected = EmitIndirectResourceIndex(state, key, image.indirect_mapping_offset,
-	                                                image.indirect_search_iterations, 0u);
+	auto selected = EmitIndirectResourceIndex(
+	    state, key, image.indirect_mapping_offset, image.indirect_search_iterations,
+	    source->indirect_descriptor->external_context ? UINT32_MAX : 0u);
+	if (source->indirect_descriptor->external_context) {
+		const auto invalid =
+		    Binary(state, spv::OpIEqual, TypeBool(state), selected, ConstantU32(state, UINT32_MAX));
+		EmitExternalResourceFault(
+		    ctx, invalid, key,
+		    ConstantU32(state, source->indirect_descriptor->external_context->domain_id));
+		const auto safe = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), safe, invalid,
+		                          ConstantU32(state, 0u), selected);
+		selected = safe;
+	}
 	struct ImageRun {
 		uint32_t first;
 		uint32_t count;
@@ -758,8 +844,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::ImageQueryLod) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
 		const auto dimension = image.dimension;
-		const auto sampled = MakeSampledImage(state, mem.resource,
-		                                     LoadSamplerDescriptor(state, mem.sampler));
+		const auto sampled =
+		    MakeContextSampledImage(ctx, mem, mem.resource, LoadContextSampler(ctx, inst, mem));
 		const auto lod       = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    spv::OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
@@ -886,7 +972,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					ctx.Fail(inst, "has an unsupported 1D gather variant");
 					return;
 				}
-				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, coord, numeric_class);
+				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, coord, numeric_class,
+				                                               LoadContextSampler(ctx, inst, mem));
 				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
 				                              numeric_class, false, mem, true));
 				return;
@@ -915,9 +1002,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				operand_mask = spv::ImageOperandsOffsetMask;
 				offset = PackedOffset(ctx, mem, *address, layout, dimension);
 			}
-			const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
+			const auto sampler_id = LoadContextSampler(ctx, inst, mem);
 			const auto EmitGather = [&](uint32_t mip) {
-				const auto sampled = MakeSampledImage(state, mem.resource, sampler_id, mip);
+				const auto sampled =
+				    MakeContextSampledImage(ctx, mem, mem.resource, sampler_id, mip);
 				const auto sample = state.builder.AllocateId();
 				std::vector<uint32_t> words {
 				    static_cast<uint32_t>(dref ? spv::OpImageDrefGather : spv::OpImageGather), result_type,
@@ -977,14 +1065,15 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operand_mask |= spv::ImageOperandsBiasMask;
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
-		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
+		const auto sampler_id = LoadContextSampler(ctx, inst, mem);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index = 0u) {
 			const auto& candidate = state.program.info.images[resource];
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
-			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index);
+			const auto sampled =
+			    MakeContextSampledImage(ctx, mem, resource, sampler_id, 0u, array_index);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};
 			if (dref) {

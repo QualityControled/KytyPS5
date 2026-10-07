@@ -22,6 +22,22 @@ namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
+bool ExternalContextWord(const ResourcePlan& program, const Inst& inst,
+                         ExternalCallContextBinding& binding, uint32_t& word) {
+	if (inst.GetOpcode() != ValueOpcode::ExternalCallContextWord || inst.NumArgs() != 5u ||
+	    inst.Arg(0).GetType() != Type::U32 || inst.Arg(2).GetType() != Type::U32)
+		return false;
+	for (const auto index: {1u, 3u, 4u}) {
+		const auto value = inst.Arg(index).Resolve();
+		if (!value.IsImmediate() || value.GetType() != Type::U32) return false;
+	}
+	binding = {inst.Arg(1).Resolve().U32(), inst.Arg(4).Resolve().U32()};
+	word    = inst.Arg(3).Resolve().U32();
+	return (word == 2u || word == 3u) &&
+	       std::ranges::find(program.external_context_bindings, binding) !=
+	           program.external_context_bindings.end();
+}
+
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
 		return false;
@@ -55,7 +71,9 @@ bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 	const auto& memory = values.memory_info[index];
 	if (op != ValueOpcode::LoadBufferU32) {
 		return (op == ValueOpcode::LoadAddressU32 && memory.kind == ResourceKind::ScalarAddress) ||
-		       (op == ValueOpcode::ReadConstBuffer && memory.kind == ResourceKind::ScalarBuffer);
+		       (op == ValueOpcode::ReadConstBuffer &&
+		        (memory.kind == ResourceKind::ScalarBuffer ||
+		         memory.kind == ResourceKind::IndirectBuffer));
 	}
 	if (inst.NumArgs() != 5u || memory.kind != ResourceKind::Buffer || memory.typed ||
 	    memory.formatted || memory.coherent || memory.data_bits != 32u ||
@@ -143,8 +161,9 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 
 class RuntimeValidator {
 public:
-	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type)
-	    : m_program(program), m_type(type) {}
+	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type,
+	                          std::optional<ExternalCallContextBinding> external_context)
+	    : m_program(program), m_type(type), m_external_context(external_context) {}
 
 	bool Run(Value value) { return Validate(value); }
 
@@ -188,6 +207,15 @@ private:
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::ExternalCallContextWord) {
+			ExternalCallContextBinding binding;
+			uint32_t                   word = 0;
+			// The selected record remains a GPU value. Only an explicitly enumerated native
+			// record may replace this leaf during host descriptor evaluation.
+			return finish(m_external_context &&
+			              ExternalContextWord(m_program, *inst, binding, word) &&
+			              binding == *m_external_context);
+		}
 		if (op == ValueOpcode::ReadConst) {
 			const auto slot = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (inst->NumArgs() != 2 || inst->Arg(0).Resolve().TryInstruction() == nullptr ||
@@ -315,6 +343,7 @@ private:
 
 	const ResourcePlan&             m_program;
 	RuntimeValueType                m_type;
+	std::optional<ExternalCallContextBinding> m_external_context;
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
@@ -325,10 +354,26 @@ private:
 
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
-                     Value active_mask)
+                     Value active_mask, std::optional<SrtExternalContext> external_context)
     : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
-      m_context(AcquireContext(program)) {}
+      m_external_context(external_context), m_context(AcquireContext(program)) {
+	if (!m_external_context) return;
+	const ExternalCallContextDomain* domain = nullptr;
+	for (const auto& candidate: runtime.external_context_domains) {
+		if (candidate.domain_id != m_external_context->domain_id) continue;
+		if (domain != nullptr) {
+			m_external_context.reset();
+			return;
+		}
+		domain = &candidate;
+	}
+	if (domain == nullptr || !domain->complete || m_external_context->record == nullptr ||
+	    !std::ranges::any_of(domain->records, [&](const auto& record) {
+		    return &record == m_external_context->record;
+	    }))
+		m_external_context.reset();
+}
 
 SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
 
@@ -541,6 +586,16 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
 	};
 	switch (inst.GetOpcode()) {
+		case ValueOpcode::ExternalCallContextWord: {
+			ExternalCallContextBinding binding;
+			uint32_t                   word = 0;
+			if (!m_external_context || !ExternalContextWord(m_program, inst, binding, word) ||
+			    binding.domain_id != m_external_context->domain_id ||
+			    binding.function_id != m_external_context->record->function_id)
+				return false;
+			result = m_external_context->record->words[word];
+			return true;
+		}
 		case ValueOpcode::GetUserData: {
 			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
 			if (reg < m_program.user_data_base ||
@@ -557,9 +612,10 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return EvaluateWide(inst.Arg(0), result);
 			}
 			const auto clean_runtime = CleanRuntime(m_runtime);
-			SrtWalker  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1));
-			SrtWalker  active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
-			                  inst.Arg(1));
+			SrtWalker  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1),
+			                        m_external_context);
+			SrtWalker  active(m_program, m_runtime, m_clean_flat_slots, &clean_active, inst.Arg(1),
+			                  m_external_context);
 			return active.EvaluateWide(inst.Arg(0), result);
 		}
 		case ValueOpcode::BitCastU32F32:
@@ -982,9 +1038,9 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	return true;
 }
 
-bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
-	return RuntimeValidator(program, type).Run(value);
+bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,
+                          std::optional<ExternalCallContextBinding> external_context) {
+	return RuntimeValidator(program, type, external_context).Run(value);
 }
-
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

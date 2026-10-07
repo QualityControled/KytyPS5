@@ -686,7 +686,60 @@ void PruneUnreachableBlocks(Graph& graph) {
 	RebuildPredecessors(graph);
 }
 
+void ComputeExternalDominators(Graph& graph) {
+	// Use the immediate-dominator fixed point in reverse postorder. A linked
+	// library has many independent leaf paths; allocating an all-block set for
+	// every node would otherwise make the initial analysis quadratic in memory.
+	const auto count=static_cast<uint32_t>(graph.blocks.size());
+	std::vector<uint8_t> visited(count);
+	std::vector<uint32_t> postorder;
+	std::vector<std::pair<uint32_t,size_t>> stack;
+	stack.emplace_back(graph.entry_block,0u); visited.at(graph.entry_block)=1;
+	while (!stack.empty()) {
+		auto& [block,next]=stack.back();
+		if (next<graph.blocks[block].successors.size()) {
+			const auto successor=graph.blocks[block].successors[next++];
+			if (!visited.at(successor)) {visited[successor]=1; stack.emplace_back(successor,0u);}
+		} else {postorder.push_back(block); stack.pop_back();}
+	}
+	std::ranges::reverse(postorder);
+	std::vector<uint32_t> rank(count,UINT32_MAX),idom(count,UINT32_MAX);
+	for (uint32_t i=0;i<postorder.size();++i) rank[postorder[i]]=i;
+	idom[graph.entry_block]=graph.entry_block;
+	const auto intersect=[&](uint32_t a,uint32_t b) {
+		while (a!=b) {
+			while (rank[a]>rank[b]) a=idom[a];
+			while (rank[b]>rank[a]) b=idom[b];
+		}
+		return a;
+	};
+	bool changed=true;
+	while (changed) {
+		changed=false;
+		for (const auto block:postorder) {
+			if (block==graph.entry_block) continue;
+			uint32_t parent=UINT32_MAX;
+			for (const auto predecessor:graph.blocks[block].predecessors) {
+				if (idom[predecessor]==UINT32_MAX) continue;
+				parent=parent==UINT32_MAX ? predecessor:intersect(parent,predecessor);
+			}
+			if (idom[block]!=parent) {idom[block]=parent;changed=true;}
+		}
+	}
+	for (auto& block:graph.blocks) {
+		block.dominators.clear();
+		uint32_t current=block.id;
+		for (;;) {
+			block.dominators.push_back(current);
+			if (idom[current]==UINT32_MAX || idom[current]==current) break;
+			current=idom[current];
+		}
+		SortUnique(block.dominators);
+	}
+}
+
 void ComputeDominators(Graph& graph) {
+	if (graph.external_library) { ComputeExternalDominators(graph); return; }
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
 	const auto all   = AllBlockIds(count);
 
@@ -1445,8 +1498,9 @@ private:
 
 } // namespace
 
-Graph BuildGraph(const Decoder::Program& program) {
+Graph BuildGraph(const Decoder::Program& program, std::span<const ExternalTransfer> external_transfers) {
 	Graph graph;
+	graph.external_library = !external_transfers.empty();
 	if (program.instructions.empty()) {
 		ExitBuildFailure(graph, FailureKind::InvalidLabel, UINT32_MAX,
 		                 "cannot build CFG for empty shader");
@@ -1471,10 +1525,33 @@ Graph BuildGraph(const Decoder::Program& program) {
 	labels.insert(end_pc);
 
 	std::map<uint32_t, SetpcTargetInfo> setpc_targets;
+	std::map<uint32_t, const ExternalTransfer*> external_by_pc;
+	for (const auto& transfer: external_transfers) {
+		if (!external_by_pc.emplace(transfer.pc, &transfer).second ||
+		    transfer.target_pcs.empty() || transfer.target_pcs.size() != transfer.guest_addresses.size())
+			ExitBuildFailure(graph, FailureKind::InvalidInput, UINT32_MAX, "invalid external transfer metadata");
+	}
 	for (uint32_t i = 0; i < program.instructions.size(); i++) {
 		const auto& inst    = program.instructions[i];
 		const auto  next_pc = InstructionEndPc(inst);
-		if (Decoder::IsDirectBranch(inst.opcode)) {
+		if (const auto external = external_by_pc.find(inst.pc); external != external_by_pc.end()) {
+			if ((external->second->call && inst.opcode != Opcode::S_SWAPPC_B64) ||
+			    (!external->second->call && inst.opcode != Opcode::S_SETPC_B64) ||
+			    inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg > 104u ||
+			    external->second->target_sgpr != inst.src0.reg ||
+			    (external->second->call && (inst.dst.kind != Decoder::OperandKind::Sgpr ||
+			     external->second->return_sgpr != inst.dst.reg || inst.dst.reg > 104u)))
+				ExitBuildFailure(graph, FailureKind::InvalidInput, UINT32_MAX, "external transfer instruction mismatch");
+			for (const auto target: external->second->target_pcs) {
+				if (!instruction_pcs.contains(target))
+					ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX, "invalid external transfer target");
+				labels.insert(target);
+			}
+			if (instruction_pcs.contains(next_pc) || next_pc == end_pc) labels.insert(next_pc);
+		} else if (inst.opcode == Opcode::S_SWAPPC_B64) {
+			ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+			                 fmt::format("S_SWAPPC_B64 at pc 0x{:08x} has no complete external library", inst.pc));
+		} else if (Decoder::IsDirectBranch(inst.opcode)) {
 			if (!IsValidTarget(inst.branch_target, instruction_pcs, first_pc, end_pc)) {
 				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
@@ -1508,7 +1585,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 				labels.insert(next_pc);
 			}
 		} else if (inst.opcode == Opcode::S_ENDPGM) {
-			labels.insert(next_pc);
+			if (instruction_pcs.contains(next_pc) || next_pc == end_pc) labels.insert(next_pc);
 		}
 	}
 
@@ -1555,7 +1632,20 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 		const auto& last    = program.instructions[block.inst_end - 1u];
 		const auto  next_pc = InstructionEndPc(last);
-		if (last.opcode == Opcode::S_ENDPGM) {
+		if (const auto external = external_by_pc.find(last.pc); external != external_by_pc.end()) {
+			const auto& transfer = *external->second;
+			auto& term = block.terminator;
+			term.kind = TerminatorKind::IndirectBranch;
+			term.indirect_pc_sgpr = transfer.target_sgpr;
+			term.external_transfer = true;
+			term.external_call = transfer.call;
+			term.external_guest_pc = transfer.guest_pc;
+			term.external_link_address = transfer.link_address;
+			term.external_return_sgpr = transfer.return_sgpr;
+			term.indirect_guest_addresses = transfer.guest_addresses;
+			term.indirect_target_pcs = transfer.target_pcs;
+			for (const auto target: transfer.target_pcs) term.indirect_targets.push_back(pc_to_block.at(target));
+		} else if (last.opcode == Opcode::S_ENDPGM) {
 			block.terminator.kind = TerminatorKind::Return;
 		} else if (last.opcode == Opcode::S_SETPC_B64) {
 			const auto& target_info = setpc_targets.at(last.pc);

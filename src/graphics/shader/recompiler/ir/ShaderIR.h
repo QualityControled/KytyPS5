@@ -71,15 +71,17 @@ struct MemoryInfo {
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+	// Finite-context source used to specialize dynamic BDA formats without
+	// turning each descriptor into a bound-buffer slot.
+	uint32_t dynamic_descriptor_source = UINT32_MAX;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		return !typed && data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32
-		                  : opcode == ValueOpcode::ReadConstBuffer ||
-		                        opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		       ((!formatted && opcode == ValueOpcode::ReadConstBuffer) ||
+		        opcode == ValueOpcode::LoadBufferU32 ||
+		        opcode == ValueOpcode::LoadBufferU32x2 ||
+		        opcode == ValueOpcode::LoadBufferU32x3 ||
+		        opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -150,11 +152,13 @@ struct ImageResource {
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
 	std::vector<uint32_t>         indirect_resources;
+	uint32_t binding_alias = UINT32_MAX;
 
 	bool operator==(const ImageResource& other) const = default;
 };
 
 struct SamplerResource {
+	static constexpr uint32_t NoIndirectSampler = UINT32_MAX;
 	uint32_t source                = 0;
 	uint32_t first_use_pc          = 0;
 	// Native filtering/border variants share the original sampler's runtime descriptor.
@@ -163,6 +167,11 @@ struct SamplerResource {
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
 	bool     gather_lod            = false;
+	uint32_t indirect_root = NoIndirectSampler;
+	uint32_t indirect_mapping_offset = 0;
+	uint32_t indirect_search_iterations = 0;
+	std::vector<uint32_t> indirect_resources;
+	uint32_t binding_alias = UINT32_MAX;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -303,11 +312,12 @@ enum class DescriptorBindingKind : uint32_t {
 	FlattenedSrt,
 	ShaderData,
 	SharedMemory,
+	ShaderCallFaultBuffer,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 57u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -470,6 +480,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	bool                             uses_external_call_fault = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -483,8 +494,20 @@ struct BlockInfo {
 	Value           indirect_target;
 };
 
+struct ExternalCallContextBinding {
+	uint32_t domain_id = 0;
+	uint32_t function_id = 0;
+	bool operator==(const ExternalCallContextBinding&) const = default;
+};
+
 struct DescriptorSource {
 	struct IndirectDescriptor {
+		struct ExternalContext {
+			uint32_t domain_id = 0;
+			uint32_t function_id = 0;
+			uint32_t expression_source = UINT32_MAX;
+			bool operator==(const ExternalContext&) const = default;
+		};
 		struct SelectorRead {
 			uint32_t source = UINT32_MAX;
 			uint32_t stride = 0;
@@ -493,6 +516,7 @@ struct DescriptorSource {
 			bool operator==(const SelectorRead& other) const = default;
 		};
 		std::optional<SelectorRead> selector;
+		std::optional<ExternalContext> external_context;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;
 		uint32_t table_immediate = 0;
@@ -577,6 +601,7 @@ struct ResourcePlan {
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
+	std::vector<ExternalCallContextBinding> external_context_bindings;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
@@ -594,6 +619,12 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+};
+
+struct DynamicBufferFormatSet {
+	uint32_t memory_index = 0;
+	std::vector<uint32_t> formats;
+	bool operator==(const DynamicBufferFormatSet&) const = default;
 };
 
 struct Program: ResourcePlan {
@@ -619,6 +650,7 @@ struct Program: ResourcePlan {
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
+	std::vector<DynamicBufferFormatSet> dynamic_buffer_formats;
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;

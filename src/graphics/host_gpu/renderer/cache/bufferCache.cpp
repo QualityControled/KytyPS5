@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/shaderCallFaultManager.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -644,6 +645,17 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+Buffer* BufferCache::GetShaderCallFaultBuffer() {
+	if (!m_shader_call_fault_manager) {
+		m_shader_call_fault_manager = std::make_unique<ShaderCallFaultManager>(m_graphics, m_scheduler);
+	}
+	return m_shader_call_fault_manager->GetBuffer();
+}
+
+void BufferCache::ProcessShaderCallFaultBuffer() {
+	if (m_shader_call_fault_manager) m_shader_call_fault_manager->Process();
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

@@ -15,7 +15,9 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderCallDiagnostics.h"
+#include "graphics/shader/recompiler/ExternalLibrary.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -25,11 +27,14 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -157,21 +162,21 @@ bool WriteCallCaptureFile(const std::filesystem::path& path, const void* data, s
 	return static_cast<bool>(file);
 }
 
-void DumpShaderCallInputs(const char* stage_name,
+bool DumpShaderCallInputs(const char* stage_name,
                           const ShaderRecompiler::CompileOptions& options,
                           std::span<const uint32_t> code) {
 	// Other stages can have fused/front-only code spans with different decoding rules.
-	if (!Config::GraphicsDebugDumpEnabled() || options.stage != ShaderType::Compute) return;
+	if (!Config::GraphicsDebugDumpEnabled() || options.stage != ShaderType::Compute) return false;
 	const auto could_call = [](uint32_t word) {
 		return ((word >> 23u) & 0x1ffu) == 0x17du && ((word >> 8u) & 0xffu) == 0x21u &&
 		       ((word >> 16u) & 0x7fu) != 125u;
 	};
-	if (!std::ranges::any_of(code, could_call)) return;
+	if (!std::ranges::any_of(code, could_call)) return false;
 	ShaderRecompiler::Decoder::Program decoded;
 	ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
 	const auto capture = ShaderRecompiler::Diagnostics::CaptureCallTables(
 	    true, decoded, options.user_data, ReadShaderGuestMemory, nullptr, options.user_data_base);
-	if (capture.tables.empty()) return;
+	if (capture.tables.empty()) return false;
 
 	static std::atomic_uint64_t id = 0;
 	std::filesystem::path folder;
@@ -182,12 +187,12 @@ void DumpShaderCallInputs(const char* stage_name,
 	} while (std::filesystem::exists(folder, error) && !error);
 	if (error) {
 		PipelineCacheLog("External-call diagnostic directory query failed: {}", error.message());
-		return;
+		return false;
 	}
 	std::filesystem::create_directories(folder, error);
 	if (error) {
 		PipelineCacheLog("External-call diagnostic directory creation failed: {}", error.message());
-		return;
+		return false;
 	}
 	std::string manifest = fmt::format(
 	    "External shader-call diagnostic capture\n"
@@ -217,6 +222,31 @@ void DumpShaderCallInputs(const char* stage_name,
 	    capture.table_budget_exhausted, capture.target_limit_reached, capture.target_budget_exhausted,
 	    capture.zero_targets,
 	    capture.misaligned_targets, capture.outside_address_space_targets, capture.duplicate_targets);
+	manifest += fmt::format("caller_base=0x{:016x} wave_size={} user_data_base={} user_data_count={}\n",
+	                        reinterpret_cast<uint64_t>(code.data()), options.wave_size,
+	                        options.user_data_base, options.user_data.size());
+	if (const auto* compute = options.input_info.compute; compute != nullptr) {
+		manifest += fmt::format(
+		    "threads_num={},{},{} host_subgroup_size={} lds_size_dwords={} scratch_size_dwords={}\n",
+		    compute->threads_num[0], compute->threads_num[1], compute->threads_num[2],
+		    compute->host_subgroup_size, compute->lds_size_dwords, compute->scratch_size_dwords);
+		manifest += fmt::format(
+		    "dispatch_threads_num={},{},{} workgroup_counts={},{},{} group_id={},{},{} "
+		    "thread_ids_num={} workgroup_register={} tg_size_en={} "
+		    "dispatch_thread_dimensions={} lds_storage={} float_mode=0x{:02x}\n",
+		    compute->dispatch_threads_num[0], compute->dispatch_threads_num[1],
+		    compute->dispatch_threads_num[2], compute->workgroup_counts[0],
+		    compute->workgroup_counts[1], compute->workgroup_counts[2],
+		    compute->group_id[0], compute->group_id[1], compute->group_id[2],
+		    compute->thread_ids_num, compute->workgroup_register, compute->tg_size_en,
+		    compute->dispatch_thread_dimensions, compute->lds_storage, compute->float_mode);
+	}
+	for (size_t word = 0; word < options.user_data.size(); ++word)
+		manifest += fmt::format("user_sgpr[{}]=0x{:08x}\n", options.user_data_base + word,
+		                        options.user_data[word]);
+	manifest += "\n";
+	bool files_written = WriteCallCaptureFile(folder / "caller.bin", code.data(), code.size_bytes());
+	manifest += fmt::format("caller_file=caller.bin caller_file_written={}\n", files_written);
 	for (size_t i = 0; i < capture.tables.size(); ++i) {
 		const auto& table = capture.tables[i];
 		const auto& trace = table.trace;
@@ -226,6 +256,7 @@ void DumpShaderCallInputs(const char* stage_name,
 			if (!WriteCallCaptureFile(folder / table_file, table.words.data(),
 			                          table.words.size() * sizeof(uint32_t))) {
 				table_file += " (write failed)";
+				files_written = false;
 			}
 		}
 		manifest += fmt::format(
@@ -255,6 +286,7 @@ void DumpShaderCallInputs(const char* stage_name,
 			if (!WriteCallCaptureFile(folder / target_file, target.words.data(),
 			                          target.words.size() * sizeof(uint32_t))) {
 				target_file += " (write failed)";
+				files_written = false;
 			}
 		}
 		manifest += fmt::format(
@@ -268,15 +300,16 @@ void DumpShaderCallInputs(const char* stage_name,
 	const auto path = folder / "manifest.txt";
 	if (!WriteCallCaptureFile(path, manifest.data(), manifest.size())) {
 		PipelineCacheLog("External-call diagnostic manifest write failed: {}", Common::PathToString(path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("External-call diagnostic capture (selected function unknown): {}",
 	                 Common::PathToString(path));
+	return files_written;
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv) {
-	if (!Config::ShaderValidationEnabled()) {
+                         const std::vector<uint32_t>& spirv, bool required = false) {
+	if (!required && !Config::ShaderValidationEnabled()) {
 		return true;
 	}
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
@@ -339,8 +372,18 @@ struct PipelineCache::ProgramCache {
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
 		std::vector<uint32_t> static_state;
+		std::shared_ptr<const ShaderRecompiler::ExternalLibraryPlan> external_library;
 
-		bool operator==(const ProgramKey&) const = default;
+		bool operator==(const ProgramKey& other) const {
+			if (stage != other.stage || hash != other.hash || user_data_count != other.user_data_count ||
+			    code_size != other.code_size || static_state != other.static_state) return false;
+			if (external_library == other.external_library) return true;
+			if (!external_library || !other.external_library) return false;
+			// The bucket hash is not an identity: all addresses and bytes must agree.
+			return external_library->caller_address == other.external_library->caller_address &&
+			       external_library->dependency_hash == other.external_library->dependency_hash &&
+			       external_library->dependencies == other.external_library->dependencies;
+		}
 	};
 
 	struct Permutation {
@@ -371,6 +414,10 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
+			if (key.external_library) {
+				PipelineKeyHash::Mix(hash, key.external_library->caller_address);
+				PipelineKeyHash::Mix(hash, key.external_library->dependency_hash);
+			}
 			// Bucket same-shape static variants by source. ProgramKey equality performs the one
 			// exact state comparison needed on a stable hit without hashing the full state first.
 			return hash;
@@ -379,22 +426,104 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
+	struct LibrarySnapshot {
+		uint64_t caller_hash;
+		std::shared_ptr<const ShaderRecompiler::ExternalLibraryPlan> plan;
+	};
+
+	std::shared_ptr<const ShaderRecompiler::ExternalLibraryPlan> LoadLibrary(
+	    const ShaderParams& params, std::span<const uint32_t> user_data) {
+		// Validate exact guarded dependencies even on a warm hit: library mappings may relocate
+		// or change independently of the unchanged caller shader hash.
+		for (auto& snapshot: libraries) {
+			if (snapshot.caller_hash != params.hash || snapshot.plan->caller_address != params.Base() ||
+			    !ShaderRecompiler::ExternalLibraryInputsMatch(*snapshot.plan, user_data)) continue;
+			if (ShaderRecompiler::ValidateExternalLibraryDependencies(
+			        *snapshot.plan, ReadShaderGuestMemory, nullptr)) return snapshot.plan;
+		}
+		ShaderRecompiler::Decoder::Program decoded;
+		ShaderRecompiler::Decoder::DecodeProgram(params.code, decoded);
+		auto loaded = ShaderRecompiler::LoadExternalLibrary(
+		    decoded, params.Base(), user_data, 0, ReadShaderGuestMemory, nullptr);
+		if (!loaded.has_calls) return {};
+		if (!loaded.plan.complete) {
+			EXIT("External shader library rejected hash=0x%016" PRIx64 ": %s\n",
+			     params.hash, loaded.failure.c_str());
+		}
+		auto plan = std::make_shared<const ShaderRecompiler::ExternalLibraryPlan>(std::move(loaded.plan));
+		libraries.push_back({params.hash, plan});
+		std::printf("External shader library loaded hash=0x%016" PRIx64
+		     " functions=%zu call_sites=%zu dependency_hash=0x%016" PRIx64 "\n",
+		     params.hash, plan->functions.size(), plan->call_sites.size(), plan->dependency_hash);
+		std::fflush(stdout);
+		return plan;
+	}
+
 	Permutation CompilePermutation(const char*                                  stage_name,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
+		const auto external_begin = std::chrono::steady_clock::now();
+		if (options.external_library != nullptr) {
+			std::printf("External shader phase begin hash=0x%016" PRIx64 " compile-and-emit\n",
+			            options.shader_hash);
+			std::fflush(stdout);
+		}
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+		if (options.external_library != nullptr) {
+			std::printf("External shader phase end hash=0x%016" PRIx64
+			            " compile-and-emit words=%zu id_bound=%u elapsed_ms=%" PRIu64 "\n",
+			            options.shader_hash, result.spirv.size(),
+			            result.spirv.size() > 3u ? result.spirv[3] : 0u,
+			            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+			                std::chrono::steady_clock::now() - external_begin).count()));
+			std::fflush(stdout);
+		}
+		const ShaderRecompiler::IR::DescriptorBindingLimits binding_limits {
+		    .sampled_images = limits.maxPerStageDescriptorSampledImages,
+		    .storage_images = limits.maxPerStageDescriptorStorageImages,
+		    .samplers = limits.maxPerStageDescriptorSamplers,
+		    .storage_buffers = limits.maxPerStageDescriptorStorageBuffers,
+		    .total_resources = limits.maxPerStageResources,
+		};
+		std::string binding_failure;
+		if (!ShaderRecompiler::IR::ValidateDescriptorBindingLimits(
+		        result.program, binding_limits, binding_failure)) {
+			EXIT("%s device descriptor limits exceeded hash=0x%016" PRIx64 ": %s\n",
+			     options.dump_label, options.shader_hash, binding_failure.c_str());
+		}
+		if (options.external_library != nullptr) {
+			std::printf("External shader phase begin hash=0x%016" PRIx64 " validate-module\n",
+			            options.shader_hash);
+			std::fflush(stdout);
+		}
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
+		                         options.external_library != nullptr)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
 		}
+		if (options.external_library != nullptr) {
+			std::printf("External shader phase end hash=0x%016" PRIx64 " validate-module\n",
+			            options.shader_hash);
+			std::fflush(stdout);
+		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
+		if (options.external_library != nullptr) {
+			std::printf("External shader phase begin hash=0x%016" PRIx64 " driver-module\n",
+			            options.shader_hash);
+			std::fflush(stdout);
+		}
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
+		if (options.external_library != nullptr) {
+			std::printf("External shader phase end hash=0x%016" PRIx64 " driver-module\n",
+			            options.shader_hash);
+			std::fflush(stdout);
+		}
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -425,11 +554,55 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		lookup_key.external_library.reset();
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			const bool could_call = std::ranges::any_of(params.code, [](uint32_t word) {
+				return ((word >> 23u) & 0x1ffu) == 0x17du && ((word >> 8u) & 0xffu) == 0x21u &&
+				       ((word >> 16u) & 0x7fu) != 125u;
+			});
+			const auto* capture_only = std::getenv("KYTY_CAPTURE_EXTERNAL_INPUTS_ONLY");
+			if (could_call && capture_only != nullptr && std::strcmp(capture_only, "1") == 0) {
+				ShaderRecompiler::Decoder::Program capture_decoded;
+				ShaderRecompiler::Decoder::DecodeProgram(params.code, capture_decoded);
+				const bool actual_call = std::ranges::any_of(capture_decoded.instructions,
+				    [](const auto& inst) {
+					    return inst.opcode == ShaderRecompiler::Decoder::Opcode::S_SWAPPC_B64;
+				    });
+				if (actual_call) {
+					// Diagnostic-only: collect actual dispatch inputs before strict library planning
+					// or warm shader lookup can return. No external shader is translated or executed.
+					ShaderStageInputInfo capture_input {};
+					capture_input.compute = &input_info;
+					ShaderRecompiler::CompileOptions capture_options;
+					capture_options.stage = stage;
+					capture_options.shader_hash = params.hash;
+					capture_options.user_data = user_data;
+					capture_options.wave_size = input_info.wave_size;
+					capture_options.input_info = capture_input;
+					const bool inputs_captured = DumpShaderCallInputs("cs", capture_options, params.code);
+					EXIT("External shader input capture-only mode: files_written=%d; stopped before "
+					     "external translation or GPU execution\n", inputs_captured);
+				}
+			}
+			if (could_call) lookup_key.external_library = LoadLibrary(params, user_data);
+		}
 		auto                                         entry = programs.find(lookup_key);
+		std::vector<ShaderRecompiler::IR::ExternalCallContextDomain> context_domains;
+		if (lookup_key.external_library) {
+			context_domains = ShaderRecompiler::ExternalContextDomains(*lookup_key.external_library);
+		}
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .external_context_domains    = context_domains,
+		    .descriptor_limits           = {
+		        .sampled_images = limits.maxPerStageDescriptorSampledImages,
+		        .storage_images = limits.maxPerStageDescriptorStorageImages,
+		        .samplers = limits.maxPerStageDescriptorSamplers,
+		        .storage_buffers = limits.maxPerStageDescriptorStorageBuffers,
+		        .total_resources = limits.maxPerStageResources,
+		    },
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
@@ -483,6 +656,7 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.external_library = lookup_key.external_library.get();
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -496,13 +670,38 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		DumpShaderCallInputs(stage_name, options, params.code);
+		if (options.external_library != nullptr) {
+			std::printf("External shader phase begin hash=0x%016" PRIx64 " translate\n",
+			            options.shader_hash);
+			std::fflush(stdout);
+		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		if (options.external_library != nullptr) {
+			std::printf("External shader phase end hash=0x%016" PRIx64 " translate blocks=%zu\n",
+			            options.shader_hash, translated.program.blocks.size());
+			std::fflush(stdout);
+		}
 		if (entry == programs.end()) {
+			if (options.external_library != nullptr) {
+				std::printf("External shader phase begin hash=0x%016" PRIx64 " material-resources\n",
+				            options.shader_hash);
+				std::fflush(stdout);
+			}
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
+			if (options.external_library != nullptr) {
+				const auto& resources = entry->second.resources;
+				std::printf("External shader phase end hash=0x%016" PRIx64
+				            " material-resources buffers=%zu images=%zu samplers=%zu candidates=%" PRIu64
+				            " read_bytes=%" PRIu64 "\n", options.shader_hash,
+				            resources.buffers.size(), resources.images.size(), resources.samplers.size(),
+				            resources.external_descriptor_candidate_count,
+				            resources.external_descriptor_read_bytes);
+				std::fflush(stdout);
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
@@ -526,7 +725,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	explicit ProgramCache(vk::Device device, const vk::PhysicalDeviceLimits& limits)
+	    : device(device), limits(limits) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -539,13 +739,16 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::vector<LibrarySnapshot>                                libraries;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	vk::PhysicalDeviceLimits                                    limits;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(
+          graphics.device, graphics.physical_device_properties.limits)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }

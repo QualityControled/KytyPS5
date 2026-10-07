@@ -14,6 +14,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -21,6 +22,41 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
+constexpr uint64_t MaxExternalDescriptorReadBytes  = 64u * 1024u * 1024u;
+constexpr uint64_t MaxExternalDescriptorCandidates = 1u << 20u;
+
+struct ExternalReadTrace {
+	SrtMemoryReader reader           = nullptr;
+	void*           userdata         = nullptr;
+	uint64_t*       total_requested  = nullptr;
+	uint64_t        failed_address   = 0;
+	size_t          failed_dwords    = 0;
+	bool            failed           = false;
+	bool            budget_exhausted = false;
+
+	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto&      trace = *static_cast<ExternalReadTrace*>(userdata);
+		const auto bytes = static_cast<uint64_t>(values.size()) * sizeof(uint32_t);
+		if (bytes > MaxExternalDescriptorReadBytes - *trace.total_requested) {
+			trace.budget_exhausted = true;
+		} else {
+			*trace.total_requested += bytes;
+			if (trace.reader != nullptr && trace.reader(trace.userdata, address, values))
+				return true;
+		}
+		trace.failed         = true;
+		trace.failed_address = address;
+		trace.failed_dwords  = values.size();
+		return false;
+	}
+};
+
+struct ExternalDescriptorCandidate {
+	uint32_t        key;
+	DescriptorValue descriptor;
+};
+
+using ExternalDescriptorCandidates = std::vector<std::vector<ExternalDescriptorCandidate>>;
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -245,15 +281,117 @@ bool IsBoundedDescriptorTable(const ResourcePlan& program,
 	       indirect.workgroup_axis == UINT32_MAX && table != nullptr && table->dword_count == 4u;
 }
 
+bool PrepareExternalDescriptors(const ResourcePlan& program, const SrtRuntime& runtime,
+                                ExternalDescriptorCandidates& candidates,
+                                ResourceSnapshot&             snapshot) {
+	candidates.resize(program.descriptor_sources.size());
+	snapshot.external_descriptor_candidate_count = 0u;
+	snapshot.external_descriptor_read_bytes      = 0u;
+	auto& total_requested                        = snapshot.external_descriptor_read_bytes;
+	std::vector<ExternalCallContextBinding> bindings;
+	for (const auto& source: program.descriptor_sources) {
+		if (!source.indirect_descriptor || !source.indirect_descriptor->external_context) continue;
+		const auto&                      context = *source.indirect_descriptor->external_context;
+		const ExternalCallContextBinding binding {context.domain_id, context.function_id};
+		if (context.expression_source >= program.descriptor_sources.size() ||
+		    std::ranges::find(program.external_context_bindings, binding) ==
+		        program.external_context_bindings.end())
+			return SpecializationFail("external descriptor has an invalid context binding");
+		if (std::ranges::find(bindings, binding) == bindings.end()) bindings.push_back(binding);
+	}
+	for (const auto& binding: bindings) {
+		const ExternalCallContextDomain* domain = nullptr;
+		for (const auto& candidate: runtime.external_context_domains) {
+			if (candidate.domain_id != binding.domain_id) continue;
+			if (domain != nullptr) return SpecializationFail("duplicate external context domain");
+			domain = &candidate;
+		}
+		if (domain == nullptr || !domain->complete || domain->records.empty() ||
+		    domain->records.size() > MaxIndirectDescriptorProbes)
+			return SpecializationFail(
+			    "external descriptor requires a complete bounded context domain");
+		std::unordered_set<uint32_t> keys;
+		for (const auto& record: domain->records) {
+			if (!keys.insert(record.ordinal).second)
+				return SpecializationFail("external context domain has duplicate record ordinals");
+		}
+		std::vector<uint32_t> expressions;
+		for (const auto& source: program.descriptor_sources) {
+			if (!source.indirect_descriptor || !source.indirect_descriptor->external_context)
+				continue;
+			const auto& context = *source.indirect_descriptor->external_context;
+			if (context.domain_id != binding.domain_id ||
+			    context.function_id != binding.function_id)
+				continue;
+			if (std::ranges::find(expressions, context.expression_source) == expressions.end())
+				expressions.push_back(context.expression_source);
+		}
+		for (const auto expression: expressions) {
+			const auto& source = program.descriptor_sources[expression];
+			if (source.indirect_descriptor ||
+			    (source.dword_count != 4u && source.dword_count != 8u))
+				return SpecializationFail("external descriptor expression has an invalid shape");
+			for (uint32_t word = 0; word < source.dword_count; ++word) {
+				if (!ValidateRuntimeValue(program, source.dwords[word], RuntimeValueType::Integer,
+				                          binding))
+					return SpecializationFail(
+					    "external descriptor expression is not valid in its context");
+			}
+		}
+		bool found = false;
+		for (const auto& record: domain->records) {
+			if (record.function_id != binding.function_id) continue;
+			found = true;
+			// Share one evaluation memo across every descriptor chain in this native context.
+			// The selected lane/record key is never evaluated on the host.
+			auto              observed = CleanRuntime(runtime);
+			ExternalReadTrace trace {observed.read_memory, observed.userdata, &total_requested};
+			observed.read_memory                = ExternalReadTrace::Read;
+			observed.read_specialization_memory = ExternalReadTrace::Read;
+			observed.userdata                   = &trace;
+			SrtWalker evaluator(program, observed, {}, nullptr, {},
+			                    SrtExternalContext {binding.domain_id, &record});
+			for (const auto expression: expressions) {
+				if (snapshot.external_descriptor_candidate_count >= MaxExternalDescriptorCandidates)
+					return SpecializationFail(fmt::format(
+					    "hash=0x{:016x} external candidate capacity exhausted: domain={} "
+					    "function={} "
+					    "record={} source={} candidates={} tuple_bytes={} limit={} "
+					    "requested_bytes={}",
+					    program.shader_hash, binding.domain_id, binding.function_id, record.ordinal,
+					    expression, snapshot.external_descriptor_candidate_count,
+					    snapshot.external_descriptor_candidate_count *
+					        sizeof(ExternalDescriptorCandidate),
+					    MaxExternalDescriptorCandidates, total_requested));
+				DescriptorValue descriptor;
+				if (!evaluator.EvaluateDescriptor(expression, descriptor))
+					return SpecializationFail(fmt::format(
+					    "hash=0x{:016x} external descriptor failed: domain={} function={} "
+					    "record={} "
+					    "source={} code=0x{:016x} aux=0x{:016x} failed_read={} address=0x{:016x} "
+					    "dwords={} requested_bytes={} budget_exhausted={}",
+					    program.shader_hash, binding.domain_id, binding.function_id, record.ordinal,
+					    expression,
+					    uint64_t {record.words[0]} | (uint64_t {record.words[1]} << 32u),
+					    uint64_t {record.words[2]} | (uint64_t {record.words[3]} << 32u),
+					    trace.failed, trace.failed_address, trace.failed_dwords, total_requested,
+					    trace.budget_exhausted));
+				candidates[expression].push_back({record.ordinal, descriptor});
+				++snapshot.external_descriptor_candidate_count;
+			}
+		}
+		if (!found) return SpecializationFail("external context domain omits a linked function");
+	}
+	return true;
+}
+
 template <typename Specialization, typename Normalize>
-bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
-                                   const DescriptorSource::IndirectDescriptor& indirect,
-                                   uint32_t resource_index, uint32_t dword_count,
-                                   const SrtRuntime& runtime, SrtWalker& clean,
-                                   ResourceSnapshot&             snapshot,
-                                   std::vector<DescriptorValue>& descriptors,
-                                   std::vector<Specialization>&  specializations,
-                                   uint32_t maximum_resources, Normalize&& normalize) {
+bool MaterializeIndirectDescriptor(
+    const ResourcePlan& program, const DescriptorSource::IndirectDescriptor& indirect,
+    uint32_t resource_index, uint32_t dword_count, const SrtRuntime& runtime, SrtWalker& clean,
+    const ExternalDescriptorCandidates& external_candidates, ResourceSnapshot& snapshot,
+    std::vector<DescriptorValue>& descriptors, std::vector<Specialization>& specializations,
+    uint32_t maximum_resources, Normalize&& normalize) {
 	const auto  descriptor_bytes = dword_count * sizeof(uint32_t);
 	const auto& sources = indirect.sources;
 	const auto* selector = indirect.selector ? &*indirect.selector : nullptr;
@@ -274,6 +412,33 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		}
 		return true;
 	};
+	if (indirect.external_context) {
+		const auto expression = indirect.external_context->expression_source;
+		if (expression >= external_candidates.size() || external_candidates[expression].empty())
+			return SpecializationFail("external descriptor candidates are unavailable");
+		auto entries = external_candidates[expression];
+		std::ranges::sort(entries, {}, &ExternalDescriptorCandidate::key);
+		const auto mapping_offset = snapshot.flattened_srt.size();
+		snapshot.flattened_srt.resize(mapping_offset + 1u + entries.size() * 2u);
+		snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(entries.size());
+		// A key that does not belong to this function selects the typed null resource.
+		descriptors[resource_index] = {.dword_count = dword_count};
+		for (uint32_t entry = 0; entry < entries.size(); ++entry) {
+			auto candidate = entries[entry].descriptor;
+			if (candidate.dword_count != dword_count || !normalize(candidate)) return false;
+			uint32_t ordinal = 0;
+			if (!intern_candidate(candidate, ordinal)) return false;
+			snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = entries[entry].key;
+			snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = ordinal;
+		}
+		// Even a default sampler needs its complete key domain: an unknown context must
+		// report a fault rather than silently succeeding with the identical null payload.
+		auto& root                      = specializations[resource_index];
+		root.indirect_root              = resource_index;
+		root.indirect_mapping_offset    = static_cast<uint32_t>(mapping_offset);
+		root.indirect_search_iterations = std::bit_width(entries.size());
+		return true;
+	}
 	const auto read_keys = [&](const ShaderBufferResource& material, uint64_t first,
 	                           uint64_t step, uint64_t count) {
 		keys.resize(count);
@@ -461,10 +626,13 @@ struct SamplerPlan {
 		uint32_t     source;
 		SamplerClass type;
 	};
-	std::array<std::array<uint32_t, 3>, ShaderInfo::MaxSamplers> mapping;
-	std::array<Binding, ShaderInfo::MaxSamplers>                bindings;
+	std::vector<std::array<uint32_t, 3>>                      mapping;
+	std::vector<Binding>                                      bindings;
 	uint32_t                                                  sampler_count = 0;
 };
+
+static bool BuildBindingAliases(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                                ResourceSpecialization& specialization);
 
 template <typename T, typename Keep>
 void CompactImages(std::vector<T>& images, Keep&& keep) {
@@ -527,9 +695,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		}
 		if (NullImageDescriptor(descriptor)) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
-			                                  : Prospero::TextureNumericClass::Float;
-			image.dimension     = Decoder::ImageDimension::Dim2D;
-			image.cube          = false;
+			                      : base.numeric_class != Prospero::TextureNumericClass::Unsupported
+			                          ? base.numeric_class
+			                          : Prospero::TextureNumericClass::Float;
+			image.dimension     = base.dimension != Decoder::ImageDimension::Unknown
+			                          ? base.dimension
+			                          : Decoder::ImageDimension::Dim2D;
+			image.cube          = base.cube;
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -614,6 +786,25 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				exemplar = resource;
 			}
 		}
+		if (exemplar == ImageResource::NoIndirectImage && resource_count == 1u) {
+			const auto& base   = program.info.images[root_index];
+			const auto* source = Source(program, base.source);
+			if (source != nullptr && source->indirect_descriptor &&
+			    source->indirect_descriptor->external_context) {
+				if (base.numeric_class != Prospero::TextureNumericClass::Unsupported &&
+				    base.dimension != Decoder::ImageDimension::Unknown)
+					continue;
+				const auto& context = *source->indirect_descriptor->external_context;
+				return SpecializationFail(
+				    fmt::format("hash=0x{:016x} all-null external image lacks a proven type: "
+					            "root={} pc=0x{:08x} "
+					            "domain={} function={} source={} numeric_class={} dimension={}",
+					            program.shader_hash, root_index, base.first_use_pc,
+					            context.domain_id, context.function_id, context.expression_source,
+					            static_cast<uint32_t>(base.numeric_class),
+					            static_cast<uint32_t>(base.dimension)));
+			}
+		}
 		if (resource_count < 2u || exemplar == ImageResource::NoIndirectImage) {
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
@@ -648,21 +839,28 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
+	if (!BuildBindingAliases(program, snapshot, specialization)) return false;
 	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
 	return true;
 }
 
-bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
-	if (base.samplers.size() > plan.mapping.size()) {
-		return false;
-	}
-	std::array<uint8_t, ShaderInfo::MaxSamplers> usage {};
+bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan, bool external_contexts) {
+	if (!external_contexts && base.samplers.size() > ShaderInfo::MaxSamplers) return false;
+	plan.mapping.resize(base.samplers.size());
+	plan.bindings.resize(base.samplers.size());
+	std::vector<uint8_t> usage(base.samplers.size());
 	plan.sampler_count = static_cast<uint32_t>(base.samplers.size());
 	for (const auto& pair: base.sampled_pairs) {
 		if (pair.image >= base.images.size() || pair.sampler >= base.samplers.size()) {
 			return false;
 		}
 		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(base.images[pair.image]));
+	}
+	for (uint32_t index = 0; index < base.samplers.size(); ++index) {
+		const auto root = base.samplers[index].indirect_root;
+		if (root == SamplerResource::NoIndirectSampler || root == index) continue;
+		if (root >= base.samplers.size()) return false;
+		usage[index] = usage[root];
 	}
 	for (uint32_t index = 0; index < base.samplers.size(); index++) {
 		auto& mapping = plan.mapping[index];
@@ -672,11 +870,134 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 		for (uint32_t type = 0; type < mapping.size(); type++) {
 			if ((classes & (1u << type)) == 0u) continue;
 			const auto target = first ? index : plan.sampler_count++;
-			if (target >= ShaderInfo::MaxSamplers) return false;
+			if (!external_contexts && target >= ShaderInfo::MaxSamplers) return false;
+			if (target >= plan.bindings.size()) plan.bindings.resize(target + 1u);
 			mapping[type]         = target;
 			plan.bindings[target] = {index, static_cast<SamplerClass>(type)};
 			first                = false;
 		}
+	}
+	return true;
+}
+
+static void ApplySamplerVariants(ShaderInfo& info, const SamplerPlan& plan) {
+	auto&      samplers       = info.samplers;
+	const auto original_count = samplers.size();
+	samplers.reserve(plan.sampler_count);
+	for (uint32_t index = 0; index < plan.sampler_count; ++index) {
+		const auto& binding = plan.bindings[index];
+		if (index >= original_count) samplers.push_back(samplers[binding.source]);
+		auto& sampler                 = samplers[index];
+		sampler.snapshot_index        = binding.source;
+		sampler.force_point_filtering = binding.type == SamplerClass::PointInteger;
+		sampler.integer_border        = binding.type != SamplerClass::Float;
+	}
+	for (uint32_t index = 0; index < plan.sampler_count; ++index) {
+		auto& sampler = samplers[index];
+		if (sampler.indirect_root == SamplerResource::NoIndirectSampler) continue;
+		const auto type       = static_cast<uint32_t>(plan.bindings[index].type);
+		sampler.indirect_root = plan.mapping[sampler.indirect_root][type];
+		EXIT_IF(sampler.indirect_root == UINT32_MAX);
+		for (auto& resource: sampler.indirect_resources) {
+			resource = plan.mapping[resource][type];
+			EXIT_IF(resource == UINT32_MAX);
+		}
+	}
+	for (auto& pair: info.sampled_pairs) {
+		const auto type = static_cast<uint32_t>(ClassifySampler(info.images[pair.image]));
+		pair.sampler    = plan.mapping[pair.sampler][type];
+		EXIT_IF(pair.sampler == UINT32_MAX);
+		samplers[pair.sampler].depth_compare |= info.images[pair.image].depth_compare;
+	}
+	for (auto& sampler: samplers) {
+		if (sampler.indirect_root != SamplerResource::NoIndirectSampler)
+			sampler.depth_compare |= samplers[sampler.indirect_root].depth_compare;
+	}
+}
+
+static bool BuildBindingAliases(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                                ResourceSpecialization& specialization) {
+	specialization.sampler_binding_aliases.clear();
+	for (auto& image: specialization.images)
+		image.binding_alias = UINT32_MAX;
+	if (program.external_context_bindings.empty()) return true;
+	ShaderInfo prospective        = program.info;
+	const auto native_image_count = prospective.images.size();
+	for (uint32_t index = 0; index < specialization.images.size(); ++index) {
+		const auto& source = specialization.images[index];
+		if (index >= native_image_count) {
+			if (source.indirect_root >= native_image_count) return false;
+			prospective.images.push_back(prospective.images[source.indirect_root]);
+		}
+		auto& image             = prospective.images[index];
+		image.numeric_class     = source.numeric_class;
+		image.dimension         = source.dimension;
+		image.mip_count         = source.mip_count;
+		image.conversion_format = source.conversion_format;
+		image.shader_swizzle    = source.shader_swizzle;
+		image.cube              = source.cube;
+	}
+	const auto native_sampler_count = prospective.samplers.size();
+	for (uint32_t index = 0; index < specialization.samplers.size(); ++index) {
+		const auto& source = specialization.samplers[index];
+		if (index >= native_sampler_count) {
+			if (source.indirect_root >= native_sampler_count) return false;
+			prospective.samplers.push_back(prospective.samplers[source.indirect_root]);
+		}
+		auto& sampler         = prospective.samplers[index];
+		sampler.indirect_root = source.indirect_root;
+		sampler.indirect_resources.clear();
+	}
+	for (uint32_t index = 0; index < prospective.samplers.size(); ++index) {
+		const auto root = prospective.samplers[index].indirect_root;
+		if (root != SamplerResource::NoIndirectSampler) {
+			if (root >= prospective.samplers.size()) return false;
+			prospective.samplers[root].indirect_resources.push_back(index);
+		}
+	}
+	SamplerPlan plan;
+	if (!BuildSamplerPlan(prospective, plan, true)) return false;
+	ApplySamplerVariants(prospective, plan);
+
+	// Exact descriptor payload and view/class metadata determine binding equivalence. The
+	// record-key maps and provenance remain independent, even when their bindings coincide.
+	struct KeyHash {
+		size_t operator()(const std::vector<uint32_t>& words) const {
+			size_t hash = 1469598103934665603ull;
+			for (const auto word: words)
+				hash = (hash ^ word) * 1099511628211ull;
+			return hash;
+		}
+	};
+	std::unordered_map<std::vector<uint32_t>, uint32_t, KeyHash> images, samplers;
+	const auto DescriptorKey = [](const DescriptorValue& descriptor) {
+		std::vector<uint32_t> key {descriptor.dword_count};
+		key.insert(key.end(), descriptor.dwords.begin(), descriptor.dwords.end());
+		return key;
+	};
+	for (uint32_t index = 0; index < prospective.images.size(); ++index) {
+		if (specialization.images[index].fmask) continue;
+		const auto& image = prospective.images[index];
+		auto        key   = DescriptorKey(snapshot.images[index]);
+		key.insert(key.end(),
+		           {static_cast<uint32_t>(image.resource_class),
+		            static_cast<uint32_t>(image.numeric_class),
+		            static_cast<uint32_t>(image.dimension), static_cast<uint32_t>(image.mip_mode),
+		            image.mip_count, static_cast<uint32_t>(image.conversion_format),
+		            image.shader_swizzle, image.read, image.written, image.atomic, image.atomic64,
+		            image.depth_compare, image.cube, image.r128});
+		const auto [it, inserted] = images.emplace(std::move(key), index);
+		if (!inserted) specialization.images[index].binding_alias = it->second;
+	}
+	specialization.sampler_binding_aliases.assign(prospective.samplers.size(), UINT32_MAX);
+	for (uint32_t index = 0; index < prospective.samplers.size(); ++index) {
+		const auto& sampler = prospective.samplers[index];
+		if (sampler.snapshot_index >= snapshot.samplers.size()) return false;
+		auto key = DescriptorKey(snapshot.samplers[sampler.snapshot_index]);
+		key.insert(key.end(), {sampler.force_point_filtering, sampler.depth_compare,
+		                       sampler.integer_border, sampler.gather_lod});
+		const auto [it, inserted] = samplers.emplace(std::move(key), index);
+		if (!inserted) specialization.sampler_binding_aliases[index] = it->second;
 	}
 	return true;
 }
@@ -933,6 +1254,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.shader_hash                = program.shader_hash;
 	plan.user_data_base             = program.user_data_base;
 	plan.user_data_count            = program.user_data_count;
+	plan.external_context_bindings  = program.external_context_bindings;
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
 	plan.srt_plan_complete          = program.srt_plan_complete;
@@ -966,7 +1288,12 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		auto& target =
 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
 		cloned.emplace(source, &target);
-		if (source->GetOpcode() == ValueOpcode::Phi) {
+		if (source->GetOpcode() == ValueOpcode::ExternalCallContextWord) {
+			// This graph is host-only. Keep the context identity, while the actual selected
+			// words and ordinal remain exclusively in executable GPU IR.
+			for (uint32_t index = 0; index < source->NumArgs(); ++index)
+				target.SetArg(index, index == 0u || index == 2u ? Value(0u) : source->Arg(index));
+		} else if (source->GetOpcode() == ValueOpcode::Phi) {
 			for (size_t index = 0; index < source->NumArgs(); index++) {
 				target.AddPhiOperand(nullptr, Clone(source->Arg(index)));
 			}
@@ -1046,7 +1373,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.selector_mask);
 		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.selector_first);
 		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.key_count);
-		if (indirect.sources.empty()) {
+		if (indirect.external_context) {
+			MarkCleanFlatSlots(plan, Source(plan, indirect.external_context->expression_source),
+			                   plan.clean_flat_slots);
+		} else if (indirect.sources.empty()) {
 			MarkCleanFlatSlots(plan, Source(plan, indirect.table_source), plan.clean_flat_slots);
 		} else {
 			for (const auto candidate: indirect.sources) {
@@ -1086,6 +1416,30 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		observed.read_memory = CaptureOrdinaryRead;
 	}
 	SrtWalker clean(program, CleanRuntime(observed));
+	ExternalDescriptorCandidates external_candidates;
+	if (!PrepareExternalDescriptors(program, observed, external_candidates, snapshot)) return false;
+	specialization.dynamic_buffer_formats.clear();
+	for (uint32_t index = 0; index < program.memory_info.size(); ++index) {
+		const auto& memory = program.memory_info[index];
+		if (memory.dynamic_descriptor_source == UINT32_MAX) continue;
+		const auto* source = Source(program, memory.dynamic_descriptor_source);
+		if (source == nullptr || !source->indirect_descriptor ||
+		    !source->indirect_descriptor->external_context || !memory.formatted ||
+		    memory.kind != ResourceKind::IndirectBuffer)
+			return SpecializationFail("invalid finite-context buffer format provenance");
+		const auto expression = source->indirect_descriptor->external_context->expression_source;
+		if (expression >= external_candidates.size() || external_candidates[expression].empty())
+			return SpecializationFail("finite-context buffer format candidates are unavailable");
+		DynamicBufferFormatSet set {.memory_index = index};
+		for (const auto& candidate: external_candidates[expression]) {
+			ShaderBufferResource descriptor;
+			if (!DecodeBufferDescriptor(candidate.descriptor, descriptor)) return false;
+			set.formats.push_back(static_cast<uint32_t>(descriptor.Format()));
+		}
+		std::ranges::sort(set.formats);
+		set.formats.erase(std::unique(set.formats.begin(), set.formats.end()), set.formats.end());
+		specialization.dynamic_buffer_formats.push_back(std::move(set));
+	}
 	SrtWalker walker(program, observed, program.clean_flat_slots,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
@@ -1129,9 +1483,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
 					if (!MaterializeIndirectDescriptor(
-					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
-					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
-					        NormalizeIndirectStoreBuffer))
+					        program, *source->indirect_descriptor, i, 4u, observed, clean,
+					        external_candidates, snapshot, snapshot.buffers, specialization.buffers,
+					        ShaderInfo::MaxBuffers, NormalizeIndirectStoreBuffer))
 						return false;
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
@@ -1189,8 +1543,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
-			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
-			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
+			        program, indirect, i, 8u, observed, clean, external_candidates, snapshot,
+			        snapshot.images, specialization.images, UINT32_MAX,
+			        [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
 				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
@@ -1209,11 +1564,28 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.samplers.resize(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
-		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
-			return false;
+	specialization.samplers.assign(program.info.samplers.size(), {});
+	for (uint32_t i = 0; i < snapshot.samplers.size(); ++i) {
+		const auto root =
+		    i < program.info.samplers.size() ? i : specialization.samplers[i].indirect_root;
+		if (root >= program.info.samplers.size()) return false;
+		const auto& sampler = program.info.samplers[root];
+		if (i < program.info.samplers.size()) {
+			const auto* source = Source(program, sampler.source);
+			if (source == nullptr) return false;
+			if (source->indirect_descriptor) {
+				if (!source->indirect_descriptor->external_context)
+					return SpecializationFail("unsupported indirect sampler provenance");
+				snapshot.samplers[i] = {.dword_count = 4u};
+				if (!MaterializeIndirectDescriptor(
+				        program, *source->indirect_descriptor, i, 4u, observed, clean,
+				        external_candidates, snapshot, snapshot.samplers, specialization.samplers,
+				        UINT32_MAX, [](DescriptorValue&) { return true; }))
+					return false;
+			} else if (!evaluate(sampler.source, snapshot.samplers[i]))
+				return false;
 		}
-		if (program.info.samplers[i].gather_lod) {
+		if (sampler.gather_lod) {
 			const auto control = snapshot.samplers[i].dwords[2];
 			const auto filter = (control >> 26u) & 3u;
 			// MipNone always selects the base level. Explicit point gathers currently require
@@ -1233,6 +1605,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	        program.binding_layout_complete);
 	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||
 	        program.info.images.size() > specialization.images.size());
+	program.dynamic_buffer_formats = specialization.dynamic_buffer_formats;
 
 	auto& buffers = program.info.buffers;
 	const auto original_buffer_count = buffers.size();
@@ -1278,6 +1651,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.binding_alias              = source.binding_alias;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {
@@ -1288,26 +1662,39 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 	}
 
-	SamplerPlan sampler_plan;
-	EXIT_IF(!BuildSamplerPlan(program.info, sampler_plan));
 	auto& samplers      = program.info.samplers;
 	auto& sampled_pairs = program.info.sampled_pairs;
-	const auto original_sampler_count = samplers.size();
-	samplers.reserve(sampler_plan.sampler_count);
-	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
-		const auto& binding = sampler_plan.bindings[index];
-		if (index >= original_sampler_count) {
-			samplers.push_back(samplers[binding.source]);
+	const auto native_sampler_count = samplers.size();
+	for (uint32_t index = 0; index < specialization.samplers.size(); ++index) {
+		const auto& source = specialization.samplers[index];
+		if (index >= native_sampler_count) {
+			EXIT_IF(source.indirect_root >= native_sampler_count);
+			samplers.push_back(samplers[source.indirect_root]);
 		}
-		samplers[index].snapshot_index = binding.source;
-		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
-		samplers[index].integer_border        = binding.type != SamplerClass::Float;
+		auto& sampler                      = samplers[index];
+		sampler.snapshot_index             = index;
+		sampler.indirect_root              = source.indirect_root;
+		sampler.indirect_mapping_offset    = source.indirect_mapping_offset;
+		sampler.indirect_search_iterations = source.indirect_search_iterations;
+		sampler.binding_alias              = UINT32_MAX;
+		sampler.indirect_resources.clear();
 	}
-	for (auto& pair: sampled_pairs) {
-		const auto type = static_cast<uint32_t>(ClassifySampler(images[pair.image]));
-		pair.sampler = sampler_plan.mapping[pair.sampler][type];
-		EXIT_IF(pair.sampler == UINT32_MAX);
-		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
+	for (uint32_t index = 0; index < samplers.size(); ++index) {
+		const auto root = samplers[index].indirect_root;
+		if (root != SamplerResource::NoIndirectSampler) {
+			EXIT_IF(root >= samplers.size());
+			samplers[root].indirect_resources.push_back(index);
+		}
+	}
+	SamplerPlan sampler_plan;
+	EXIT_IF(
+	    !BuildSamplerPlan(program.info, sampler_plan, !program.external_context_bindings.empty()));
+	const auto original_sampler_count = samplers.size();
+	ApplySamplerVariants(program.info, sampler_plan);
+	if (!specialization.sampler_binding_aliases.empty()) {
+		EXIT_IF(specialization.sampler_binding_aliases.size() != samplers.size());
+		for (uint32_t index = 0; index < samplers.size(); ++index)
+			samplers[index].binding_alias = specialization.sampler_binding_aliases[index];
 	}
 
 	auto& memory_info = program.memory_info;
@@ -1422,6 +1809,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		pair.image = image_remap[pair.image];
 	}
 	for (auto& image: images) {
+		if (image.binding_alias != UINT32_MAX)
+			image.binding_alias = image_remap[image.binding_alias];
 		if (image.indirect_root != ImageResource::NoIndirectImage) {
 			image.indirect_root = image_remap[image.indirect_root];
 		}

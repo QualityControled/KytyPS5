@@ -315,10 +315,13 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				break;
 			case CFG::TerminatorKind::IndirectBranch: {
 				if (!validate_control_value(program.block_info[block_index].indirect_target,
-				                            Type::U32)) {
+				                            terminator.external_transfer ? Type::U64 : Type::U32)) {
 					return Fail("value IR indirect branch selector is invalid");
 				}
 				std::unordered_set<uint32_t> indirect_targets;
+				if (terminator.external_transfer && (terminator.indirect_guest_addresses.empty() ||
+				    terminator.indirect_guest_addresses.size()!=terminator.indirect_targets.size()))
+					return Fail("value IR external guest-address mapping is inconsistent");
 				for (const auto target: terminator.indirect_targets) {
 					if (!indirect_targets.insert(target).second) {
 						return Fail("value IR indirect branch target is duplicated");
@@ -598,31 +601,87 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		return Fail("value IR contains an unreachable block");
 	}
 
-	std::vector<std::vector<bool>> dominators(program.blocks.size(),
-	                                          std::vector<bool>(program.blocks.size(), true));
-	dominators.front().assign(program.blocks.size(), false);
-	dominators.front().front() = true;
-	bool changed               = true;
-	while (changed) {
-		changed = false;
-		for (size_t block_index = 1; block_index < program.blocks.size(); block_index++) {
-			std::vector<bool> next(program.blocks.size(), true);
-			for (const auto* predecessor: program.blocks[block_index]->ImmPredecessors()) {
-				const auto predecessor_index = block_indices.at(predecessor);
-				for (size_t candidate = 0; candidate < next.size(); candidate++) {
-					next[candidate] = next[candidate] && dominators[predecessor_index][candidate];
-				}
+	std::vector<std::vector<bool>> dominators;
+	std::vector<size_t> dominance_begin, dominance_end;
+	if (program.info.uses_external_call_fault) {
+		const auto count=program.blocks.size();
+		std::vector<uint8_t> visited(count);
+		std::vector<size_t> order;
+		std::vector<std::pair<size_t,size_t>> stack {{0u,0u}};
+		visited[0]=1;
+		while (!stack.empty()) {
+			auto& [block,next]=stack.back();
+			const auto successors=program.blocks[block]->ImmSuccessors();
+			if (next<successors.size()) {
+				const auto successor=block_indices.at(successors[next++]);
+				if (!visited[successor]) {visited[successor]=1; stack.emplace_back(successor,0u);}
+			} else {order.push_back(block);stack.pop_back();}
+		}
+		std::ranges::reverse(order);
+		std::vector<size_t> rank(count,SIZE_MAX),idom(count,SIZE_MAX);
+		for (size_t i=0;i<order.size();++i) rank[order[i]]=i;
+		idom[0]=0;
+		const auto intersect=[&](size_t a,size_t b) {
+			while (a!=b) {
+				while (rank[a]>rank[b]) a=idom[a];
+				while (rank[b]>rank[a]) b=idom[b];
 			}
-			next[block_index] = true;
-			if (next != dominators[block_index]) {
-				dominators[block_index] = std::move(next);
-				changed                 = true;
+			return a;
+		};
+		bool changed=true;
+		while (changed) {
+			changed=false;
+			for (const auto block:order) {
+				if (block==0) continue;
+				size_t parent=SIZE_MAX;
+				for (const auto* predecessor:program.blocks[block]->ImmPredecessors()) {
+					const auto pred=block_indices.at(predecessor);
+					if (idom[pred]==SIZE_MAX) continue;
+					parent=parent==SIZE_MAX ? pred:intersect(parent,pred);
+				}
+				if (parent!=idom[block]) {idom[block]=parent;changed=true;}
+			}
+		}
+		std::vector<std::vector<size_t>> children(count);
+		for (size_t i=1;i<count;++i) {
+			if (idom[i]==SIZE_MAX) return Fail("external value IR has no immediate dominator");
+			children[idom[i]].push_back(i);
+		}
+		dominance_begin.resize(count);dominance_end.resize(count);
+		size_t clock=0;
+		stack={{0u,0u}};dominance_begin[0]=clock++;
+		while (!stack.empty()) {
+			auto& [block,next]=stack.back();
+			if (next<children[block].size()) {
+				const auto child=children[block][next++];
+				dominance_begin[child]=clock++;stack.emplace_back(child,0u);
+			} else {dominance_end[block]=clock++;stack.pop_back();}
+		}
+	} else {
+		dominators.assign(program.blocks.size(),std::vector<bool>(program.blocks.size(),true));
+		dominators.front().assign(program.blocks.size(), false);
+		dominators.front().front() = true;
+		bool changed = true;
+		while (changed) {
+			changed = false;
+			for (size_t block_index = 1; block_index < program.blocks.size(); block_index++) {
+				std::vector<bool> next(program.blocks.size(), true);
+				for (const auto* predecessor: program.blocks[block_index]->ImmPredecessors()) {
+					const auto predecessor_index = block_indices.at(predecessor);
+					for (size_t candidate = 0; candidate < next.size(); candidate++)
+						next[candidate] = next[candidate] && dominators[predecessor_index][candidate];
+				}
+				next[block_index] = true;
+				if (next != dominators[block_index]) {dominators[block_index]=std::move(next);changed=true;}
 			}
 		}
 	}
 
 	const auto dominates = [&](const Block* definition, const Block* use) {
-		return dominators[block_indices.at(use)][block_indices.at(definition)];
+		const auto def=block_indices.at(definition),user=block_indices.at(use);
+		if (!dominance_begin.empty()) return dominance_begin[def]<=dominance_begin[user] &&
+		                                   dominance_end[def]>=dominance_end[user];
+		return static_cast<bool>(dominators[user][def]);
 	};
 	const auto control_dominates = [&](Value value, const Block* use) {
 		const auto* definition = value.TryInstruction();

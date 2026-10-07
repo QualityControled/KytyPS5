@@ -126,8 +126,9 @@ Diagnostics::CallCapture Capture(const Fixture& fixture, Memory& memory, bool en
 void TestActualAliasedTraceAndUnchangedDecoder() {
 	Fixture fixture;
 	const auto original_call = fixture.program.instructions.back();
-	Check(original_call.opcode == Decoder::Opcode::UNSUPPORTED && original_call.opcode_id == 0x21u,
-	      "diagnostics changed the unsupported SWAPPC decoder contract");
+	Check(original_call.opcode == Decoder::Opcode::S_SWAPPC_B64 && original_call.opcode_id == 0x21u &&
+	          original_call.data_dwords == 2u,
+	      "SWAPPC decoding lost its two-word target/return contract");
 	const auto trace = Diagnostics::TraceCallTables(fixture.program, fixture.user_data);
 	Check(trace.calls.size() == 1u && !trace.call_sites_truncated, "actual call was not found once");
 	const auto& call = trace.calls.front();
@@ -690,8 +691,8 @@ void TestCapturedCallerFromFile(const char* path) {
 	      "full captured caller did not identify the observed external table origin");
 	const auto decoded_call = std::find_if(program.instructions.begin(), program.instructions.end(),
 	                                     [](const auto& instruction) { return instruction.pc == 0xae4u; });
-	Check(decoded_call != program.instructions.end() && decoded_call->opcode == Decoder::Opcode::UNSUPPORTED,
-	      "diagnostic tracing accidentally enabled execution of the actual call");
+	Check(decoded_call != program.instructions.end() && decoded_call->opcode == Decoder::Opcode::S_SWAPPC_B64,
+	      "captured call lost its decoded SWAPPC identity");
 	std::puts("ShaderCallCaptureTests: full captured caller origin passed (no guest memory reads)");
 }
 

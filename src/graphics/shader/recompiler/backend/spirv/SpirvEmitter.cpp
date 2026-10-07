@@ -23,19 +23,13 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	constexpr auto                               KindCount = static_cast<size_t>(Kind::Count);
 	std::array<std::vector<uint32_t>, KindCount> expected;
 	std::array<bool, KindCount>                  present {};
-	const auto                                   Dense = [](size_t size) {
-		std::vector<uint32_t> values(size);
-		for (uint32_t i = 0; i < values.size(); i++) {
-			values[i] = i;
-		}
-		return values;
-	};
 	auto Expect = [&](Kind kind, std::vector<uint32_t> resources = {}) {
 		const auto index = static_cast<size_t>(kind);
 		present[index]   = true;
 		expected[index]  = std::move(resources);
 	};
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (program.info.images[i].binding_alias != UINT32_MAX) continue;
 		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			Fail(program, "native shader plan has an invalid image class");
@@ -50,7 +44,10 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		                                            count, i);
 	}
 	if (!program.info.samplers.empty()) {
-		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
+		std::vector<uint32_t> samplers;
+		for (uint32_t i = 0; i < program.info.samplers.size(); ++i)
+			if (program.info.samplers[i].binding_alias == UINT32_MAX) samplers.push_back(i);
+		Expect(Kind::Samplers, std::move(samplers));
 	}
 	auto& buffers = expected[static_cast<size_t>(Kind::Buffers)];
 	const auto shared = IR::CollectMemoryResources(program, buffers);
@@ -64,6 +61,9 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	if (program.info.uses_dma) {
 		Expect(Kind::BdaPagetable);
 		Expect(Kind::FaultBuffer);
+	}
+	if (program.info.uses_external_call_fault) {
+		Expect(Kind::ShaderCallFaultBuffer);
 	}
 	if (IR::UsesFlattenedSrt(program)) {
 		Expect(Kind::FlattenedSrt);
@@ -280,6 +280,10 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::StoreCompletion: requirements.subgroup_barrier = true; break;
 				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
+				case IR::ValueOpcode::ConditionRef:
+					requirements.subgroup_ballot |=
+					    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
+					break;
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:

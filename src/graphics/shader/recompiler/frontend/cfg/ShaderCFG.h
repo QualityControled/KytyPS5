@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include <vector>
+#include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
 
@@ -55,6 +56,13 @@ struct Terminator {
 	std::vector<uint32_t> indirect_targets;
 	std::vector<uint32_t> indirect_selector_values;
 	std::vector<uint32_t> indirect_selector_targets;
+	// External transfers keep guest addresses separate from dense CFG labels.
+	std::vector<uint64_t> indirect_guest_addresses;
+	uint64_t external_guest_pc = 0;
+	uint64_t external_link_address = 0;
+	uint32_t external_return_sgpr = UINT32_MAX;
+	bool external_transfer = false;
+	bool external_call = false;
 	uint32_t              expression    = UINT32_MAX;
 	bool                  loop_header   = false;
 };
@@ -101,6 +109,7 @@ struct Graph {
 	uint32_t                                entry_block   = UINT32_MAX;
 	bool                                    irreducible   = false;
 	bool                                    unsupported   = false;
+	bool                                    external_library = false;
 	FailureKind                             failure_kind  = FailureKind::None;
 	uint32_t                                failure_block = UINT32_MAX;
 	std::string                             unsupported_reason;
@@ -112,7 +121,18 @@ struct Graph {
 	bool              Dominates(uint32_t dominator, uint32_t block) const;
 };
 
-Graph       BuildGraph(const Decoder::Program& program);
+struct ExternalTransfer {
+	uint32_t pc = 0;
+	uint32_t target_sgpr = UINT32_MAX;
+	uint32_t return_sgpr = UINT32_MAX;
+	uint64_t guest_pc = 0;
+	uint64_t link_address = 0;
+	bool call = false;
+	std::vector<uint64_t> guest_addresses;
+	std::vector<uint32_t> target_pcs;
+};
+Graph       BuildGraph(const Decoder::Program& program,
+                       std::span<const ExternalTransfer> external_transfers = {});
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.
 Graph       Structurize(const Graph& graph);

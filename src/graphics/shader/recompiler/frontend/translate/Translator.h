@@ -18,6 +18,9 @@ public:
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source, IR::BlockInfo& info);
+	void TranslateExternalCall(const Decoder::Instruction& inst, const CFG::Terminator& term);
+	IR::U32 CaptureExternalRecordOrdinal(const Decoder::Instruction& inst);
+	void MarkExternalContext(const ExternalFunctionEntry& entry, IR::U32 ordinal);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
@@ -259,6 +262,7 @@ private:
 	IR::Program&    program;
 	IR::IREmitter   ir;
 	IR::U1          instruction_branch_condition;
+	IR::Value       instruction_indirect_target;
 	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;

@@ -30,11 +30,23 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_search_iterations = 0;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
+		uint32_t                      binding_alias              = UINT32_MAX;
 		bool                          operator==(const Image&) const = default;
+	};
+
+	struct Sampler {
+		uint32_t indirect_root                    = SamplerResource::NoIndirectSampler;
+		uint32_t indirect_mapping_offset          = 0;
+		uint32_t indirect_search_iterations       = 0;
+		bool     operator==(const Sampler&) const = default;
 	};
 
 	std::vector<Buffer> buffers;
 	std::vector<Image>  images;
+	std::vector<Sampler> samplers;
+	// Indexed by the final sampler filtering/border variants, not raw snapshots.
+	std::vector<uint32_t>               sampler_binding_aliases;
+	std::vector<DynamicBufferFormatSet> dynamic_buffer_formats;
 
 	bool operator==(const ResourceSpecialization&) const = default;
 };

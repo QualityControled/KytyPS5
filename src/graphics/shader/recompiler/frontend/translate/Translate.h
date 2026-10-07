@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ExternalProgram.h"
 
 #include <cstdint>
 #include <vector>
@@ -29,6 +30,7 @@ struct TranslateOptions {
 	uint32_t                      user_data_count     = 64;
 	ShaderStageInputInfo          input_info;
 	const EmbeddedFetchPlan*      embedded_fetch = nullptr;
+	std::span<const ExternalFunctionEntry> external_entries;
 };
 
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,

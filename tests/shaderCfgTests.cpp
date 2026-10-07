@@ -43,6 +43,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -14675,13 +14676,14 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto structured_result = compile("structured-phi", structured_phi,
-                                         {.words = 140,
-                                          .instructions = 41,
+                                         {.words = 174,
+                                          .instructions = 49,
                                           .phis = 1,
                                           .labels = 8,
                                           .loop_merges = 1,
                                           .branches = 6,
-                                          .conditional_branches = 1});
+                                          .conditional_branches = 1,
+                                          .ballots = 2});
   const auto structured_metrics = MeasureSpirv(structured_result.spirv);
   Check((structured_result.ir_dump.find("Phi") != std::string::npos),
         "structured Phi size fixture no longer contains an IR Phi");
@@ -14692,13 +14694,14 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(structured_result.spirv);
   const auto structured_repeat =
       compile("structured-phi-repeat", structured_phi,
-              {.words = 140,
-               .instructions = 41,
+              {.words = 174,
+               .instructions = 49,
                .phis = 1,
                .labels = 8,
                .loop_merges = 1,
                .branches = 6,
-               .conditional_branches = 1});
+               .conditional_branches = 1,
+               .ballots = 2});
   Check(structured_repeat.spirv == structured_result.spirv,
         "deferred Phi patching is not deterministic");
 
@@ -14862,8 +14865,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto dispatcher_result = compile("dispatcher", dispatcher,
-                                         {.words = 242,
-                                          .instructions = 67,
+                                         {.words = 255,
+                                          .instructions = 70,
                                           .variables = 3,
                                           .function_variables = 3,
                                           .loads = 3,
@@ -14874,7 +14877,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                           .selection_merges = 1,
                                           .branches = 10,
                                           .conditional_branches = 1,
-                                          .switches = 1});
+                                          .switches = 1,
+                                          .ballots = 1});
   Check(dispatcher_result.program.dispatcher_fallback &&
             (dispatcher_result.ir_dump.find("Phi") != std::string::npos) &&
             SpirvInstructionOpcodeCount(dispatcher_result.spirv, 245u) == 2u &&
@@ -14888,10 +14892,14 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::string_view(argv[1]) == "--spirv-size-only") {
+    TestNewShaderRecompilerSpirvSizeBaselines();
+    return 0;
+  }
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
