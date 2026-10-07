@@ -13,9 +13,9 @@ namespace Libs::Graphics::ShaderRecompiler::Diagnostics {
 
 inline constexpr size_t MaxCallSites            = 64;
 inline constexpr size_t MaxTableBytes           = 1024 * 1024;
-inline constexpr size_t MaxTargets              = 1024;
+inline constexpr size_t MaxTargets              = 2048;
 inline constexpr size_t MaxTargetBytes          = 64 * 1024;
-inline constexpr size_t MaxAggregateTargetBytes = 64 * 1024 * 1024;
+inline constexpr size_t MaxAggregateTargetBytes = 128 * 1024 * 1024;
 inline constexpr size_t ReadChunkBytes          = 4096;
 using MemoryReader                     = bool (*)(void*, uint64_t, std::span<uint32_t>);
 

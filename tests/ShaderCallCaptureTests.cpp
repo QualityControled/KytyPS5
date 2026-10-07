@@ -626,6 +626,43 @@ void TestAggregateTargetReadBudget() {
 	      "callback requests escaped aggregate target bounds");
 }
 
+void TestObservedDistinctLibraryFitsCaptureCaps() {
+	Fixture fixture;
+	Memory memory;
+	constexpr uint32_t records = 10644u;
+	constexpr uint32_t unique_targets = 1684u;
+	constexpr uint64_t table_base = 0x8000000u;
+	constexpr uint64_t target_base = 0x1350000000ull;
+	std::vector<uint32_t> table;
+	table.reserve(records * 4u);
+	for (uint32_t record = 0; record < records; ++record) {
+		AppendRecord(table, target_base + (record % unique_targets) * Diagnostics::MaxTargetBytes,
+		             0x2870018u + record * 24u, 0x10u);
+	}
+	memory.Add(fixture.DescriptorAddress(), Descriptor(table_base, 16u, records));
+	memory.Add(table_base, table);
+	for (uint32_t target = 0; target < unique_targets; ++target) {
+		memory.Add(target_base + target * Diagnostics::MaxTargetBytes,
+		           std::vector<uint32_t>(Diagnostics::ReadChunkBytes / sizeof(uint32_t), 0xbe80200eu));
+	}
+	const auto capture = Capture(fixture, memory);
+	Check(capture.tables.size() == 1u && capture.tables.front().words == table &&
+	          !capture.tables.front().table_truncated && !capture.table_budget_exhausted,
+	      "observed full library table was truncated despite sufficient table budget");
+	Check(capture.targets.size() == unique_targets && !capture.target_limit_reached &&
+	          !capture.target_budget_exhausted && capture.duplicate_targets == records - unique_targets &&
+	          capture.target_bytes_reserved == unique_targets * Diagnostics::MaxTargetBytes &&
+	          capture.target_read_bytes_requested == unique_targets * 2u * Diagnostics::ReadChunkBytes,
+	      "observed distinct library exceeded capture count or aggregate reservation budget");
+	Check(capture.targets.back().raw_address == target_base + (unique_targets - 1u) * Diagnostics::MaxTargetBytes &&
+	          capture.targets.back().record_index == unique_targets - 1u &&
+	          std::all_of(capture.targets.begin(), capture.targets.end(), [](const auto& target) {
+		          return target.read_failed && !target.prefix_capped &&
+		                 target.words.size() * sizeof(uint32_t) == Diagnostics::ReadChunkBytes;
+	          }),
+	      "observed target tail or failed-prefix labels changed");
+}
+
 void TestCapturedCallerFromFile(const char* path) {
 	std::ifstream file(path, std::ios::binary | std::ios::ate);
 	Check(static_cast<bool>(file), "cannot open supplied native shader capture");
@@ -677,6 +714,7 @@ int main(int argc, char** argv) {
 		TestDistinctTargetAndCallSiteCaps();
 		TestCompleteObservedTableTailAndDuplicateContexts();
 		TestAggregateTargetReadBudget();
+		TestObservedDistinctLibraryFitsCaptureCaps();
 		if (argc == 3) TestCapturedCallerFromFile(argv[2]);
 		std::puts("ShaderCallCaptureTests: all cases passed");
 		return 0;
