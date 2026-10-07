@@ -195,19 +195,27 @@ void DumpShaderCallInputs(const char* stage_name,
 	    "runtime_scope=compute_only; other stages were not examined\n"
 	    "selection=unknown; all records are candidates, no function was executed\n"
 	    "prefixes are raw mapped-memory snapshots, not proven function boundaries\n"
-	    "limits: call_sites=64 aggregate_table_bytes=65536 targets=64 target_prefix_bytes=65536 "
-	    "read_chunk_bytes=4096\n"
+	    "limits: call_sites={} aggregate_table_bytes={} targets={} target_prefix_bytes={} "
+	    "aggregate_target_bytes={} read_chunk_bytes={}\n"
 	    "descriptor_read_requests={} descriptor_requested_bytes={} "
-	    "table_bytes_reserved={} table_read_bytes_requested={} target_read_bytes_requested={}\n"
-	    "call_sites_truncated={} table_budget_exhausted={} target_limit_reached={}\n"
+	    "table_bytes_reserved={} table_read_bytes_requested={} target_bytes_reserved={} "
+	    "target_read_bytes_requested={}\n"
+	    "call_sites_truncated={} table_budget_exhausted={} target_limit_reached={} "
+	    "target_budget_exhausted={}\n"
 	    "zero_targets={} misaligned_targets={} outside_48bit_targets={} duplicate_targets={}\n"
 	    "Raw table files preserve every captured 64-bit target and both auxiliary DWORDs, "
 	    "including excluded or repeated targets.\n\n",
 	    stage_name, options.shader_hash, code.size_bytes(), decoded.instructions.size(),
+	    ShaderRecompiler::Diagnostics::MaxCallSites, ShaderRecompiler::Diagnostics::MaxTableBytes,
+	    ShaderRecompiler::Diagnostics::MaxTargets, ShaderRecompiler::Diagnostics::MaxTargetBytes,
+	    ShaderRecompiler::Diagnostics::MaxAggregateTargetBytes,
+	    ShaderRecompiler::Diagnostics::ReadChunkBytes,
 	    capture.descriptor_read_requests, capture.descriptor_read_requests * 16u,
 	    capture.table_bytes_reserved, capture.table_read_bytes_requested,
+	    capture.target_bytes_reserved,
 	    capture.target_read_bytes_requested, capture.call_sites_truncated,
-	    capture.table_budget_exhausted, capture.target_limit_reached, capture.zero_targets,
+	    capture.table_budget_exhausted, capture.target_limit_reached, capture.target_budget_exhausted,
+	    capture.zero_targets,
 	    capture.misaligned_targets, capture.outside_address_space_targets, capture.duplicate_targets);
 	for (size_t i = 0; i < capture.tables.size(); ++i) {
 		const auto& table = capture.tables[i];

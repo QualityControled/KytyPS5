@@ -305,17 +305,28 @@ CallCapture CaptureCallTables(bool enabled, const Decoder::Program& program,
 				capture.target_limit_reached = true;
 				continue;
 			}
+			const auto target_remaining = MaxAggregateTargetBytes - capture.target_bytes_reserved;
+			const auto target_bytes = std::min(MaxTargetBytes, target_remaining) & ~size_t {3};
+			if (target_bytes == 0u) {
+				capture.target_budget_exhausted = true;
+				continue;
+			}
 			TargetSnapshot candidate;
 			candidate.raw_address     = target;
 			candidate.table_index     = table_index;
 			candidate.record_index    = record;
 			candidate.auxiliary_words = {table.words[first + 2u], table.words[first + 3u]};
+			// Reserve failed attempts too: an unreadable prefix must not replenish the budget.
+			capture.target_bytes_reserved += target_bytes;
 			candidate.read_failed =
-			    !ReadPrefix(reader, reader_context, target, MaxTargetBytes, candidate.words,
+			    !ReadPrefix(reader, reader_context, target, target_bytes, candidate.words,
 				            capture.target_read_bytes_requested);
+			capture.target_budget_exhausted |= capture.target_bytes_reserved == MaxAggregateTargetBytes;
 			candidate.prefix_capped = !candidate.read_failed;
 			candidate.status = candidate.read_failed ? "prefix read failed; function extent unknown"
-			                                         : "prefix capped; function extent unknown";
+			                   : target_bytes < MaxTargetBytes
+			                       ? "aggregate target budget prefix capped; function extent unknown"
+			                       : "prefix capped; function extent unknown";
 			capture.targets.push_back(std::move(candidate));
 		}
 		capture.tables.push_back(std::move(table));

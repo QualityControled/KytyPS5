@@ -11,11 +11,12 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Diagnostics {
 
-inline constexpr size_t MaxCallSites   = 64;
-inline constexpr size_t MaxTableBytes  = 64 * 1024;
-inline constexpr size_t MaxTargets     = 64;
-inline constexpr size_t MaxTargetBytes = 64 * 1024;
-inline constexpr size_t ReadChunkBytes = 4096;
+inline constexpr size_t MaxCallSites            = 64;
+inline constexpr size_t MaxTableBytes           = 1024 * 1024;
+inline constexpr size_t MaxTargets              = 1024;
+inline constexpr size_t MaxTargetBytes          = 64 * 1024;
+inline constexpr size_t MaxAggregateTargetBytes = 64 * 1024 * 1024;
+inline constexpr size_t ReadChunkBytes          = 4096;
 using MemoryReader                     = bool (*)(void*, uint64_t, std::span<uint32_t>);
 
 struct CallTableTrace {
@@ -67,6 +68,7 @@ struct CallCapture {
 	bool                           call_sites_truncated          = false;
 	bool                           table_budget_exhausted        = false;
 	bool                           target_limit_reached          = false;
+	bool                           target_budget_exhausted       = false;
 	size_t                         zero_targets                  = 0;
 	size_t                         misaligned_targets            = 0;
 	size_t                         outside_address_space_targets = 0;
@@ -74,6 +76,7 @@ struct CallCapture {
 	size_t                         descriptor_read_requests      = 0;
 	size_t                         table_bytes_reserved          = 0;
 	size_t                         table_read_bytes_requested    = 0;
+	size_t                         target_bytes_reserved         = 0;
 	size_t                         target_read_bytes_requested   = 0;
 	std::vector<CallTableSnapshot> tables;
 	std::vector<TargetSnapshot>    targets;

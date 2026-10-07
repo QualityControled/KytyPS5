@@ -461,8 +461,8 @@ void TestPartialTableAndAggregateBudget() {
 	Check(trace.calls.size() == 2u && trace.calls[0].rejection.empty() && trace.calls[1].rejection.empty(),
 	      "independent descriptor register groups could not both be traced");
 	Memory aggregate_memory;
-	constexpr size_t first_size = 40000u;
-	constexpr uint64_t second_base = 0x20000u;
+	constexpr size_t first_size = Diagnostics::MaxTableBytes * 3u / 4u;
+	constexpr uint64_t second_base = 0x4000000u;
 	aggregate_memory.Add(fixture.DescriptorAddress(), Descriptor(table_base, 0u, first_size));
 	aggregate_memory.Add(fixture.DescriptorAddress() + 16u, Descriptor(second_base, 0u, first_size));
 	aggregate_memory.Add(table_base, std::vector<uint32_t>(first_size / sizeof(uint32_t), 0u));
@@ -518,8 +518,14 @@ void TestDistinctTargetAndCallSiteCaps() {
 	memory.Add(fixture.DescriptorAddress(), Descriptor(table_base, 16u, Diagnostics::MaxTargets + 1u));
 	memory.Add(table_base, table);
 	const auto capture = Capture(fixture, memory);
-	Check(capture.targets.size() == Diagnostics::MaxTargets && capture.target_limit_reached,
+	Check(capture.targets.size() == Diagnostics::MaxTargets && capture.target_limit_reached &&
+	          capture.target_budget_exhausted &&
+	          capture.target_bytes_reserved == Diagnostics::MaxAggregateTargetBytes &&
+	          capture.target_read_bytes_requested == 2u * Diagnostics::ReadChunkBytes * Diagnostics::MaxTargets,
 	      "distinct target count was not capped or truncation was hidden");
+	Check(std::all_of(capture.targets.begin(), capture.targets.end(), [](const auto& target) {
+		      return target.read_failed && !target.prefix_capped;
+	      }), "failed target attempts escaped the target count or reservation budget");
 	const uint64_t excluded_target = 0x100000u + Diagnostics::MaxTargets * 0x10000u;
 	Check(memory.CountReads(excluded_target, Diagnostics::MaxTargetBytes) == 0u,
 	      "target beyond the hard count cap was read");
@@ -536,6 +542,88 @@ void TestDistinctTargetAndCallSiteCaps() {
 	const auto trace = Diagnostics::TraceCallTables(many_calls.program, many_calls.user_data);
 	Check(trace.calls.size() == Diagnostics::MaxCallSites && trace.call_sites_truncated,
 	      "call site scan did not enforce or report its hard cap");
+}
+
+void TestCompleteObservedTableTailAndDuplicateContexts() {
+	Fixture fixture;
+	Memory memory;
+	constexpr uint32_t records = 10500u;
+	constexpr size_t table_bytes = 168000u;
+	constexpr uint64_t table_base = 0x8000000u;
+	constexpr uint64_t first_target = 0x133add0e00ull;
+	constexpr uint64_t tail_target = 0x133bcd2c00ull;
+	constexpr uint64_t last_target = 0x133bcd3500ull;
+	std::vector<uint32_t> table;
+	table.reserve(table_bytes / sizeof(uint32_t));
+	for (uint32_t record = 0u; record < records; ++record) {
+		const uint64_t target = record == 4096u ? tail_target
+		                        : record == records - 1u ? last_target : first_target;
+		AppendRecord(table, target, 0x50000000u + record * 16u, 0x10u);
+	}
+	// Auxiliary words are data, and must never be masked or interpreted as code pointers.
+	table[4096u * 4u + 2u] = 0x77778888u;
+	table[4096u * 4u + 3u] = 0x12u;
+	table[(records - 1u) * 4u + 2u] = 0xfedcba98u;
+	table[(records - 1u) * 4u + 3u] = 0x76543210u;
+	memory.Add(fixture.DescriptorAddress(), Descriptor(table_base, 16u, records));
+	memory.Add(table_base, table);
+	for (const auto target: {first_target, tail_target, last_target}) {
+		memory.Add(target, std::vector<uint32_t>(Diagnostics::ReadChunkBytes / sizeof(uint32_t), 0xbf810000u));
+	}
+	const auto capture = Capture(fixture, memory);
+	Check(capture.tables.size() == 1u && capture.tables.front().table_size == table_bytes &&
+	          capture.tables.front().words == table && !capture.tables.front().table_truncated &&
+	          !capture.tables.front().read_failed && !capture.table_budget_exhausted &&
+	          capture.table_bytes_reserved == table_bytes && capture.table_read_bytes_requested == table_bytes,
+	      "observed-size table or its tail was truncated despite sufficient bounded budget");
+	Check(capture.targets.size() == 3u && capture.duplicate_targets == records - 3u &&
+	          !capture.target_limit_reached && !capture.target_budget_exhausted &&
+	          capture.target_bytes_reserved == 3u * Diagnostics::MaxTargetBytes,
+	      "duplicate code targets consumed capture slots or erased unique table-tail targets");
+	Check(capture.targets[1].raw_address == tail_target && capture.targets[1].record_index == 4096u &&
+	          capture.targets[1].auxiliary_words == std::array<uint32_t, 2>{0x77778888u, 0x12u} &&
+	          capture.targets[2].raw_address == last_target && capture.targets[2].record_index == records - 1u &&
+	          capture.targets[2].auxiliary_words == std::array<uint32_t, 2>{0xfedcba98u, 0x76543210u},
+	      "unique tail target provenance or raw auxiliary words changed");
+	for (const auto& request: memory.requests) {
+		Check(request.address != 0x1277778888ull && request.address < 0x1000000000000ull,
+		      "capture dereferenced auxiliary context words or an invalid address");
+	}
+}
+
+void TestAggregateTargetReadBudget() {
+	Fixture fixture;
+	Memory memory;
+	constexpr uint64_t table_base = 0x8000000u;
+	constexpr uint64_t target_base = 0x10000000u;
+	std::vector<uint32_t> table;
+	for (size_t index = 0u; index <= Diagnostics::MaxTargets; ++index) {
+		AppendRecord(table, target_base + index * Diagnostics::MaxTargetBytes);
+	}
+	memory.Add(fixture.DescriptorAddress(), Descriptor(table_base, 16u, Diagnostics::MaxTargets + 1u));
+	memory.Add(table_base, table);
+	memory.Add(target_base, std::vector<uint32_t>(Diagnostics::MaxAggregateTargetBytes / sizeof(uint32_t),
+	                                             0x12345678u));
+	const auto capture = Capture(fixture, memory);
+	Check(capture.targets.size() == Diagnostics::MaxTargets && capture.target_limit_reached &&
+	          capture.target_budget_exhausted &&
+	          capture.target_bytes_reserved == Diagnostics::MaxAggregateTargetBytes &&
+	          capture.target_read_bytes_requested == Diagnostics::MaxAggregateTargetBytes,
+	      "successful target prefixes exceeded or failed to report aggregate read budget");
+	Check(std::all_of(capture.targets.begin(), capture.targets.end(), [](const auto& target) {
+		      return !target.read_failed && target.prefix_capped &&
+		             target.words.size() * sizeof(uint32_t) == Diagnostics::MaxTargetBytes;
+	      }), "per-target prefixes did not obey their individual cap within the aggregate budget");
+	size_t requested_target_bytes = 0u;
+	for (const auto& request: memory.requests) {
+		if (request.address >= target_base && request.address - target_base < Diagnostics::MaxAggregateTargetBytes) {
+			requested_target_bytes += request.bytes;
+		}
+	}
+	Check(requested_target_bytes == Diagnostics::MaxAggregateTargetBytes &&
+	          memory.CountReads(target_base + Diagnostics::MaxAggregateTargetBytes,
+	                            Diagnostics::MaxTargetBytes) == 0u,
+	      "callback requests escaped aggregate target bounds");
 }
 
 void TestCapturedCallerFromFile(const char* path) {
@@ -587,6 +675,8 @@ int main(int argc, char** argv) {
 		TestTableAndTargetHardCaps();
 		TestPartialTableAndAggregateBudget();
 		TestDistinctTargetAndCallSiteCaps();
+		TestCompleteObservedTableTailAndDuplicateContexts();
+		TestAggregateTargetReadBudget();
 		if (argc == 3) TestCapturedCallerFromFile(argv[2]);
 		std::puts("ShaderCallCaptureTests: all cases passed");
 		return 0;
