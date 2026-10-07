@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/ShaderCallDiagnostics.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
@@ -26,6 +27,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -145,6 +147,123 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	file.Write(code.data(), code.size_bytes());
+}
+
+bool WriteCallCaptureFile(const std::filesystem::path& path, const void* data, size_t bytes) {
+	std::ofstream file(path, std::ios::binary | std::ios::trunc);
+	if (!file) return false;
+	file.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+	file.close();
+	return static_cast<bool>(file);
+}
+
+void DumpShaderCallInputs(const char* stage_name,
+                          const ShaderRecompiler::CompileOptions& options,
+                          std::span<const uint32_t> code) {
+	// Other stages can have fused/front-only code spans with different decoding rules.
+	if (!Config::GraphicsDebugDumpEnabled() || options.stage != ShaderType::Compute) return;
+	const auto could_call = [](uint32_t word) {
+		return ((word >> 23u) & 0x1ffu) == 0x17du && ((word >> 8u) & 0xffu) == 0x21u &&
+		       ((word >> 16u) & 0x7fu) != 125u;
+	};
+	if (!std::ranges::any_of(code, could_call)) return;
+	ShaderRecompiler::Decoder::Program decoded;
+	ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+	const auto capture = ShaderRecompiler::Diagnostics::CaptureCallTables(
+	    true, decoded, options.user_data, ReadShaderGuestMemory, nullptr, options.user_data_base);
+	if (capture.tables.empty()) return;
+
+	static std::atomic_uint64_t id = 0;
+	std::filesystem::path folder;
+	std::error_code error;
+	do {
+		folder = Config::GetShaderLogFolder() / "external_calls" /
+		         fmt::format("{:04d}_{}_{:016x}", id++, stage_name, options.shader_hash);
+	} while (std::filesystem::exists(folder, error) && !error);
+	if (error) {
+		PipelineCacheLog("External-call diagnostic directory query failed: {}", error.message());
+		return;
+	}
+	std::filesystem::create_directories(folder, error);
+	if (error) {
+		PipelineCacheLog("External-call diagnostic directory creation failed: {}", error.message());
+		return;
+	}
+	std::string manifest = fmt::format(
+	    "External shader-call diagnostic capture\n"
+	    "stage={} caller_hash=0x{:016x} caller_span_bytes={} decoded_instructions={}\n"
+	    "runtime_scope=compute_only; other stages were not examined\n"
+	    "selection=unknown; all records are candidates, no function was executed\n"
+	    "prefixes are raw mapped-memory snapshots, not proven function boundaries\n"
+	    "limits: call_sites=64 aggregate_table_bytes=65536 targets=64 target_prefix_bytes=65536 "
+	    "read_chunk_bytes=4096\n"
+	    "descriptor_read_requests={} descriptor_requested_bytes={} "
+	    "table_bytes_reserved={} table_read_bytes_requested={} target_read_bytes_requested={}\n"
+	    "call_sites_truncated={} table_budget_exhausted={} target_limit_reached={}\n"
+	    "zero_targets={} misaligned_targets={} outside_48bit_targets={} duplicate_targets={}\n"
+	    "Raw table files preserve every captured 64-bit target and both auxiliary DWORDs, "
+	    "including excluded or repeated targets.\n\n",
+	    stage_name, options.shader_hash, code.size_bytes(), decoded.instructions.size(),
+	    capture.descriptor_read_requests, capture.descriptor_read_requests * 16u,
+	    capture.table_bytes_reserved, capture.table_read_bytes_requested,
+	    capture.target_read_bytes_requested, capture.call_sites_truncated,
+	    capture.table_budget_exhausted, capture.target_limit_reached, capture.zero_targets,
+	    capture.misaligned_targets, capture.outside_address_space_targets, capture.duplicate_targets);
+	for (size_t i = 0; i < capture.tables.size(); ++i) {
+		const auto& table = capture.tables[i];
+		const auto& trace = table.trace;
+		std::string table_file = "none";
+		if (!table.words.empty()) {
+			table_file = fmt::format("table_{:02d}.bin", i);
+			if (!WriteCallCaptureFile(folder / table_file, table.words.data(),
+			                          table.words.size() * sizeof(uint32_t))) {
+				table_file += " (write failed)";
+			}
+		}
+		manifest += fmt::format(
+		    "call[{}]: pc=0x{:08x} raw=0x{:08x} target_encoded_pair={} return_encoded_pair={} "
+		    "aliased={}\n"
+		    "  record_load_pc=0x{:08x} record_offset={} descriptor_load_pc=0x{:08x}\n"
+		    "  user_sgpr_pair={} user_words=[0x{:08x},0x{:08x}] descriptor_offset={} "
+		    "descriptor_address=0x{:016x}\n"
+		    "  status={} rejection={} descriptor_read={} "
+		    "descriptor_words=[0x{:08x},0x{:08x},0x{:08x},0x{:08x}]\n"
+		    "  aligned_table_base=0x{:016x} declared_table_bytes={} captured_bytes={} "
+		    "truncated={} read_failed={} file={}\n",
+		    i, trace.call_pc, trace.raw_call, trace.target_sgpr, trace.return_sgpr,
+		    trace.target_sgpr == trace.return_sgpr, trace.record_load_pc, trace.record_offset,
+		    trace.descriptor_load_pc, trace.descriptor_user_sgpr, trace.user_words[0],
+		    trace.user_words[1], trace.descriptor_offset, trace.descriptor_address,
+		    table.status, trace.rejection.empty() ? "none" : trace.rejection,
+		    table.descriptor_read, table.descriptor[0], table.descriptor[1], table.descriptor[2],
+		    table.descriptor[3], table.table_base, table.table_size,
+		    table.words.size() * sizeof(uint32_t), table.table_truncated, table.read_failed, table_file);
+	}
+	for (size_t i = 0; i < capture.targets.size(); ++i) {
+		const auto& target = capture.targets[i];
+		std::string target_file = "none";
+		if (!target.words.empty()) {
+			target_file = fmt::format("target_{:02d}_{:016x}.bin", i, target.raw_address);
+			if (!WriteCallCaptureFile(folder / target_file, target.words.data(),
+			                          target.words.size() * sizeof(uint32_t))) {
+				target_file += " (write failed)";
+			}
+		}
+		manifest += fmt::format(
+		    "target[{}]: raw_address=0x{:016x} table={} record={} "
+		    "aux=[0x{:08x},0x{:08x}] captured_bytes={} read_failed={} prefix_capped={} "
+		    "status={} file={} selected=unknown\n",
+		    i, target.raw_address, target.table_index, target.record_index, target.auxiliary_words[0],
+		    target.auxiliary_words[1], target.words.size() * sizeof(uint32_t), target.read_failed,
+		    target.prefix_capped, target.status, target_file);
+	}
+	const auto path = folder / "manifest.txt";
+	if (!WriteCallCaptureFile(path, manifest.data(), manifest.size())) {
+		PipelineCacheLog("External-call diagnostic manifest write failed: {}", Common::PathToString(path));
+		return;
+	}
+	PipelineCacheLog("External-call diagnostic capture (selected function unknown): {}",
+	                 Common::PathToString(path));
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
@@ -368,6 +487,7 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		DumpShaderCallInputs(stage_name, options, params.code);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,

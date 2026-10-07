@@ -467,6 +467,16 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_materialization_tests fmt::fmt)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
+file(GLOB shader_call_capture_decoder_sources CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/*.cpp")
+add_executable(shader_call_capture_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderCallCaptureTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ShaderCallDiagnostics.cpp"
+	${shader_call_capture_decoder_sources}
+)
+target_link_libraries(shader_call_capture_tests fmt::fmt)
+target_include_directories(shader_call_capture_tests PRIVATE ${inc_headers})
+
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
@@ -591,7 +601,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests)
+			virtual_memory_allocation_tests shader_call_capture_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 endif()
@@ -620,6 +630,7 @@ if(BUILD_TESTING)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME shader_call_capture COMMAND $<TARGET_FILE:shader_call_capture_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
@@ -697,6 +708,7 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
+		shader_call_capture_tests
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
