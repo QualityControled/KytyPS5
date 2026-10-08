@@ -19,6 +19,7 @@
 #include "graphics/shader/recompiler/ExternalLibrary.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/SrtReadCapture.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -37,6 +38,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -208,7 +210,8 @@ bool WriteCallCaptureFile(const std::filesystem::path& path, const void* data, s
 
 bool DumpShaderCallInputs(const char* stage_name,
                           const ShaderRecompiler::CompileOptions& options,
-                          std::span<const uint32_t> code) {
+                          std::span<const uint32_t> code,
+                          std::filesystem::path* output_folder = nullptr) {
 	// Other stages can have fused/front-only code spans with different decoding rules.
 	if (!Config::GraphicsDebugDumpEnabled() || options.stage != ShaderType::Compute) return false;
 	const auto could_call = [](uint32_t word) {
@@ -240,6 +243,7 @@ bool DumpShaderCallInputs(const char* stage_name,
 		PipelineCacheLog("External-call diagnostic directory creation failed: {}", error.message());
 		return false;
 	}
+	if (output_folder != nullptr) *output_folder = folder;
 	std::string manifest = fmt::format(
 	    "External shader-call diagnostic capture\n"
 	    "stage={} caller_hash=0x{:016x} caller_span_bytes={} decoded_instructions={}\n"
@@ -374,6 +378,156 @@ bool DumpShaderCallInputs(const char* stage_name,
 	                 Common::PathToString(path));
 	return files_written;
 }
+
+bool ExternalResourceReadCaptureRequested() {
+	const auto* value = std::getenv("KYTY_CAPTURE_EXTERNAL_RESOURCE_READS");
+	if (value == nullptr) return false;
+	if (std::strcmp(value, "1") != 0 || !ExternalProbeRequested() ||
+	    !Config::GraphicsDebugDumpEnabled()) {
+		EXIT("KYTY_CAPTURE_EXTERNAL_RESOURCE_READS requires value 1, the external-call "
+		     "probe and graphics debug dumping\n");
+	}
+	return true;
+}
+
+// Canonical topology is retained separately from the bucket hash. Prefix words
+// are retained in the exact dependency files, not reread from guest memory.
+std::vector<uint64_t> ResourceCaptureLibraryTopology(
+    const ShaderRecompiler::ExternalLibraryPlan& library) {
+	std::vector<uint64_t> words {1, library.complete, library.caller_address,
+	                           library.functions.size(), library.call_sites.size(),
+	                           library.dependencies.size()};
+	for (const auto& function: library.functions) {
+		words.insert(words.end(), {function.function_id, function.guest_address,
+		                          function.code_prefix.size()});
+	}
+	for (const auto& site: library.call_sites) {
+		words.insert(words.end(), {site.caller_pc, site.target_sgpr, site.return_sgpr,
+		    site.context_domain, site.record_load_pc, site.record_sgpr, site.auxiliary_sgpr,
+		    site.descriptor_user_sgpr, static_cast<uint64_t>(static_cast<int64_t>(site.descriptor_offset)),
+		    site.descriptor_address, site.table_base, site.table_bytes,
+		    site.candidate_addresses.size(), site.records.size(), site.context_records.size()});
+		words.insert(words.end(), site.candidate_addresses.begin(), site.candidate_addresses.end());
+		for (const auto& record: site.records) {
+			words.insert(words.end(), {record.ordinal, record.function_id,
+			                          record.function_address, record.auxiliary_address});
+		}
+		for (const auto& context: site.context_records) {
+			words.insert(words.end(), {context.ordinal, context.function_id});
+			words.insert(words.end(), context.words.begin(), context.words.end());
+		}
+	}
+	for (const auto& dependency: library.dependencies) {
+		words.insert(words.end(), {dependency.address, dependency.words.size()});
+	}
+	return words;
+}
+
+bool DumpResourceReadCapture(const std::filesystem::path& input_folder,
+                             const ShaderRecompiler::IR::SrtReadCapture& capture,
+                             const ShaderRecompiler::ExternalLibraryPlan& library,
+                             std::span<const uint32_t> caller_code,
+                             bool input_files_written, bool materialization_succeeded) {
+	using Capture = ShaderRecompiler::IR::SrtReadCapture;
+	const auto folder = input_folder / "resource_reads";
+	std::error_code error;
+	if (input_folder.empty() || !std::filesystem::create_directory(folder, error) || error) {
+		PipelineCacheLog("Resource-read capture directory unavailable: {}", error.message());
+		return false;
+	}
+	const std::string attempt = "schema=1 complete=false state=writing\n"
+	                            "scope=existing_host_materialization_reads_only\n"
+	                            "guest_memory_atomicity_proven=false native_pc=unknown\n";
+	if (!WriteCallCaptureFile(folder / "manifest.txt", attempt.data(), attempt.size())) return false;
+	const auto& identity = capture.Identity();
+	const auto& counters = capture.Counters();
+	const auto& limits = capture.Limits();
+	const auto& failure = capture.Failure();
+	bool files_written = input_files_written;
+	const auto write = [&](const char* name, const void* data, size_t bytes) {
+		const bool written = WriteCallCaptureFile(folder / name, data, bytes);
+		files_written &= written;
+		return written;
+	};
+	write("actual-caller.bin", caller_code.data(), caller_code.size_bytes());
+	write("user-data.bin", identity.user_data.data(), identity.user_data.size() * sizeof(uint32_t));
+	write("control-words.bin", identity.control_words.data(), identity.control_words.size() * sizeof(uint32_t));
+	const auto topology = ResourceCaptureLibraryTopology(library);
+	write("library-topology-u64le.bin", topology.data(), topology.size() * sizeof(uint64_t));
+	std::string dependency_index;
+	for (size_t i = 0; i < library.dependencies.size(); ++i) {
+		const auto& dependency = library.dependencies[i];
+		const auto name = fmt::format("library-dependency-{:04d}.bin", i);
+		const bool written = write(name.c_str(), dependency.words.data(), dependency.words.size() * sizeof(uint32_t));
+		dependency_index += fmt::format("dependency[{}]: address=0x{:016x} bytes={} file={} written={}\n",
+		    i, dependency.address, dependency.words.size() * sizeof(uint32_t), name, written);
+	}
+	// Explicit packed records avoid structure padding: address low/high then raw DWORD.
+	std::vector<uint32_t> packed_words;
+	packed_words.reserve(capture.Words().size() * 3u);
+	for (const auto& [address, word]: capture.Words()) {
+		packed_words.insert(packed_words.end(), {static_cast<uint32_t>(address),
+		    static_cast<uint32_t>(address >> 32u), word});
+	}
+	write("observed-words-u32le.bin", packed_words.data(), packed_words.size() * sizeof(uint32_t));
+	std::string observations;
+	for (size_t i = 0; i < capture.Observations().size(); ++i) {
+		const auto& observation = capture.Observations()[i];
+		observations += fmt::format("read[{}]: kind={} address=0x{:016x} bytes={} succeeded={} "
+		    "specialization={} context_present={} native_pc={}", i,
+		    static_cast<uint32_t>(observation.kind), observation.address, observation.requested_bytes,
+		    observation.succeeded, observation.specialization_read, observation.context.has_value(),
+		    observation.native_pc ? fmt::format("0x{:08x}", *observation.native_pc) : "unknown");
+		if (observation.context) {
+			const auto& context = *observation.context;
+			observations += fmt::format(" domain={} function={} ordinal={} words={:08x},{:08x},{:08x},{:08x}",
+			    context.domain_id, context.function_id, context.record_ordinal, context.record_words[0],
+			    context.record_words[1], context.record_words[2], context.record_words[3]);
+		}
+		observations += '\n';
+	}
+	write("observations.txt", observations.data(), observations.size());
+	const bool complete = materialization_succeeded && capture.Complete() && library.complete && files_written;
+	std::string manifest = fmt::format(
+	    "schema=1 complete={} collector_complete={} finalized={} status={}\n"
+	    "scope=existing_host_materialization_reads_only guest_memory_atomicity_proven=false native_pc_encoding=optional_relative_caller_pc\n"
+	    "stage={} shader_hash=0x{:016x} shader_base=0x{:016x} pass_id={} user_data_base={}\n"
+	    "caller_identity={} library_identity={} input_identity={}\n"
+	    "control_schema={}\n"
+	    "materialization_succeeded={} input_files_written={} payload_files_written={} library_complete={} dependency_bucket_hash=0x{:016x}\n"
+	    "library_functions={} library_call_sites={} library_dependencies={} topology_u64_words={}\n"
+	    "word_record_schema=u32le_address_low,address_high,word word_records={}\n"
+	    "hooks={} accepted_observations={} ignored_after_invalidation={} observed_bytes={} unique_words={}\n"
+	    "limit_unique_bytes={} limit_observation_bytes={} limit_observations={}\n"
+	    "failure_address=0x{:016x} failure_bytes={} previous_word=0x{:08x} conflicting_word=0x{:08x} failure_native_pc={} failure_context_present={}\n",
+	    complete, capture.Complete(), capture.Finalized(), Capture::StatusName(capture.Status()),
+	    static_cast<uint32_t>(identity.stage), identity.shader_hash, identity.shader_base, identity.pass_id,
+	    identity.user_data_base, identity.caller_identity, identity.library_identity, identity.input_identity,
+	    identity.control_schema, materialization_succeeded, input_files_written, files_written, library.complete, library.dependency_hash,
+	    library.functions.size(), library.call_sites.size(), library.dependencies.size(), topology.size(),
+	    capture.Words().size(), counters.hooks, counters.accepted_observations,
+	    counters.ignored_after_invalidation, counters.observed_bytes, counters.unique_words,
+	    limits.unique_bytes, limits.observation_bytes, limits.observations, failure.address,
+	    failure.requested_bytes, failure.previous_word, failure.conflicting_word,
+	    failure.native_pc ? fmt::format("0x{:08x}", *failure.native_pc) : "unknown", failure.context.has_value());
+	if (failure.context) {
+		const auto& context = *failure.context;
+		manifest += fmt::format("failure_context: domain={} function={} ordinal={} words={:08x},{:08x},{:08x},{:08x}\n",
+		    context.domain_id, context.function_id, context.record_ordinal, context.record_words[0],
+		    context.record_words[1], context.record_words[2], context.record_words[3]);
+	}
+	manifest += dependency_index;
+	// A partial final write cannot publish a leading complete=true. On either
+	// failure the initial incomplete manifest remains the only published status.
+	const auto final_temporary = folder / "manifest-final.tmp";
+	if (!WriteCallCaptureFile(final_temporary, manifest.data(), manifest.size()) ||
+	    !Common::AtomicReplaceFile(final_temporary, folder / "manifest.txt")) return false;
+	PipelineCacheLog("Resource-read diagnostic capture: complete={} status={} words={} observations={} folder={}",
+	    complete, Capture::StatusName(capture.Status()), capture.Words().size(),
+	    capture.Observations().size(), Common::PathToString(folder));
+	return files_written;
+}
+
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
                          const std::vector<uint32_t>& spirv, bool required = false) {
@@ -627,6 +781,7 @@ struct PipelineCache::ProgramCache {
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		const bool requested_bvh_probe = ExternalBvhProbeRequested();
+		const bool requested_resource_capture = ExternalResourceReadCaptureRequested();
 		const auto requested_checked_vgpr = ExternalUnwrittenVgprRequested();
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -691,13 +846,75 @@ struct PipelineCache::ProgramCache {
 		        .total_resources = limits.maxPerStageResources,
 		    },
 		};
+		std::optional<ShaderRecompiler::IR::SrtReadCapture> resource_capture;
+		std::filesystem::path resource_input_folder;
+		bool resource_input_files_written = false;
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
+			if (requested_resource_capture && lookup_key.external_library) {
+				// All observed reads retain their original callbacks and synchronization.
+				// This collector is invocation-local and is never retained by a cached plan.
+				ShaderStageInputInfo capture_input {};
+				capture_input.compute = &input_info;
+				ShaderRecompiler::CompileOptions capture_options;
+				capture_options.stage = stage;
+				capture_options.shader_hash = params.hash;
+				capture_options.user_data = user_data;
+				capture_options.wave_size = input_info.wave_size;
+				capture_options.input_info = capture_input;
+				capture_options.external_library = lookup_key.external_library.get();
+				resource_input_files_written = DumpShaderCallInputs("cs", capture_options,
+				    params.code, &resource_input_folder);
+				static std::atomic_uint64_t next_capture_pass {1};
+				ShaderRecompiler::IR::SrtReadCaptureIdentity identity;
+				identity.stage = stage;
+				identity.shader_hash = params.hash;
+				identity.shader_base = params.Base();
+				identity.pass_id = next_capture_pass++;
+				identity.user_data.assign(user_data.begin(), user_data.end());
+				identity.control_schema = "compute_v1:wave,host_subgroup,threads_xyz,dispatch_threads_xyz,"
+				    "workgroup_counts_xyz,group_id_xyz,thread_ids,workgroup_register,tg_size_en,"
+				    "dispatch_dimensions,lds_storage,lds_dwords,scratch_dwords,float_mode,"
+				    "external_probe,before_bvh,checked_vgpr,descriptor_limits_5";
+				identity.control_words = {input_info.wave_size, input_info.host_subgroup_size,
+				    input_info.threads_num[0], input_info.threads_num[1], input_info.threads_num[2],
+				    input_info.dispatch_threads_num[0], input_info.dispatch_threads_num[1], input_info.dispatch_threads_num[2],
+				    input_info.workgroup_counts[0], input_info.workgroup_counts[1], input_info.workgroup_counts[2],
+				    input_info.group_id[0], input_info.group_id[1], input_info.group_id[2],
+				    static_cast<uint32_t>(input_info.thread_ids_num),
+				    static_cast<uint32_t>(input_info.workgroup_register), input_info.tg_size_en,
+				    input_info.dispatch_thread_dimensions, static_cast<uint32_t>(input_info.lds_storage),
+				    input_info.lds_size_dwords, input_info.scratch_size_dwords, input_info.float_mode,
+				    lookup_key.external_call_probe, lookup_key.external_probe_before_bvh,
+				    lookup_key.external_unwritten_vgpr, runtime.descriptor_limits.sampled_images,
+				    runtime.descriptor_limits.storage_images, runtime.descriptor_limits.samplers,
+				    runtime.descriptor_limits.storage_buffers, runtime.descriptor_limits.total_resources};
+				identity.caller_identity = "actual-caller.bin";
+				identity.library_identity = "library-topology-u64le.bin+exact_dependency_files";
+				identity.input_identity = Common::PathToString(resource_input_folder);
+				resource_capture.emplace(std::move(identity));
+				runtime.post_read_observer = ShaderRecompiler::IR::SrtReadCapture::Observe;
+				runtime.post_read_userdata = &*resource_capture;
+				PipelineCacheLog("External resource-read capture begin hash=0x{:016x}; stops after "
+				    "materialization before shader compilation", params.hash);
+			}
 		}
+		const auto materialize = [&](const auto& plan, auto& resources, auto& specialization) {
+			const bool succeeded = ShaderRecompiler::IR::MaterializeResources(plan, runtime,
+			    resources, specialization);
+			if (resource_capture) {
+				resource_capture->Finalize(succeeded);
+				const bool saved = DumpResourceReadCapture(resource_input_folder, *resource_capture,
+				    *lookup_key.external_library, params.code, resource_input_files_written, succeeded);
+				EXIT("External resource-read diagnostic stop: materialized=%d capture_complete=%d "
+				     "files_written=%d; stopped before external shader compilation or GPU execution\n",
+				     succeeded, resource_capture->Complete(), saved);
+			}
+			return succeeded;
+		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			EXIT_IF(!materialize(entry->second.resource_plan, entry->second.resources,
+			                     entry->second.specialization));
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -759,7 +976,7 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
-		DumpShaderCallInputs(stage_name, options, params.code);
+		if (!resource_capture) DumpShaderCallInputs(stage_name, options, params.code);
 		if (options.external_library != nullptr) {
 			std::printf("External shader phase begin hash=0x%016" PRIx64 " translate\n",
 			            options.shader_hash);
@@ -779,9 +996,8 @@ struct PipelineCache::ProgramCache {
 			}
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			EXIT_IF(!materialize(entry->second.resource_plan, entry->second.resources,
+			                     entry->second.specialization));
 			if (options.external_library != nullptr) {
 				const auto& resources = entry->second.resources;
 				std::printf("External shader phase end hash=0x%016" PRIx64

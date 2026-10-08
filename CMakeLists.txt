@@ -467,6 +467,22 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_materialization_tests fmt::fmt)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
+add_executable(srt_read_capture_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SrtReadCaptureTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Block.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Program.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Type.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/Value.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtReadCapture.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+)
+target_link_libraries(srt_read_capture_tests fmt::fmt)
+target_include_directories(srt_read_capture_tests PRIVATE ${inc_headers})
+
 file(GLOB shader_call_capture_decoder_sources CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/frontend/decode/*.cpp")
 add_executable(shader_call_capture_tests EXCLUDE_FROM_ALL
@@ -698,6 +714,7 @@ if(BUILD_TESTING)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME srt_read_capture COMMAND $<TARGET_FILE:srt_read_capture_tests>)
 	add_test(NAME shader_call_capture COMMAND $<TARGET_FILE:shader_call_capture_tests>)
 	add_test(NAME bvh_node_capture COMMAND $<TARGET_FILE:bvh_node_capture_tests>)
 	add_test(NAME bda_resident_capture COMMAND $<TARGET_FILE:bda_resident_capture_tests>)
@@ -790,6 +807,7 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
+		srt_read_capture_tests
 		shader_call_capture_tests
 		bvh_node_capture_tests
 		bda_resident_capture_tests

@@ -12,6 +12,7 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
+	runtime.post_read_clean = true;
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
@@ -565,14 +566,32 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	}
 	uint32_t word = 0;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
+	const auto observe = [&](bool succeeded) {
+		if (m_runtime.post_read_observer == nullptr) return;
+		std::optional<SrtReadContext> context;
+		if (m_external_context && m_external_context->record != nullptr) {
+			const auto& record = *m_external_context->record;
+			context = SrtReadContext {m_external_context->domain_id, record.function_id,
+			                         record.ordinal, record.words};
+		}
+		const auto kind = vector ? SrtReadKind::VectorBuffer
+		                         : inst.GetOpcode() == ValueOpcode::ReadConstBuffer
+		                               ? SrtReadKind::ScalarBuffer : SrtReadKind::Scalar;
+		const auto caller_pc = m_program.info.uses_external_call_probe && !m_external_context && flags.pc != 0u
+		                           ? std::optional<uint32_t> {flags.pc} : std::optional<uint32_t> {};
+		ObserveSrtRead(m_runtime, kind, address, sizeof(word), {&word, 1}, succeeded,
+		               context, vector || m_runtime.post_read_clean, caller_pc);
+	};
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
+			observe(false);
 			return false;
 		}
 	} else {
 		if (vector) return false;
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
+	observe(true);
 	result = word;
 	return true;
 }

@@ -38,6 +38,33 @@ struct DescriptorBindingLimits {
 	uint32_t total_resources = UINT32_MAX;
 };
 
+// Diagnostic observations are made only after an existing read. Failure events
+// carry a byte count but no potentially uninitialized returned words.
+enum class SrtReadKind : uint8_t { Scalar, ScalarBuffer, VectorBuffer, ScalarTable };
+
+struct SrtReadContext {
+	uint32_t domain_id = 0;
+	uint32_t function_id = 0;
+	uint32_t record_ordinal = 0;
+	std::array<uint32_t, 4> record_words {};
+	bool operator==(const SrtReadContext&) const = default;
+};
+
+struct SrtReadObservation {
+	SrtReadKind kind = SrtReadKind::Scalar;
+	uint64_t address = 0;
+	uint64_t requested_bytes = 0;
+	bool succeeded = false;
+	bool specialization_read = false;
+	std::span<const uint32_t> words;
+	std::optional<SrtReadContext> context;
+	// Relative caller PC only for a caller-only probe and a nonzero explicit
+	// MemoryFlags.pc. Other/zero/synthetic relocated locations remain unknown.
+	std::optional<uint32_t> native_pc;
+};
+
+using SrtPostReadObserver = void (*)(void*, const SrtReadObservation&);
+
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
@@ -47,7 +74,23 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 	std::span<const ExternalCallContextDomain> external_context_domains;
 	DescriptorBindingLimits                    descriptor_limits;
+	// Independent from reader userdata so nested read wrappers preserve the observer.
+	SrtPostReadObserver                         post_read_observer = nullptr;
+	void*                                      post_read_userdata = nullptr;
+	bool                                       post_read_clean = false;
 };
+
+inline void ObserveSrtRead(const SrtRuntime& runtime, SrtReadKind kind, uint64_t address,
+                           uint64_t requested_bytes, std::span<const uint32_t> words,
+                           bool succeeded, std::optional<SrtReadContext> context = {},
+                           bool specialization_read = false,
+                           std::optional<uint32_t> native_pc = {}) {
+	if (runtime.post_read_observer == nullptr) return;
+	runtime.post_read_observer(runtime.post_read_userdata,
+	    {kind, address, requested_bytes, succeeded, specialization_read,
+	     succeeded ? words : std::span<const uint32_t> {},
+	     context, native_pc});
+}
 
 enum class RuntimeValueType { Any, Integer };
 

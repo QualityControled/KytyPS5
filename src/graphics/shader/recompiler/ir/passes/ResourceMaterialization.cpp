@@ -256,9 +256,12 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t dynamic_offset,
 	}
 	const auto address = base + offset;
 	const auto prefix = words.first(count);
-	return prefix.size_bytes() - 1u <= AddressMask - address &&
-	       runtime.read_specialization_memory != nullptr &&
-	       runtime.read_specialization_memory(runtime.userdata, address, prefix);
+	if (prefix.size_bytes() - 1u > AddressMask - address ||
+	    runtime.read_specialization_memory == nullptr) return false;
+	const bool succeeded = runtime.read_specialization_memory(runtime.userdata, address, prefix);
+	ObserveSrtRead(runtime, SrtReadKind::ScalarTable, address, prefix.size_bytes(), prefix,
+	               succeeded, {}, true);
+	return succeeded;
 }
 
 bool NormalizeIndirectStoreBuffer(DescriptorValue& value) {
