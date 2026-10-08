@@ -1701,6 +1701,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	}
 
 	auto& memory_info = program.memory_info;
+	// DCE can leave native image metadata without an executable consumer. Only
+	// surviving image operations have had their raw resource IDs tracked.
+	std::vector<bool> active_image_memory(memory_info.size(), false);
 	const ImageRemap image_remap(specialization);
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
@@ -1758,6 +1761,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 			const auto index = inst.Flags<MemoryFlags>().index;
 			EXIT_IF(index >= memory_info.size());
+			active_image_memory[index] = true;
 			auto& memory = memory_info[index];
 			EXIT_IF(memory.resource >= images.size());
 			const auto& image = images[memory.resource];
@@ -1798,8 +1802,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 		}
 	}
-	for (auto& memory: memory_info) {
-		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
+	for (size_t index = 0; index < memory_info.size(); ++index) {
+		auto& memory = memory_info[index];
+		if (active_image_memory[index] && memory.kind == ResourceKind::Image &&
+		    !memory.planning_only) {
 			memory.resource = image_remap[memory.resource];
 		}
 	}

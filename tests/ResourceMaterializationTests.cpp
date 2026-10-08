@@ -963,6 +963,80 @@ void TestExternalBindingAliasesRemainStructural() {
       "integer point-filtering sampler class aliased a float sampler binding");
 }
 
+
+void MakeImageMemoryLivenessFixture(
+    Libs::Graphics::ShaderRecompiler::IR::Program& program,
+    Libs::Graphics::ShaderRecompiler::IR::ResourceSpecialization& specialization,
+    bool active_out_of_range = false) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.resource_tracking_complete = true;
+  program.info.images.resize(2);
+  for (auto& image : program.info.images) {
+    image.resource_class = ImageResourceClass::Sampled;
+    image.dimension = ImageDimension::Dim2D;
+    image.read = true;
+  }
+  specialization.images.resize(2);
+  for (auto& image : specialization.images) {
+    image.numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float;
+    image.dimension = ImageDimension::Dim2D;
+    image.mip_count = 1;
+  }
+  // Removing a leading FMASK entry proves the live remap still occurs exactly.
+  specialization.images[0].fmask = true;
+  MemoryInfo live;
+  live.kind = ResourceKind::Image;
+  live.resource = active_out_of_range ? 7u : 1u;
+  live.image_dimension = ImageDimension::Dim2D;
+  live.data_dwords = 4u;
+  program.memory_info.push_back(live);
+  MemoryInfo dead = live;
+  dead.resource = 7u;
+  program.memory_info.push_back(dead);
+  dead.planning_only = true;
+  program.memory_info.push_back(dead);
+  auto& block = AddValueBlock(program);
+  auto& handle = block.AppendNewInst(ValueOpcode::GetImageResource,
+      {Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u)});
+  handle.SetFlags(1u);
+  auto& coordinates = block.AppendNewInst(ValueOpcode::CompositeConstructU32x4,
+      {Value(0u),Value(0u),Value(0u),Value(0u)});
+  auto& read = block.AppendNewInst(ValueOpcode::ImageRead,
+      {Value(&handle),Value(&coordinates),Value(true)});
+  read.SetFlags(MemoryFlags{.index=0u,.pc=0xb0u});
+}
+
+void TestDeadImageMemoryMetadataDoesNotRemap() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  ResourceSpecialization specialization;
+  MakeImageMemoryLivenessFixture(program,specialization);
+  const auto dead_before=program.memory_info[1];
+  const auto planning_before=program.memory_info[2];
+  ApplyResourceSpecialization(program,specialization);
+  Check(program.info.images.size()==1u && program.memory_info[0].resource==0u,
+        "surviving image metadata lost the leading-FMASK index permutation");
+  Check(program.memory_info[1]==dead_before,
+        "unused image metadata was clamped, assigned a guessed image, or otherwise changed");
+  Check(program.memory_info[2]==planning_before && program.memory_info[2].planning_only,
+        "planning-only metadata semantics changed during executable image remap");
+  Check(program.blocks[0]->Instructions().front().Flags<uint32_t>()==0u,
+        "live GetImageResource handle did not receive the same image permutation");
+}
+
+void TestLiveOutOfRangeImageMemoryStillRejects() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  ResourceSpecialization specialization;
+  MakeImageMemoryLivenessFixture(program,specialization,true);
+  std::puts("Expected strict active image-resource bound rejection");
+  std::fflush(stdout);
+  ApplyResourceSpecialization(program,specialization);
+  Check(false,"out-of-range executable image metadata was ignored or clamped");
+}
+
 } // namespace
 
 namespace Common {
@@ -980,6 +1054,16 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main(int argc, char **argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--dead-image-metadata-only") == 0) {
+    TestDeadImageMemoryMetadataDoesNotRemap();
+    std::puts("ResourceMaterializationTests: dead/planning/live image metadata passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--live-image-metadata-out-of-range-only") == 0) {
+    TestLiveOutOfRangeImageMemoryStillRejects();
+    return 1;
+  }
+
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-operations-only") == 0) {
     TestSupportedIndirectImageOperationsSpecialize();
     return 0;
@@ -999,6 +1083,7 @@ int main(int argc, char **argv) {
   TestExternalContextRejectsIncompleteOrUnprovedReads();
   TestExternalTypedNullImageRetainsKeyDomain();
   TestExternalBindingAliasesRemainStructural();
+  TestDeadImageMemoryMetadataDoesNotRemap();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }
