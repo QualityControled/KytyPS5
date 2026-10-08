@@ -12982,9 +12982,23 @@ void TestRenderTargetReverseExportMapping() {
         "inactive reverse MRT mapping was not normalized out of the shader "
       "cache key");
   sh.target_output_mode[0] = 4;
+  sh.m_cbShaderMask = 0xf;
   PrepareProgram(regs, sh, mappings, compiled_info);
   Check(compiled_info.target_export_mapping[0] == gr32.export_mapping,
       "active reverse MRT mapping was lost before shader specialization");
+  const auto first_slot_key = MakeStageStaticKey(compiled_info);
+  sh.m_cbShaderMask = 0xf000;
+  mappings[3] = gr32.export_mapping;
+  PrepareProgram(regs, sh, mappings, compiled_info);
+  Check(compiled_info.target_shader_mask == sh.m_cbShaderMask &&
+            compiled_info.target_export_mapping[0] == gr32.export_mapping &&
+            first_slot_key != MakeStageStaticKey(compiled_info),
+        "compact MRT ordinal lost its physical export mapping or cache identity");
+  const auto sparse_slot_key = MakeStageStaticKey(compiled_info);
+  sh.m_cbShaderMask = 0x1000;
+  PrepareProgram(regs, sh, mappings, compiled_info);
+  Check(sparse_slot_key == MakeStageStaticKey(compiled_info),
+        "component-only shader mask changes introduced a duplicate shader variant");
 }
 
 void TestBlendMappingClassification() {
@@ -14895,6 +14909,16 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
+  if (argc > 1 && std::string_view(argv[1]).starts_with("--compact-mrt")) {
+    if (argc != 2 || std::string_view(argv[1]) != "--compact-mrt-mapping-only") {
+      std::fputs("CompactMrtMapping: exact CPU mapping flag only; no Vulkan initialized\n", stderr);
+      return 2;
+    }
+    EnsureConfigInitialized();
+    TestRenderTargetReverseExportMapping();
+    std::puts("CompactMrt mapping: official reverse component mapping, shader-mask/static-key and emitted shuffle controls passed; no Vulkan device initialized");
+    return 0;
+  }
   EnsureConfigInitialized();
   if (argc == 2 && std::string_view(argv[1]) == "--spirv-size-only") {
     TestNewShaderRecompilerSpirvSizeBaselines();

@@ -1829,10 +1829,12 @@ std::string StorageUint2DImageBindingName(bool atomic) {
 }
 
 CompiledShader CompileFragmentCase(const GraphicsCase &test,
-                                   ShaderRecompiler::IR::PixelSampleSensitivity *original = nullptr) {
+                                   ShaderRecompiler::IR::PixelSampleSensitivity *original = nullptr,
+                                   u32 target_shader_mask = UINT32_MAX) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
+  pixel_info.target_shader_mask = target_shader_mask;
   pixel_info.input_num =
       test.pixel_interpolator_settings.empty()
           ? 1u
@@ -15984,6 +15986,7 @@ public:
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     registers.SetRenderTargetMask(0xf);
+    registers.SetShaderMask(0xf);
     scheduler.Begin(registers, user_config, shaders);
     auto &resources = context;
     auto &cache = context.GetTextureCache();
@@ -16853,8 +16856,9 @@ public:
         registers.SetColorAttrib2(slot, {.height = side - 1, .width = side - 1});
         registers.SetColorAttrib3(slot,
             {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
-        registers.SetTargetOutputMode(slot, 4);
       }
+      registers.SetTargetOutputMode(0, 4);
+      registers.SetTargetOutputMode(1, 4);
       stencil_target.z_info.htile_acceleration = true;
       stencil_target.htile_data_base_addr = depth_address + 0x30000;
       registers.SetDepthRenderTarget(stencil_target);
@@ -16916,7 +16920,7 @@ public:
       registers.SetDepthShaderControl({});
       registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
                                 .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
-      for (const auto slot : {0u, 3u}) {
+      for (const auto slot : {0u, 1u}) {
         registers.SetTargetOutputMode(slot, 0);
       }
       RenderExecutorTestAccess::DrawAuto(
@@ -16927,36 +16931,47 @@ public:
               std::ranges::all_of(depth_only_pixels, [](u32 v) { return v == 0; }),
               "disabled color exports invoked the stale PS or clipped fixed-function depth");
       registers.SetPsInControl(0x8000);
-      for (const auto slot : {0u, 3u}) {
-        registers.SetTargetOutputMode(slot, 4);
-      }
+      registers.SetTargetOutputMode(0, 4);
 
-      // With MRT0 still bound, an MRT3-only export must retain location3 in
-      // rendering attachments, pipeline formats, blend masks and dynamic write enables.
-      static const auto sparse_pixel = [] {
-        auto code = native_pixel;
-        *std::ranges::find(code, EncodeExp0(0x00, 0xf)) = EncodeExp0(0x03, 0xf);
-        return code;
+      // Export ordinals follow CB_SHADER_MASK. A disabled CB_TARGET_MASK slot
+      // still consumes an ordinal, and stale MRT0 must not clip physical MRT3.
+      static const auto sparse_pixels_code = [] {
+        std::array<std::vector<u32>, 2> result{native_pixel, native_pixel};
+        auto &code = result[1];
+        const auto exp = std::ranges::find(code, EncodeExp0(0, 0xf));
+        *exp = EncodeExp0(0, 0xf, false);
+        *(exp + 1) = EncodeExp1(0, 0, 0, 0);
+        code.insert(exp + 2, {EncodeExp0(1, 0xf), EncodeExp1(1, 1, 1, 2)});
+        return result;
       }();
-      const auto sparse_address = reinterpret_cast<uint64_t>(sparse_pixel.data());
-      ShaderMapUserData(sparse_address,
-          {.type = Prospero::ShaderBinaryType::kPs,
-           .code_size_bytes = static_cast<uint32_t>(sparse_pixel.size() * sizeof(u32))});
-      shaders.SetPsShaderBase(sparse_address);
+      registers.SetRenderTargetMask(0xf000);
       registers.SetDepthControl({});
       registers.SetDepthShaderControl({});
-      RenderExecutorTestAccess::DrawAuto(
-            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
       RenderColorInfo sparse_color{};
-      RenderExecutorTestAccess::ResolveRenderColorTarget(
-          executor, scheduler.Current(), sparse_color, 3);
-      const auto sparse_pixels = ReadCachedTexel(name, context, sparse_color.image_id,
-                                                {}, {extent, extent, 1});
-      for (size_t component = 0; component < sparse_pixels.size(); component++) {
-        const auto expected = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
-        Require(name, "sparse MRT3 output", sparse_pixels[component] == expected,
-                "MRT3 was compacted to a different slot or clipped by unused MRT0");
+      for (uint32_t index = 0; index < sparse_pixels_code.size(); index++) {
+        const auto &code = sparse_pixels_code[index];
+        const auto address = reinterpret_cast<uint64_t>(code.data());
+        ShaderMapUserData(address,
+            {.type = Prospero::ShaderBinaryType::kPs,
+             .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+        shaders.SetPsShaderBase(address);
+        registers.SetShaderMask(index == 0 ? 0xf000 : 0xf00f);
+        registers.SetTargetOutputMode(1, index == 0 ? 0 : 4);
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), sparse_color, 3);
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                            {}, {extent, extent, 1});
+        for (size_t component = 0; component < pixels.size(); component++) {
+          const auto expected = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
+          Require(name, "compact export to sparse MRT3", pixels[component] == expected,
+                  "shader output routing used the write mask or clipped MRT3 with stale MRT0");
+        }
       }
+
 
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
       const ShaderBufferResource rect_buffer{{
@@ -16983,7 +16998,7 @@ public:
         }
         AppendVMovU32(&code, 22, 0);
         AppendVMovLiteral(&code, 23, 0x3f800000u);
-        code.insert(code.end(), {EncodeExp0(0x03, 0xf), EncodeExp1(20, 21, 22, 23)});
+        code.insert(code.end(), {EncodeExp0(0, 0xf), EncodeExp1(20, 21, 22, 23)});
         AppendEnd(&code);
         return code;
       }();
@@ -43848,6 +43863,85 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc > 1 && std::string_view(argv[1]).starts_with("--compact-mrt")) {
+    if (argc != 2 || std::strcmp(argv[1], "--compact-mrt-prepare-only") != 0) {
+      std::fputs("CompactMrt: exact CPU preparation flag only; no Vulkan initialized\n", stderr);
+      return 2;
+    }
+    EnsureConfigInitialized(false);
+    struct MrtCase { const char *name; u32 shader_mask; std::vector<u32> slots; };
+    const std::array<MrtCase, 4> cases{{
+        {"CompactMrtDense0", 0xfu, {0}},
+        {"CompactMrtSparse3", 0xf000u, {3}},
+        {"CompactMrtSparse0And3", 0xf00fu, {0, 3}},
+        {"CompactMrtSparse0124", 0xf0fffu, {0, 1, 2, 4}},
+    }};
+    for (const auto &item : cases) {
+      GraphicsCase test;
+      test.name = item.name;
+      // The official CheckRasterization native pixel fixture supplies this prefix.
+      AppendVMovU32(&test.fragment_code, 0, 0);
+      AppendSMovLiteral(&test.fragment_code, 107, 0x3e800000u);
+      test.fragment_code.push_back(EncodeVopc(0xc2, InlineU32(1), 0));
+      test.fragment_code.push_back(EncodeVop1(0x01, 1, 107));
+      AppendVMovLiteral(&test.fragment_code, 2, 0x3f800000u);
+      for (u32 ordinal = 0; ordinal < item.slots.size(); ++ordinal) {
+        test.fragment_code.push_back(EncodeExp0(ordinal, 0xf,
+                                               ordinal + 1u == item.slots.size()));
+        test.fragment_code.push_back(EncodeExp1(1, 1, 1, 2));
+      }
+      AppendEnd(&test.fragment_code);
+      const auto compiled = CompileFragmentCase(test, nullptr, item.shader_mask);
+      u32 mrt_outputs = 0;
+      for (const auto &output : compiled.program.info.outputs) {
+        if (output.kind != ShaderRecompiler::IR::StageOutputKind::Mrt) continue;
+        ++mrt_outputs;
+        Require(test.name, "logical to physical MRT reflection",
+                output.index < item.slots.size() &&
+                    output.location == item.slots[output.index] &&
+                    ShaderPixelExportTarget(item.shader_mask, output.index) == output.location,
+                "logical ordinal must route to the occupied physical shader-mask slot");
+      }
+      Require(test.name, "MRT reflection count", mrt_outputs == item.slots.size(),
+              "native exports were lost or duplicated before emission");
+      std::vector<u32> output_ids, emitted_locations;
+      std::vector<std::pair<u32, u32>> locations;
+      for (size_t offset = 5; offset < compiled.spirv.size();) {
+        const auto count = compiled.spirv[offset] >> 16u;
+        Require(test.name, "SPIR-V instruction bounds", count != 0 &&
+                count <= compiled.spirv.size() - offset, "invalid instruction length");
+        const auto words = std::span<const u32>(compiled.spirv).subspan(offset, count);
+        const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (opcode == spv::OpVariable && count >= 4 && words[3] == spv::StorageClassOutput)
+          output_ids.push_back(words[2]);
+        if (opcode == spv::OpDecorate && count == 4 && words[2] == spv::DecorationLocation)
+          locations.emplace_back(words[1], words[3]);
+        offset += count;
+      }
+      for (const auto &[id, location] : locations) {
+        if (std::ranges::find(output_ids, id) != output_ids.end())
+          emitted_locations.push_back(location);
+      }
+      std::ranges::sort(emitted_locations);
+      Require(test.name, "actual emitted physical MRT locations",
+              emitted_locations == item.slots,
+              "SPIR-V output Location decorations must match physical attachments exactly");
+      std::printf("[host]    %-32s native Emit + Vulkan1.2 validation, physical MRT locations ok; no GPU\n", test.name);
+    }
+    ShaderPixelInputInfo key_info{};
+    std::vector<u32> dense_key, sparse_key, sparse_component_key;
+    key_info.target_shader_mask = 0xf;
+    BuildStageStaticKey(key_info, dense_key);
+    key_info.target_shader_mask = 0xf000;
+    BuildStageStaticKey(key_info, sparse_key);
+    key_info.target_shader_mask = 0x1000;
+    BuildStageStaticKey(key_info, sparse_component_key);
+    Require("CompactMrt", "mask occupancy cache identity", dense_key != sparse_key &&
+            sparse_key == sparse_component_key,
+            "physical occupancy changes must key separately; component-only changes must share");
+    std::puts("CompactMrt CPU preparation: 4 native pixel modules and occupancy-key controls passed; no memory or Vulkan device initialized");
+    return 0;
+  }
   if (argc > 1 && std::string_view(argv[1]).starts_with("--mixed-pixel-interpolation")) {
     if (argc != 2 || std::strcmp(argv[1], "--mixed-pixel-interpolation-prepare-only") != 0) {
       std::fputs("MixedPixelInterpolation: exact CPU preparation flag only; no Vulkan initialized\n", stderr);
