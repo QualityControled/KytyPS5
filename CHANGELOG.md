@@ -2,6 +2,14 @@
 
 This list covers emulator changes after `KytyPS5-2026-10-07-d2413fc`. Experimental settings are opt-in. Owned fixtures and captured CPU validation are separate from actual game observations.
 
+## r34 - 2026-10-08 - 8c291f1
+
+- Port [upstream b38b745](https://github.com/KytyPS5/KytyPS5/commit/b38b7454a6bc21f5d68bea825214fac60f53f80a) to preserve real vertex-export locations when a pixel shader reads the same export with both flat and smooth interpolation. Respect first/last provoking-vertex selection for ordinary primitives and retain rectangle interpolation's separate mapping.
+- Include interpolation mode in shader cache identity. Coherent build and eight CPU regression groups passed; four authored native pixel modules and rectangle regressions passed CPU emission/default Vulkan 1.2 SPIR-V validation. No new GPU test is claimed for this port.
+- Add default-off experimental R8 point/bilinear software comparison while retaining supported native depth comparison. Its earlier authored tests passed 31 modules and 33 manual Vulkan dispatches; these tests are separate from the current interpolation checks and do not prove production texture imports or AMD comparison equivalence. An actual software-enabled startup rejected unsupported status requests before Garage, so the portable starter keeps the experiment off.
+- Add an optional exact pixel-shader trace selector and bounded first-failure metadata for the R8 experiment. The report retains the original strict rejection and is limited to 32 KiB. Optional witnesses, vehicle traces and lookup trials also remain off.
+- This revision reached Garage; the user reported that the vehicle looked about the same. Incorrect vehicle paint/materials/lighting/shadows, missing details, music silence and the prior native fiber crash remain unresolved. No wheel/lighting repair, playable race or FPS improvement is claimed. Scapes Movies ran, but returning to World Map ended in a native read access violation; cause unresolved.
+
 ## r33 - 2026-10-08 - 8f8d34d
 
 - Raise the optional geometry-candidate trace limit from 32 KiB to 256 KiB per record so a larger binding record can be retained. The ordinary trace remains 32 KiB per record. Both modes retain the 64-record and 1 MiB total limits, duplicate suppression and scene activation control.

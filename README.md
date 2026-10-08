@@ -2,7 +2,7 @@
 
 This fork develops Gran Turismo 7 rendering and shader compatibility on Windows x64. It is based on [KytyPS5](https://github.com/KytyPS5/KytyPS5) and remains experimental.
 
-**[Windows download and release notes: r33](https://github.com/QualityControled/KytyPS5/releases/tag/gt7-experimental-2026.10.08-r33)** | **[Changelog](CHANGELOG.md)** | **[Matching source](https://github.com/QualityControled/KytyPS5/tree/8f8d34d30313930404162aac88158a5f73c21eb2)**
+**[Windows download and release notes: r34](https://github.com/QualityControled/KytyPS5/releases/tag/gt7-experimental-2026.10.08-r34)** | **[Changelog](CHANGELOG.md)** | **[Matching source](https://github.com/QualityControled/KytyPS5/tree/8c291f1bbab3db9036570a209b34875f1465ddfa)**
 
 ## Current GT7 result
 
@@ -10,13 +10,13 @@ World Map and Garage can be reached. Rotating vehicle geometry has been observed
 
 Playable races have not been established. Menu performance remains low, around four completed guest frames per second in measured scenes. There is no demonstrated 30 FPS result or confirmed performance improvement from the experimental lookup and polling options.
 
-The r33 diagnostic retained 34 complete indexed/depth-tested draw candidates and 432 pixel-shader image associations without an oversized record. Vehicle appearance remains dark or flat. The run closed normally; this does not fix the earlier native fiber crash. A moving-preview comparison of the optional lookup found no demonstrated performance gain, and the portable starter keeps lookup off.
+r34 ports the [upstream mixed pixel interpolation fix](https://github.com/KytyPS5/KytyPS5/commit/b38b7454a6bc21f5d68bea825214fac60f53f80a). When flat and smooth pixel inputs share one vertex export, ordinary primitives now retain that export's actual location and the requested first/last provoking vertex. Rectangle interpolation keeps its separate behavior. The coherent build, eight CPU regression groups and four authored native pixel modules with default Vulkan 1.2 SPIR-V validation passed. This build reached Garage, and the user reported that the vehicle looked about the same. No visible wheel, lighting, material or FPS improvement has been established. Scapes Movies ran, but returning to World Map ended in a native read access violation; cause unresolved.
 
 The GT7 launcher enables a declared lower-AA approximation and fixed-function resolve support. It also uses a terminal external-call probe: reaching a selected external shader call can deliberately stop the emulator before that callee executes. This build is intended for rendering development and testing.
 
 ## Download and start on Windows
 
-1. Open the [r33 release](https://github.com/QualityControled/KytyPS5/releases/tag/gt7-experimental-2026.10.08-r33) and download `KytyPS5-GT7-Experimental-r33-8f8d34d-Windows-x64.zip`. Download the checksum file as well if you want to verify the archive.
+1. Open the [r34 release](https://github.com/QualityControled/KytyPS5/releases/tag/gt7-experimental-2026.10.08-r34) and download `KytyPS5-GT7-Experimental-r34-8c291f1-Windows-x64.zip`. Download the checksum file as well if you want to verify the archive.
 2. Extract the whole ZIP into a writable folder. Keep the DLLs, plugin folders and license files together with the executable; do not run it inside the ZIP.
 3. Double-click `Start-GT7-Experimental.cmd`. Choose your GT7 game folder containing `eboot.bin`.
 4. Keep the console open. Initial shader compilation can pause visible progress. A deliberate external-call stop or another unsupported operation may end the session.
@@ -37,10 +37,10 @@ Use 64-bit Windows and a Vulkan 1.3-capable GPU with current drivers. The extrac
 
 ## Changes in this fork
 
-Recent changes cover indirect image writes, external-call provenance and bounded diagnostics, image metadata remapping, mapped blend semantics, sample-state retention, an opt-in lower-AA profile, and fixed-function 2-sample-to-1-sample resolves. r30 added an optional bounded final-binding trace for diagnosing vehicle materials. r31 adds default-off, failure-only metadata for invalid shader/vertex buffer ranges while retaining the existing stop. r32 adds an optional geometry-candidate filter to preserve the trace budget for larger or depth-tested draws. r33 raises only that filtered trace's per-record limit to 256 KiB, retaining 64 records and a 1 MiB total limit; the ordinary trace remains 32 KiB per record. All optional vehicle and failure traces stay off in the portable starter. These updates collect evidence and do not repair lighting, materials or the native fiber crash. See [CHANGELOG.md](CHANGELOG.md) for changes and the limits of their validation.
+Recent changes cover sample-state retention, a declared lower-AA profile, bounded fixed-function resolves, mapped blending and optional rendering diagnostics. r34 adds the upstream mixed pixel interpolation correction and its cache identity, preserving rectangle interpolation. It also adds the default-off R8 software comparison experiment, an optional exact pixel-shader trace selector and bounded failure-only diagnostic metadata. Earlier authored manual GPU tests of the R8 path are separate from this interpolation port's CPU checks; an actual software-enabled startup rejected unsupported status requests before Garage. The public starter leaves software comparison and all optional diagnostics off. See [CHANGELOG.md](CHANGELOG.md) for the changes and their validation limits.
 
 ## Source and license
 
-r33 corresponds to [`8f8d34d30313930404162aac88158a5f73c21eb2`](https://github.com/QualityControled/KytyPS5/tree/8f8d34d30313930404162aac88158a5f73c21eb2). [Download the corresponding source ZIP](https://github.com/QualityControled/KytyPS5/archive/8f8d34d30313930404162aac88158a5f73c21eb2.zip). For a complete build checkout, clone the pinned revision with submodules; GitHub source ZIPs do not include submodule contents. Build instructions remain in the [upstream project](https://github.com/KytyPS5/KytyPS5#developer-information).
+r34 corresponds to [`8c291f1bbab3db9036570a209b34875f1465ddfa`](https://github.com/QualityControled/KytyPS5/tree/8c291f1bbab3db9036570a209b34875f1465ddfa). [Download the corresponding source ZIP](https://github.com/QualityControled/KytyPS5/archive/8c291f1bbab3db9036570a209b34875f1465ddfa.zip). For a complete build checkout, clone the pinned revision with submodules; GitHub source ZIPs do not include submodule contents. Build instructions remain in the [upstream project](https://github.com/KytyPS5/KytyPS5#developer-information).
 
 KytyPS5 remains licensed under [GPL version 2](LICENSE). Original Kyty and third-party notices are retained in the source and the Windows package's `licenses` directory. This fork is not affiliated with Sony Interactive Entertainment or Polyphony Digital.
