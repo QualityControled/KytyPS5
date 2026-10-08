@@ -10,6 +10,8 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 
+enum class TimelineRefreshRole : uint32_t { Other, PendingPop, CommandPool, IsFree, Wait };
+
 class MasterSemaphore {
 public:
 	explicit MasterSemaphore(GraphicContext& graphics);
@@ -28,7 +30,7 @@ public:
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
-	void Refresh();
+	void Refresh(TimelineRefreshRole role = TimelineRefreshRole::Other);
 	void Wait(uint64_t tick);
 
 private:

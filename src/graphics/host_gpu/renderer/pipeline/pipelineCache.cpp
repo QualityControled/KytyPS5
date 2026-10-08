@@ -1755,8 +1755,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		MenuPerformanceDiagnostic::GraphicsPipelineLookup(true);
 		return *iter->second;
 	}
+	MenuPerformanceDiagnostic::GraphicsPipelineLookup(false);
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
@@ -1770,8 +1772,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
+	{
+		MenuPerformanceDiagnostic::TimedScope diagnostic_scope(
+		    MenuPerformanceDiagnostic::TimedOperation::GraphicsPipelineCreate);
+		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+		                       ps_input_info, programs, static_params, m_driver_cache);
+	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);

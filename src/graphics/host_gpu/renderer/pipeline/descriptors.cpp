@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "graphics/MenuPerformanceDiagnostic.h"
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -979,6 +980,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
+	MenuPerformanceDiagnostic::TimedScope diagnostic_scope(
+	    MenuPerformanceDiagnostic::TimedOperation::DescriptorBinding);
 	auto   vk_buffer        = buffer.Handle();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;

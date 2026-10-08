@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/MenuPerformanceDiagnostic.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -73,7 +74,7 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 
 	auto found = search(m_hint, m_ticks.size());
 	if (!found) {
-		m_master.Refresh();
+		m_master.Refresh(TimelineRefreshRole::CommandPool);
 		gpu_tick = m_master.KnownGpuTick();
 		found    = search(m_hint, m_ticks.size());
 	}
@@ -208,7 +209,22 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	MenuPerformanceDiagnostic::TimedScope diagnostic_scope(
+	    MenuPerformanceDiagnostic::TimedOperation::PendingPop);
+	if (MenuPerformanceDiagnostic::EmptyDeferredPollSkipRequested()) {
+		// Only normal callbacks are drained here. Priority callbacks have their own waiter.
+		// A producer queued after this locked observation is handled at the next boundary.
+		bool empty;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			empty = m_pending_operations.empty();
+		}
+		if (empty) {
+			MenuPerformanceDiagnostic::EmptyDeferredPollSkipped();
+			return;
+		}
+	}
+	m_master.Refresh(TimelineRefreshRole::PendingPop);
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -317,7 +333,7 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 	if (m_master.IsFree(tick)) {
 		return true;
 	}
-	m_master.Refresh();
+	m_master.Refresh(TimelineRefreshRole::IsFree);
 	return m_master.IsFree(tick);
 }
 

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "graphics/MenuPerformanceDiagnostic.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <cinttypes>
@@ -25,9 +26,10 @@ MasterSemaphore::~MasterSemaphore() {
 	}
 }
 
-void MasterSemaphore::Refresh() {
-	uint64_t   counter = 0;
-	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+void MasterSemaphore::Refresh(TimelineRefreshRole role) {
+	MenuPerformanceDiagnostic::TimelineRefreshScope diagnostic_scope(static_cast<uint32_t>(role));
+	uint64_t                                        counter = 0;
+	const auto result = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	if (result != vk::Result::eSuccess) {
 		EXIT("GPU timeline counter failed: Vulkan result=%d device_lost=%d\n",
 		     static_cast<int>(result), result == vk::Result::eErrorDeviceLost);
@@ -44,7 +46,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
-	Refresh();
+	Refresh(TimelineRefreshRole::Wait);
 	if (IsFree(tick)) {
 		return;
 	}
@@ -59,7 +61,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		EXIT("GPU timeline wait failed: Vulkan result=%d device_lost=%d tick=%" PRIu64 "\n",
 		     static_cast<int>(result), result == vk::Result::eErrorDeviceLost, tick);
 	}
-	Refresh();
+	Refresh(TimelineRefreshRole::Wait);
 }
 
 } // namespace Libs::Graphics
