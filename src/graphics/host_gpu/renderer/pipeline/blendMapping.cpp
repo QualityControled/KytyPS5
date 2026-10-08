@@ -42,6 +42,18 @@ BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                
 			default: break;
 		}
 	}
+	// Preserve the observed separate zero-alpha equation when logical alpha is
+	// stored in a color component: export primary alpha as zero and broadcast the
+	// original source alpha in the second blend source before that replacement.
+	if (blend.separate_alpha_blend &&
+	    blend.color_srcblend == static_cast<uint8_t>(Prospero::BlendFactor::kOne) &&
+	    blend.alpha_srcblend == static_cast<uint8_t>(Prospero::BlendFactor::kZero) &&
+	    blend.color_destblend == static_cast<uint8_t>(Prospero::BlendFactor::kSrcAlpha) &&
+	    blend.alpha_destblend == blend.color_destblend &&
+	    blend.color_comb_fcn == static_cast<uint8_t>(Prospero::BlendOp::kAdd) &&
+	    blend.alpha_comb_fcn == blend.color_comb_fcn) {
+		return BlendMappingSupport::SourceOneAlphaZero;
+	}
 	// Moving alpha requires the same equation for all channels.
 	if (blend.separate_alpha_blend && (blend.alpha_srcblend != blend.color_srcblend ||
 	                                   blend.alpha_destblend != blend.color_destblend ||

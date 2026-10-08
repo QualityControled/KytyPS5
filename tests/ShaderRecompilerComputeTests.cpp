@@ -16492,6 +16492,9 @@ public:
         Prospero::BlendFactor alpha_source;
         ShaderAlphaBlendSource mode;
         float alpha;
+        Prospero::BlendFactor color_source = Prospero::BlendFactor::kSrcAlpha;
+        Prospero::BlendFactor destination = Prospero::BlendFactor::kOneMinusSrcAlpha;
+        std::array<float, 3> mapped_rgb{0.35f, 0.35f, 0.5f};
       };
       uint64_t broadcast_program = 0;
       vk::Pipeline broadcast_pipeline{};
@@ -16499,9 +16502,16 @@ public:
           AlphaBlendCase{false, Prospero::BlendFactor::kOne, ShaderAlphaBlendSource::SourceAlpha, 0.4f},
           AlphaBlendCase{true, Prospero::BlendFactor::kSrcAlpha, ShaderAlphaBlendSource::SourceAlpha, 0.4f},
           AlphaBlendCase{true, Prospero::BlendFactor::kOne, ShaderAlphaBlendSource::SourceAlphaOne, 0.65f},
-          AlphaBlendCase{true, Prospero::BlendFactor::kZero, ShaderAlphaBlendSource::SourceAlphaZero, 0.15f}}) {
+          AlphaBlendCase{true, Prospero::BlendFactor::kZero, ShaderAlphaBlendSource::SourceAlphaZero, 0.15f},
+          // The exact mapping0x1b/color1/4/alpha0/4 tuple seen in GT7.
+          AlphaBlendCase{true, Prospero::BlendFactor::kZero, ShaderAlphaBlendSource::SourceOneAlphaZero,
+                         0.15f, Prospero::BlendFactor::kOne, Prospero::BlendFactor::kSrcAlpha,
+                         {0.55f, 0.65f, 0.9f}}}) {
         alpha_blend.separate_alpha_blend = test.separate;
         alpha_blend.alpha_srcblend = static_cast<uint8_t>(test.alpha_source);
+        alpha_blend.color_srcblend = static_cast<uint8_t>(test.color_source);
+        alpha_blend.color_destblend = alpha_blend.alpha_destblend =
+            static_cast<uint8_t>(test.destination);
         registers.SetBlendControl(0, alpha_blend);
         const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
             native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
@@ -16524,7 +16534,7 @@ public:
         constexpr std::array<float, 4> destination{0.3f, 0.3f, 0.1f, 0.2f};
         draw(selected, 3, std::bit_cast<std::array<u32, 4>>(destination));
         const auto blend_pixels = read_color();
-        const std::array<float, 4> expected{test.alpha, 0.35f, 0.35f, 0.5f};
+        const std::array<float, 4> expected{test.alpha, test.mapped_rgb[0], test.mapped_rgb[1], test.mapped_rgb[2]};
         for (size_t component = 0; component < blend_pixels.size(); component++) {
           Require(name, "logical alpha blend readback",
                   std::abs(std::bit_cast<float>(blend_pixels[component]) -

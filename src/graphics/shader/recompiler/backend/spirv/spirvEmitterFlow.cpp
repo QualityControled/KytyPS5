@@ -536,6 +536,13 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 					}
 				}
 				state.builder.AddFunction(spv::OpStore, blend_output, alpha);
+				if (state.input_info.pixel->alpha_blend_source ==
+				    ShaderAlphaBlendSource::SourceOneAlphaZero) {
+					const auto primary = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeInsert, vector_type, primary,
+					                          ConstantF32Value(state, 0.0f), value, 3u);
+					value = primary;
+				}
 			}
 		}
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&

@@ -1522,6 +1522,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				case BlendMappingSupport::SourceAlphaZero:
 					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
 					break;
+				case BlendMappingSupport::SourceOneAlphaZero:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceOneAlphaZero;
+					break;
 				default: break;
 			}
 			if (pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
@@ -1658,6 +1661,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 					blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
 					blend.color_destblend =
 					    static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+					blend.separate_alpha_blend = false;
+					break;
+				case ShaderAlphaBlendSource::SourceOneAlphaZero:
+					// The pixel export preserves logical Sa in source1 and zeros only
+					// the primary logical alpha, retaining the separate native equation.
+					blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+					blend.color_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Alpha);
 					blend.separate_alpha_blend = false;
 					break;
 				case ShaderAlphaBlendSource::None: break;

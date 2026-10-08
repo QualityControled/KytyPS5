@@ -17,6 +17,7 @@ enum class BlendMappingSupport {
 	SourceAlpha, // Requires logical alpha in the second blend source.
 	SourceAlphaOne, // Source alpha for RGB, one for alpha, with a shared destination equation.
 	SourceAlphaZero, // Source alpha for RGB, zero for alpha, with a shared destination equation.
+	SourceOneAlphaZero, // Source color plus destination times logical Sa; alpha source is zero.
 	Unsupported,
 };
 
