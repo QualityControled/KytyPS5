@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/MenuPerformanceDiagnostic.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
@@ -883,6 +884,7 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+	Graphics::MenuPerformanceDiagnostic::BackingReadScope diagnostic_scope(size);
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
 			return false;

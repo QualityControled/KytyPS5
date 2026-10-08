@@ -50,7 +50,7 @@ static void PrintUnsupportedColorSamples(const CommandBuffer& buffer, uint32_t s
                                          uint32_t effective_mask, uint32_t slice_offset,
                                          bool ignore_target_mask, bool exact_format,
                                          bool fatal_preserved = true) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!ShaderRecompiler::Diagnostics::PrintEqaaFullState(Config::GraphicsDebugDumpEnabled())) {
 		return;
 	}
 	const auto& hw = buffer.GetRegisters();
@@ -69,8 +69,10 @@ static void PrintUnsupportedColorSamples(const CommandBuffer& buffer, uint32_t s
 	const auto& raw = hw.GetSampleRegisterSnapshot();
 	std::printf(
 	    "SampleRegisters selected_write_sequence=%" PRIu64
-	    " sequence_scope=context_relative_copy_restore observed_only_when_debug_enabled=1\n",
-	    raw.sequence);
+	    " sequence_scope=context_relative_copy_restore observed_only_when_debug_enabled=%u\n",
+	    raw.sequence,
+	    static_cast<unsigned>(!ShaderRecompiler::Diagnostics::EqaaReduced2xRequested() &&
+	                          !ShaderRecompiler::Diagnostics::EqaaShaderCaptureEnabled()));
 	static constexpr std::array<const char*, static_cast<size_t>(HW::SampleRegister::Count)>
 	    raw_names {"DB_Z_INFO",
 		           "DB_EQAA",
@@ -359,8 +361,7 @@ static void PrintExistingImageOwnerState(const char*                         rol
 static void PrintEqaaShaderAndOwners(const CommandBuffer& buffer, TextureCache& cache,
                                      uint32_t slot, const ShaderPixelInputInfo* prepared_ps,
                                      const char* draw_name) {
-	if (!Config::GraphicsDebugDumpEnabled() ||
-	    !ShaderRecompiler::Diagnostics::EqaaShaderCaptureEnabled())
+	if (!ShaderRecompiler::Diagnostics::EqaaShaderCaptureEnabled())
 		return;
 	const auto& hw    = buffer.GetRegisters();
 	const auto& rt    = hw.GetRenderTarget(slot);

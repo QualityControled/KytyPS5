@@ -12,6 +12,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/recompiler/EqaaFactCollection.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
@@ -91,10 +92,10 @@ void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 
 } // namespace
 
-// Observe only accepted existing setters. The default-off branch performs no
-// diagnostic bookkeeping; decoding, validation and packet consumption stay as-is.
+// Observe only accepted existing setters. Retain bounded trial facts independently
+// of disk debug dumps; decoding, validation and packet consumption stay as-is.
 static void RecordRawSampleRegister(CommandProcessor& cp, HW::SampleRegister reg, uint32_t value) {
-	if (Config::GraphicsDebugDumpEnabled()) {
+	if (ShaderRecompiler::Diagnostics::RetainEqaaRawRegisters(Config::GraphicsDebugDumpEnabled())) {
 		cp.GetCtx().RecordSampleRegister(reg, value);
 	}
 }

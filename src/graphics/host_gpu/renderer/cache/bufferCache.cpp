@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/MenuPerformanceDiagnostic.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -113,6 +114,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	MenuPerformanceDiagnostic::BackingDownloadScope diagnostic_download(!async);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -139,6 +141,10 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		mapped = temporary->Mapped().data();
 	} else {
 		m_download_buffer.Commit();
+	}
+	uint64_t diagnostic_payload_bytes = 0;
+	if (diagnostic_download.Active()) {
+		for (const auto& copy: copies) diagnostic_payload_bytes += copy.size;
 	}
 	const auto& download = temporary ? *temporary : m_download_buffer;
 	for (auto& copy: copies) {
@@ -187,6 +193,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		publish();
+		diagnostic_download.Completed(diagnostic_payload_bytes, total_size);
 	}
 	return true;
 }

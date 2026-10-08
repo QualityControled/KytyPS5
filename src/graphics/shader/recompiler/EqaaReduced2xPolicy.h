@@ -1,19 +1,10 @@
 #pragma once
 
+#include "graphics/shader/recompiler/EqaaFactCollection.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <cstdlib>
-#include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::Diagnostics {
-
-inline bool EqaaReduced2xRequested() {
-	static const bool requested = [] {
-		const auto* value = std::getenv("KYTY_EXPERIMENTAL_EQAA_2X");
-		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
-	return requested;
-}
 
 // AMD PAL gfx9_plus_merged_mask.h defines the enable mask as 0x00000001.
 // Preserve the raw DWORD; offset/round fields do not imply coverage enable.

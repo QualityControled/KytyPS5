@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/MenuPerformanceDiagnostic.h"
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/BvhResultHostPolicy.h"
@@ -775,8 +776,7 @@ struct PipelineCache::ProgramCache {
 		}
 		ShaderRecompiler::IR::PixelSampleSensitivity pixel_sample_sensitivity;
 		if (options.stage == ShaderType::Pixel &&
-		    Config::GraphicsDebugDumpEnabled() &&
-		    ShaderRecompiler::Diagnostics::EqaaShaderCaptureEnabled()) {
+		    ShaderRecompiler::Diagnostics::CollectEqaaPixelFacts()) {
 			pixel_sample_sensitivity = ShaderRecompiler::Diagnostics::CollectPixelSampleSensitivity(
 			    options.stage, true, translated.program.info, translated.program.memory_info,
 			    specialization);
@@ -963,18 +963,24 @@ struct PipelineCache::ProgramCache {
                 const auto topology=ResourceCaptureLibraryTopology(selected.overlay);
                 const bool overlay_written=WriteCallCaptureFile(input_folder/"selected-overlay-topology-u64le.bin",topology.data(),topology.size()*sizeof(uint64_t));
                 const bool reference_written=WriteCallCaptureFile(input_folder/"selected-native-reference.u32le.bin",reference.serialized_words.data(),reference.serialized_words.size()*sizeof(uint32_t));
-                const std::string candidate=fmt::format(
-                    "schema=1 scope=authored_candidate_CPU_materialization_only selected_this_run=false\n"
-                    "selection_basis=previous_run_observed_ordinal_8156_exact_reachable_native_reference\n"
-                    "caller_hash=0x{:016x} caller_base=0x{:016x} call_pc=0x{:08x} domain={} ordinal={} function={}\n"
-                    "target=0x{:016x} auxiliary=0x{:016x} relocated_addresses_allowed=true full_domain_support_proven=false\n"
+                std::string candidate=fmt::format(
+                    "schema=2 scope=authored_body_candidate_CPU_materialization_only selected_this_run=false\n"
+                    "selection_basis=historical_selected_body_exact_reachable_native_reference current_records_are_authored_not_GPU_elected\n"
+                    "caller_hash=0x{:016x} caller_base=0x{:016x} call_pc=0x{:08x} domain={} historical_ordinal={} current_function={}\n"
+                    "target=0x{:016x} relocated_addresses_allowed=true full_domain_support_proven=false\n"
+                    "current_context_policy=all_held_records_for_unique_exact_body max_matching_records={}\n"
                     "selected_compile_external_probe=false selected_compile_before_bvh=false selected_compile_structured=false selected_compile_after_bvh=false selected_compile_checked_vgpr=4294967295 parent_target_probe=true parent_structured_probe={}\n"
                     "reference_sha256=F6917CF654540D698C8DDC86D4114DF6D4720C6244E984E1A5AA829B479A1154 reference_xxh128_high=fade6f1f85f00811 reference_xxh128_low=b76ee41325b5dd93\n"
-                    "reference_file=selected-native-reference.u32le.bin reference_native_instructions={} reference_extent_bytes={} overlay_functions=1 overlay_records=1\n"
+                    "reference_file=selected-native-reference.u32le.bin reference_native_instructions={} reference_extent_bytes={} overlay_functions=1 overlay_records={}\n"
                     "full_held_plan_artifacts=resource_reads/library-topology-u64le.bin+exact_dependency_files\n"
                     "legacy_input_dump_epoch=separate_reread_not_authoritative_held_plan\n",
                     params.hash,params.Base(),reference.caller_pc,reference.domain,reference.ordinal,selected.function_id,
-                    selected.target,selected.auxiliary,lookup_key.external_probe_structured,reference.instructions.size(),reference.extent_bytes);
+                    selected.target,ShaderRecompiler::Diagnostics::MaxSelectedBodyContextRecords,lookup_key.external_probe_structured,
+                    reference.instructions.size(),reference.extent_bytes,selected.overlay.call_sites.front().records.size());
+                for(const auto& record:selected.overlay.call_sites.front().records){
+                    candidate+=fmt::format("current_record[{}]: function={} target=0x{:016x} auxiliary=0x{:016x}\n",
+                        record.ordinal,record.function_id,record.function_address,record.auxiliary_address);
+                }
                 const bool selection_written=WriteCallCaptureFile(input_folder/"selected-candidate.txt",candidate.data(),candidate.size());
                 if(!overlay_written || !selection_written || !reference_written)EXIT("Selected-callee overlay/reference artifact write failed; no materialization\n");
                 const auto domains=ShaderRecompiler::ExternalContextDomains(selected.overlay);
@@ -1005,7 +1011,7 @@ struct PipelineCache::ProgramCache {
                 ShaderRecompiler::IR::SrtReadCapture capture(std::move(identity));
                 selected_runtime.post_read_observer=ShaderRecompiler::IR::SrtReadCapture::Observe;
                 selected_runtime.post_read_userdata=&capture;
-                std::printf("Selected-callee CPU candidate capture begin hash=0x%016" PRIx64 " ordinal=%u target=0x%016" PRIx64 " auxiliary=0x%016" PRIx64 "; NOT selected by this run\n",params.hash,reference.ordinal,selected.target,selected.auxiliary);std::fflush(stdout);
+                std::printf("Selected-callee CPU body capture begin hash=0x%016" PRIx64 " historical_ordinal=%u target=0x%016" PRIx64 " current_contexts=%zu; NOT selected by this run\n",params.hash,reference.ordinal,selected.target,selected.overlay.call_sites.front().records.size());std::fflush(stdout);
                 auto translated=ShaderRecompiler::TranslateProgram(params.code,selected_options);
                 const auto plan=ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
                 ShaderRecompiler::IR::ResourceSnapshot resources;
@@ -1103,8 +1109,12 @@ struct PipelineCache::ProgramCache {
 			return succeeded;
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!materialize(entry->second.resource_plan, entry->second.resources,
-			                     entry->second.specialization));
+			{
+				MenuPerformanceDiagnostic::TimedScope diagnostic_scope(
+				    MenuPerformanceDiagnostic::TimedOperation::WarmMaterialize);
+				EXIT_IF(!materialize(entry->second.resource_plan, entry->second.resources,
+				                     entry->second.specialization));
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -1121,6 +1131,8 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		MenuPerformanceDiagnostic::TimedScope diagnostic_compile_scope(
+		    MenuPerformanceDiagnostic::TimedOperation::Compile);
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;
@@ -1203,6 +1215,7 @@ struct PipelineCache::ProgramCache {
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		MenuPerformanceDiagnostic::CompiledPermutation();
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -1304,7 +1317,7 @@ void PipelineCache::InitializeDriverCache() {
 	        fmt::format("-external-vgpr{}.bin", checked_vgpr) : std::string(".bin");
 	if (ShaderRecompiler::Diagnostics::EqaaReduced2xRequested()) {
 		cache_suffix.resize(cache_suffix.size() - std::string_view(".bin").size());
-		cache_suffix += "-experimental-eqaa2x-v1.bin";
+		cache_suffix += "-experimental-eqaa2x-v2-facts.bin";
 	}
 	m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + cache_suffix);
 	const auto path         = Common::PathToString(m_driver_cache_path);

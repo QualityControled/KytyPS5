@@ -1,22 +1,11 @@
 #pragma once
 
+#include "graphics/shader/recompiler/EqaaFactCollection.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
-#include <cstdlib>
-#include <cstring>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::Diagnostics {
-
-// Frozen once per process so a warm in-process permutation cannot have an
-// unexpected missing summary after the mode is changed by the caller.
-inline bool EqaaShaderCaptureEnabled() {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_CAPTURE_EQAA_SHADER_STATE");
-		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
-	return enabled;
-}
 
 // No guest memory, resource-plan evaluation, callbacks or executable IR mutation.
 // All materialized candidates are included conservatively, including generated

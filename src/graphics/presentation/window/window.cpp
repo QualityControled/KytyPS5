@@ -12,6 +12,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "common/stringUtils.h"
+#include "graphics/MenuPerformanceDiagnostic.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -739,6 +740,7 @@ void WindowContext::Run() {
 		const auto now     = SDL_GetTicks();
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
+			MenuPerformanceDiagnostic::Report(now);
 			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
 			if (frames != 0) {
 				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
