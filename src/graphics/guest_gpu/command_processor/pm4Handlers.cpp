@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -90,6 +91,14 @@ void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 
 } // namespace
 
+// Observe only accepted existing setters. The default-off branch performs no
+// diagnostic bookkeeping; decoding, validation and packet consumption stay as-is.
+static void RecordRawSampleRegister(CommandProcessor& cp, HW::SampleRegister reg, uint32_t value) {
+	if (Config::GraphicsDebugDumpEnabled()) {
+		cp.GetCtx().RecordSampleRegister(reg, value);
+	}
+}
+
 static HW::BlendControl DecodeBlendControl(uint32_t value) {
 	HW::BlendControl r {};
 
@@ -179,9 +188,8 @@ static HW::RenderControl DecodeRenderControl(uint32_t value) {
 	r.stencil_compress_disable =
 	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, STENCIL_COMPRESS_DISABLE) != 0;
 	r.depth_compress_disable = KYTY_PM4_GET(value, DB_RENDER_CONTROL, DEPTH_COMPRESS_DISABLE) != 0;
-	r.copy_depth_to_color = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_DEPTH_TO_COLOR) != 0;
-	r.copy_stencil_to_color =
-	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_STENCIL_TO_COLOR) != 0;
+	r.copy_depth_to_color    = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_DEPTH_TO_COLOR) != 0;
+	r.copy_stencil_to_color  = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_STENCIL_TO_COLOR) != 0;
 	r.copy_centroid          = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_CENTROID) != 0;
 	r.copy_sample            = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_SAMPLE);
 
@@ -226,6 +234,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaConfig) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::PA_SC_AA_CONFIG);
 
+	RecordRawSampleRegister(cp, HW::SampleRegister::AaConfig, buffer[0]);
 	cp.GetCtx().SetAaConfig(ParseAaConfig(buffer[0]));
 
 	return 1;
@@ -286,10 +295,27 @@ KYTY_HW_CTX_PARSER(HwCtxSetCentroidPriority) {
 	return num_values;
 }
 
-static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
-                                      [[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreAaMaskRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	switch (cmd_offset) {
+		case Pm4::PA_SC_AA_MASK_X0Y0_X1Y0:
+			RecordRawSampleRegister(cp, HW::SampleRegister::AaMaskX0Y0X1Y0, value);
+			break;
+		case Pm4::PA_SC_AA_MASK_X0Y1_X1Y1:
+			RecordRawSampleRegister(cp, HW::SampleRegister::AaMaskX0Y1X1Y1, value);
+			break;
+		case Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK:
+			RecordRawSampleRegister(cp, HW::SampleRegister::SampleExclusionMask, value);
+			break;
+		default: break;
+	}
+}
 
-static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
+static void HwCtxIgnoreAlphaToMaskRegister(CommandProcessor& cp, uint32_t cmd_offset,
+                                           uint32_t value) {
+	if (cmd_offset == Pm4::DB_ALPHA_TO_MASK) {
+		RecordRawSampleRegister(cp, HW::SampleRegister::AlphaToMask, value);
+	}
+}
 
 static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
 	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
@@ -315,7 +341,7 @@ static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offse
 }
 
 static void HwCtxSetDepthMetadataRegister(CommandProcessor& cp, uint32_t cmd_offset,
-                                         uint32_t value) {
+                                          uint32_t value) {
 	if (cmd_offset == Pm4::DB_RENDER_OVERRIDE) {
 		HW::DepthRenderOverride control;
 		control.force_z_valid       = (value & 0x20000000u) != 0;
@@ -447,7 +473,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetAlphaToMask) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 
 	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreAlphaToMaskRegister(buffer[i]);
+		HwCtxIgnoreAlphaToMaskRegister(cp, cmd_offset + i, buffer[i]);
 	}
 
 	return num_values;
@@ -517,7 +543,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaMask) {
 	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
 
 	for (uint32_t i = 0; i < num_values; i++) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset + i, buffer[i]);
+		HwCtxIgnoreAaMaskRegister(cp, cmd_offset + i, buffer[i]);
 	}
 
 	return num_values;
@@ -591,6 +617,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetDepthControl) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_DEPTH_CONTROL);
 
+	RecordRawSampleRegister(cp, HW::SampleRegister::DepthControl, buffer[0]);
 	cp.GetCtx().SetDepthControl(DecodeDepthControl(buffer[0]));
 
 	return 1;
@@ -601,9 +628,9 @@ static void HwCtxSetDepthShadingRateEncodingRegister(CommandProcessor& cp, uint3
 	    KYTY_PM4_GET(value, DB_SHADING_RATE_ENCODING, SHADING_RATE_ENCODING);
 	EXIT_NOT_IMPLEMENTED(shading_rate_encoding > 2u);
 
-	auto& ctx                       = cp.GetCtx();
-	auto  target                    = ctx.GetDepthRenderTarget();
-	target.shading_rate_encoding    = static_cast<uint8_t>(shading_rate_encoding);
+	auto& ctx                    = cp.GetCtx();
+	auto  target                 = ctx.GetDepthRenderTarget();
+	target.shading_rate_encoding = static_cast<uint8_t>(shading_rate_encoding);
 	ctx.SetDepthRenderTarget(target);
 }
 
@@ -626,6 +653,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetEqaaControl) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_EQAA);
 
+	RecordRawSampleRegister(cp, HW::SampleRegister::Eqaa, buffer[0]);
 	cp.GetCtx().SetEqaaControl(ParseEqaaControl(buffer[0]));
 
 	return 1;
@@ -907,6 +935,7 @@ KYTY_HW_CTX_PARSER(HwCtxSetStencilInfo) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_STENCIL_INFO);
 
+	RecordRawSampleRegister(cp, HW::SampleRegister::StencilInfo, buffer[0]);
 	cp.GetCtx().SetDepthStencilInfo(HW::DepthStencilInfo::Decode(buffer[0]));
 
 	return 1;
@@ -1016,8 +1045,8 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 		case Pm4::COMPUTE_PGM_RSRC1:
 			cs_regs.vgprs =
 			    (value >> Pm4::COMPUTE_PGM_RSRC1_VGPRS_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_VGPRS_MASK;
-			cs_regs.priority = (value >> Pm4::COMPUTE_PGM_RSRC1_PRIORITY_SHIFT) &
-			                   Pm4::COMPUTE_PGM_RSRC1_PRIORITY_MASK;
+			cs_regs.priority      = (value >> Pm4::COMPUTE_PGM_RSRC1_PRIORITY_SHIFT) &
+			                        Pm4::COMPUTE_PGM_RSRC1_PRIORITY_MASK;
 			cs_regs.float_mode    = (value >> Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_SHIFT) &
 			                        Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_MASK;
 			cs_regs.dx10_clamp    = ((value >> Pm4::COMPUTE_PGM_RSRC1_DX10_CLAMP_SHIFT) &
@@ -1032,7 +1061,7 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			                                     Pm4::COMPUTE_PGM_RSRC1_WGP_MODE_MASK) != 0u;
 			cs_regs.require_forward_progress =
 			    ((value >> Pm4::COMPUTE_PGM_RSRC1_FWD_PROGRESS_SHIFT) &
-			     Pm4::COMPUTE_PGM_RSRC1_FWD_PROGRESS_MASK) != 0u;
+				 Pm4::COMPUTE_PGM_RSRC1_FWD_PROGRESS_MASK) != 0u;
 			break;
 		case Pm4::COMPUTE_PGM_RSRC2:
 			cs_regs.scratch_en     = ((value >> Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT) &
@@ -1053,9 +1082,8 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			                         Pm4::COMPUTE_PGM_RSRC2_LDS_SIZE_MASK;
 			break;
 		case Pm4::COMPUTE_PGM_RSRC3:
-			cs_regs.shared_vgprs =
-			    (value >> Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_SHIFT) &
-			    Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_MASK;
+			cs_regs.shared_vgprs = (value >> Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_SHIFT) &
+			                       Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_MASK;
 			break;
 		case Pm4::COMPUTE_NUM_THREAD_X: cs_regs.num_thread_x = value; break;
 		case Pm4::COMPUTE_NUM_THREAD_Y: cs_regs.num_thread_y = value; break;
@@ -1167,7 +1195,7 @@ static bool HwShIsUserAccumulatorRange(uint32_t first, uint32_t count, uint32_t 
 }
 
 static void HwShIgnoreUserAccumulatorRegister([[maybe_unused]] uint32_t cmd_offset,
-                                               uint32_t value) {
+                                              uint32_t                  value) {
 	EXIT_NOT_IMPLEMENTED((value & ~0x7fu) != 0);
 }
 
@@ -1958,7 +1986,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 
 	auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+		                            (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
@@ -2006,8 +2034,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 			if (raw_cmd_offset == 0x24au && value == 0u) {
 				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
 				if (!logged.test_and_set(std::memory_order_relaxed)) {
-					Log::WriteToConsoleAndLog(
-					    "\t diagnostic: ignoring indirect CX {0x24a, 0}; hardware effect unresolved\n");
+					Log::WriteToConsoleAndLog("\t diagnostic: ignoring indirect CX {0x24a, 0}; "
+					                          "hardware effect unresolved\n");
 				}
 				continue;
 			}
@@ -2028,7 +2056,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 
 	auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+		                            (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
@@ -2091,7 +2119,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 
 	auto* indirect_buffer =
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
-	                                (static_cast<uint64_t>(buffer[1]) << 32u));
+		                            (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
 
 	if (indirect_num_dw == 0) {
@@ -2541,7 +2569,7 @@ template <typename T>
 static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const uint32_t* buffer) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
-	constexpr auto value_dw = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
+	constexpr auto value_dw   = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
 	constexpr auto payload_dw = 4u + value_dw * 2u;
 	constexpr auto packet_dw  = payload_dw + 1u;
 	constexpr auto opcode =
@@ -2551,7 +2579,7 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != packet_dw);
 
 	constexpr auto address_align_mask = (sizeof(T) == sizeof(uint32_t) ? 0x3u : 0x7u);
-	auto  ctrl = buffer[0];
+	auto           ctrl               = buffer[0];
 	auto* addr = reinterpret_cast<const T*>((buffer[1] & ~address_align_mask) |
 	                                        (static_cast<uint64_t>(buffer[2] & 0x3ffffu) << 32u));
 	auto  ref  = CpOpWaitRegMemReadValue<T>(buffer + 3u);
@@ -2705,7 +2733,12 @@ void GraphicsInitJmpTablesCxIndirect() {
 	for (auto cmd_offset = Pm4::CB_COLOR0_ATTRIB; cmd_offset <= Pm4::CB_COLOR7_ATTRIB;
 	     cmd_offset += 15) {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			uint32_t        slot = (cmd_offset - Pm4::CB_COLOR0_ATTRIB) / 15;
+			uint32_t slot = (cmd_offset - Pm4::CB_COLOR0_ATTRIB) / 15;
+			RecordRawSampleRegister(
+			    cp,
+			    static_cast<HW::SampleRegister>(
+			        static_cast<uint32_t>(HW::SampleRegister::Color0Attrib) + slot),
+			    value);
 			HW::ColorAttrib attrib;
 			attrib.force_dest_alpha_to_one =
 			    KYTY_PM4_GET(value, CB_COLOR0_ATTRIB, FORCE_DST_ALPHA_1) != 0;
@@ -2737,10 +2770,9 @@ void GraphicsInitJmpTablesCxIndirect() {
 			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, INDEPENDENT_128B_BLOCKS) != 0;
 			EXIT_NOT_IMPLEMENTED(independent_64b && independent_128b);
 			dcc.independent_block_size =
-			    independent_64b
-			        ? HW::ColorDccControl::IndependentBlockSize::Bytes64
-			        : independent_128b ? HW::ColorDccControl::IndependentBlockSize::Bytes128
-			                           : HW::ColorDccControl::IndependentBlockSize::Disabled;
+			    independent_64b    ? HW::ColorDccControl::IndependentBlockSize::Bytes64
+				: independent_128b ? HW::ColorDccControl::IndependentBlockSize::Bytes128
+				                   : HW::ColorDccControl::IndependentBlockSize::Disabled;
 			cp.GetCtx().SetColorDccControl(slot, dcc);
 		};
 	}
@@ -3284,6 +3316,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_Z_INFO] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		RecordRawSampleRegister(cp, HW::SampleRegister::DepthZInfo, value);
 		cp.GetCtx().SetDepthZInfo(HW::DepthZInfo::Decode(value));
 	};
 
@@ -3295,6 +3328,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_STENCIL_INFO] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		RecordRawSampleRegister(cp, HW::SampleRegister::StencilInfo, value);
 		cp.GetCtx().SetDepthStencilInfo(HW::DepthStencilInfo::Decode(value));
 	};
 
@@ -3460,6 +3494,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_CONFIG] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		RecordRawSampleRegister(cp, HW::SampleRegister::AaConfig, value);
 		cp.GetCtx().SetAaConfig(ParseAaConfig(value));
 	};
 
@@ -3486,16 +3521,16 @@ void GraphicsInitJmpTablesCxIndirect() {
 	};
 
 	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_MASK_X0Y0_X1Y0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxIgnoreAaMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SC_AA_MASK_X0Y1_X1Y1] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxIgnoreAaMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SU_VTX_CNTL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnoreVtxControl(value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAaMaskRegister(cmd_offset, value);
+		HwCtxIgnoreAaMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::PA_SC_BINNER_CNTL_0] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HwCtxIgnorePaScExtendedControl(cmd_offset, value);
@@ -3506,17 +3541,19 @@ void GraphicsInitJmpTablesCxIndirect() {
 	g_hw_ctx_indirect_func[Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL] =
 	    [](KYTY_HW_CTX_INDIRECT_ARGS) { HwCtxIgnorePaScExtendedControl(cmd_offset, value); };
 	g_hw_ctx_indirect_func[Pm4::DB_ALPHA_TO_MASK] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-		HwCtxIgnoreAlphaToMaskRegister(value);
+		HwCtxIgnoreAlphaToMaskRegister(cp, cmd_offset, value);
 	};
 	g_hw_ctx_indirect_func[Pm4::CB_COLOR_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		cp.GetCtx().SetColorControl(DecodeColorControl(value));
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_DEPTH_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		RecordRawSampleRegister(cp, HW::SampleRegister::DepthControl, value);
 		cp.GetCtx().SetDepthControl(DecodeDepthControl(value));
 	};
 
 	g_hw_ctx_indirect_func[Pm4::DB_EQAA] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+		RecordRawSampleRegister(cp, HW::SampleRegister::Eqaa, value);
 		cp.GetCtx().SetEqaaControl(ParseEqaaControl(value));
 	};
 }
@@ -3603,17 +3640,11 @@ void GraphicsInitJmpTablesShIndirect() {
 	}
 	for (uint32_t slot = 0; slot < 4; slot++) {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_PS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
+		    [](KYTY_HW_SH_INDIRECT_ARGS) { HwShIgnoreUserAccumulatorRegister(cmd_offset, value); };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_ESGS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
+		    [](KYTY_HW_SH_INDIRECT_ARGS) { HwShIgnoreUserAccumulatorRegister(cmd_offset, value); };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_LSHS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
+		    [](KYTY_HW_SH_INDIRECT_ARGS) { HwShIgnoreUserAccumulatorRegister(cmd_offset, value); };
 	}
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);

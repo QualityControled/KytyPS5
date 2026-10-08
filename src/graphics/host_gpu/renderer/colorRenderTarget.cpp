@@ -52,7 +52,7 @@ static void PrintUnsupportedColorSamples(const CommandBuffer& buffer, uint32_t s
 	const auto& hw = buffer.GetRegisters();
 	const auto& rt = hw.GetRenderTarget(slot);
 	const auto& cc = hw.GetColorControl();
-	std::printf("ColorSampleDiagnostic schema=1 slot=%u mode=%u rop=0x%02x "
+	std::printf("ColorSampleDiagnostic schema=2 slot=%u mode=%u rop=0x%02x "
 	            "ignore_target_mask=%u exact_format=%u slice_offset=%u "
 	            "target_mask=0x%08x effective_slot_mask=0x%x "
 	            "samples_encoded=%u fragments_encoded=%u coverage_count=%u fragment_count=%u\n",
@@ -62,9 +62,36 @@ static void PrintUnsupportedColorSamples(const CommandBuffer& buffer, uint32_t s
 	            rt.attrib.num_fragments,
 	            rt.attrib.num_samples <= 7 ? (1u << rt.attrib.num_samples) : 0u,
 	            render_sample_count(rt.attrib.num_fragments));
-	std::printf("ColorSampleDiagnostic original_cb_raw_registers=not_retained "
-	            "aa_mask_registers=not_retained sample_exclusion_mask=not_retained "
-	            "draw_debug_tuple=private_unavailable\n");
+	const auto& raw = hw.GetSampleRegisterSnapshot();
+	std::printf(
+	    "SampleRegisters selected_write_sequence=%" PRIu64
+	    " sequence_scope=context_relative_copy_restore observed_only_when_debug_enabled=1\n",
+	    raw.sequence);
+	static constexpr std::array<const char*, static_cast<size_t>(HW::SampleRegister::Count)>
+	    raw_names {"DB_Z_INFO",
+		           "DB_EQAA",
+		           "DB_DEPTH_CONTROL",
+		           "DB_STENCIL_INFO",
+		           "PA_SC_AA_CONFIG",
+		           "CB_COLOR0_ATTRIB",
+		           "CB_COLOR1_ATTRIB",
+		           "CB_COLOR2_ATTRIB",
+		           "CB_COLOR3_ATTRIB",
+		           "CB_COLOR4_ATTRIB",
+		           "CB_COLOR5_ATTRIB",
+		           "CB_COLOR6_ATTRIB",
+		           "CB_COLOR7_ATTRIB",
+		           "PA_SC_AA_MASK_X0Y0_X1Y0",
+		           "PA_SC_AA_MASK_X0Y1_X1Y1",
+		           "PS_SHADER_SAMPLE_EXCLUSION_MASK",
+		           "DB_ALPHA_TO_MASK"};
+	for (size_t i = 0; i < raw.words.size(); ++i) {
+		const auto& word = raw.words[i];
+		std::printf("SampleRegister name=%s value=0x%08x valid=%u last_selected_write=%" PRIu64
+		            "\n",
+		            raw_names[i], word.value, static_cast<unsigned>(word.valid), word.sequence);
+	}
+	std::printf("ColorSampleDiagnostic draw_debug_tuple=private_unavailable\n");
 	for (uint32_t i = 0; i < 8; ++i) {
 		std::printf("ColorSampleDiagnostic target_slot=%u slot_mask=0x%x failing=%u\n", i,
 		            render_target_mask_slot(hw.GetRenderTargetMask(), i),
@@ -89,7 +116,7 @@ static void PrintUnsupportedColorSamples(const CommandBuffer& buffer, uint32_t s
 	std::printf(
 	    "AA msaa_num_samples=%u exposed_samples=%u mask_centroid_dtmn=%u max_sample_dist=%u "
 	    "scan_msaa_enable=%u vport_scissor_enable=%u line_stipple_enable=%u "
-		"centroid_priority=0x%016" PRIx64 "\n",
+	    "centroid_priority=0x%016" PRIx64 "\n",
 	    static_cast<unsigned>(ac.msaa_num_samples), static_cast<unsigned>(ac.msaa_exposed_samples),
 	    static_cast<unsigned>(ac.aa_mask_centroid_dtmn), static_cast<unsigned>(ac.max_sample_dist),
 	    static_cast<unsigned>(sc.msaa_enable), static_cast<unsigned>(sc.vport_scissor_enable),
@@ -141,7 +168,7 @@ static void PrintUnsupportedColorSamples(const CommandBuffer& buffer, uint32_t s
 	std::printf(
 	    "RenderControl depth_clear=%u stencil_clear=%u resummarize=%u stencil_compress_disable=%u "
 	    "depth_compress_disable=%u copy_depth_to_color=%u copy_stencil_to_color=%u "
-		"copy_centroid=%u copy_sample=%u "
+	    "copy_centroid=%u copy_sample=%u "
 	    "force_z_valid=%u force_z_dirty=%u force_stencil_valid=%u force_stencil_dirty=%u\n",
 	    static_cast<unsigned>(rc.depth_clear_enable),
 	    static_cast<unsigned>(rc.stencil_clear_enable),
@@ -153,6 +180,43 @@ static void PrintUnsupportedColorSamples(const CommandBuffer& buffer, uint32_t s
 	    static_cast<unsigned>(rc.copy_sample), static_cast<unsigned>(ov.force_z_valid),
 	    static_cast<unsigned>(ov.force_z_dirty), static_cast<unsigned>(ov.force_stencil_valid),
 	    static_cast<unsigned>(ov.force_stencil_dirty));
+	const auto& stencil      = hw.GetStencilControl();
+	const auto& stencil_mask = hw.GetStencilMask();
+	std::printf("StencilOperations fail=%u zpass=%u zfail=%u fail_bf=%u zpass_bf=%u zfail_bf=%u\n",
+	            static_cast<unsigned>(stencil.stencil_fail),
+	            static_cast<unsigned>(stencil.stencil_zpass),
+	            static_cast<unsigned>(stencil.stencil_zfail),
+	            static_cast<unsigned>(stencil.stencil_fail_bf),
+	            static_cast<unsigned>(stencil.stencil_zpass_bf),
+	            static_cast<unsigned>(stencil.stencil_zfail_bf));
+	std::printf("StencilMasks testval=0x%02x readmask=0x%02x writemask=0x%02x opval=0x%02x "
+	            "testval_bf=0x%02x readmask_bf=0x%02x writemask_bf=0x%02x opval_bf=0x%02x\n",
+	            static_cast<unsigned>(stencil_mask.stencil_testval),
+	            static_cast<unsigned>(stencil_mask.stencil_mask),
+	            static_cast<unsigned>(stencil_mask.stencil_writemask),
+	            static_cast<unsigned>(stencil_mask.stencil_opval),
+	            static_cast<unsigned>(stencil_mask.stencil_testval_bf),
+	            static_cast<unsigned>(stencil_mask.stencil_mask_bf),
+	            static_cast<unsigned>(stencil_mask.stencil_writemask_bf),
+	            static_cast<unsigned>(stencil_mask.stencil_opval_bf));
+	for (uint32_t i = 0; i < 8; ++i) {
+		const auto& blend = hw.GetBlendControl(i);
+		std::printf("BlendControl slot=%u enable=%u separate_alpha=%u "
+		            "color_src=%u color_combine=%u color_dst=%u alpha_src=%u alpha_combine=%u "
+		            "alpha_dst=%u\n",
+		            i, static_cast<unsigned>(blend.enable),
+		            static_cast<unsigned>(blend.separate_alpha_blend),
+		            static_cast<unsigned>(blend.color_srcblend),
+		            static_cast<unsigned>(blend.color_comb_fcn),
+		            static_cast<unsigned>(blend.color_destblend),
+		            static_cast<unsigned>(blend.alpha_srcblend),
+		            static_cast<unsigned>(blend.alpha_comb_fcn),
+		            static_cast<unsigned>(blend.alpha_destblend));
+	}
+	const auto& blend_color = hw.GetBlendColor();
+	std::printf("BlendColor red=%g green=%g blue=%g alpha=%g\n",
+	            static_cast<double>(blend_color.red), static_cast<double>(blend_color.green),
+	            static_cast<double>(blend_color.blue), static_cast<double>(blend_color.alpha));
 	const auto& sh = hw.GetShaderRegisters();
 	const auto& db = sh.db_shader_control;
 	std::printf("ShaderContext stages=0x%08x cb_shader_mask=0x%08x pa_sc_shader_control=0x%08x "
@@ -163,7 +227,7 @@ static void PrintUnsupportedColorSamples(const CommandBuffer& buffer, uint32_t s
 	std::printf(
 	    "DBShaderControl other_bits=0x%08x conservative_z_export_value=%u shader_z_behavior=%u "
 	    "kill=%u z_export=%u mask_export=%u dual_export=%u execute_on_noop=%u "
-		"alpha_to_mask_disable=%u\n",
+	    "alpha_to_mask_disable=%u\n",
 	    db.other_bits, static_cast<unsigned>(db.conservative_z_export_value),
 	    static_cast<unsigned>(db.shader_z_behavior), static_cast<unsigned>(db.shader_kill_enable),
 	    static_cast<unsigned>(db.shader_z_export_enable),

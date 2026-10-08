@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
+#include <array>
+
 namespace Libs::Graphics::HW {
 
 struct ColorBase {
@@ -457,8 +459,8 @@ struct PsShaderResource2 {
 };
 
 struct PsStageRegisters {
-	uint64_t          data_addr = 0;
-	uint64_t          user_data_addr = 0;
+	uint64_t data_addr      = 0;
+	uint64_t user_data_addr = 0;
 	// Hades II uses PS offsets 4:5 for a byte-addressed descriptor table.
 	uint64_t          auxiliary_table_addr = 0;
 	PsShaderResource1 rsrc1;
@@ -627,6 +629,54 @@ struct GeUserVgprEn {
 	bool vgpr3 = false;
 };
 
+// Diagnostic state only. These are selected accepted register writes observed
+// while graphics debug dumping is enabled, not GPU timestamps or all-register
+// chronology. Context copies/restores preserve this snapshot; Reset clears it.
+enum class SampleRegister : uint8_t {
+	DepthZInfo,
+	Eqaa,
+	DepthControl,
+	StencilInfo,
+	AaConfig,
+	Color0Attrib,
+	Color1Attrib,
+	Color2Attrib,
+	Color3Attrib,
+	Color4Attrib,
+	Color5Attrib,
+	Color6Attrib,
+	Color7Attrib,
+	AaMaskX0Y0X1Y0,
+	AaMaskX0Y1X1Y1,
+	SampleExclusionMask,
+	AlphaToMask,
+	Count
+};
+
+struct SampleRegisterWord {
+	uint32_t value    = 0;
+	uint64_t sequence = 0;
+	bool     valid    = false;
+};
+
+struct SampleRegisterSnapshot {
+	uint64_t                                                                   sequence = 0;
+	std::array<SampleRegisterWord, static_cast<size_t>(SampleRegister::Count)> words {};
+
+	void Record(SampleRegister reg, uint32_t value) {
+		const auto index = static_cast<size_t>(reg);
+		if (index >= words.size()) {
+			return;
+		}
+		// Saturate only at the diagnostic counter's limit; never wrap a valid
+		// observed write into the unobserved sequence-zero state.
+		if (sequence != UINT64_MAX) {
+			++sequence;
+		}
+		words[index] = {value, sequence, true};
+	}
+};
+
 class Context {
 public:
 	Context()  = default;
@@ -635,6 +685,13 @@ public:
 	KYTY_CLASS_DEFAULT_COPY(Context);
 
 	void Reset() { *this = Context(); }
+
+	void RecordSampleRegister(SampleRegister reg, uint32_t value) {
+		m_sample_register_snapshot.Record(reg, value);
+	}
+	[[nodiscard]] const SampleRegisterSnapshot& GetSampleRegisterSnapshot() const {
+		return m_sample_register_snapshot;
+	}
 
 	void SetColorBase(uint32_t slot, const ColorBase& base) { m_render_targets[slot].base = base; }
 	void SetColorView(uint32_t slot, const ColorView& view) { m_render_targets[slot].view = view; }
@@ -904,8 +961,9 @@ public:
 	void SetScShaderControl(uint32_t value) { m_sh_regs.m_paScShaderControl = value; }
 
 private:
-	float    m_line_width            = 1.0f;
-	uint32_t m_primitive_reset_index = 0xffffffffu;
+	SampleRegisterSnapshot m_sample_register_snapshot;
+	float                  m_line_width            = 1.0f;
+	uint32_t               m_primitive_reset_index = 0xffffffffu;
 
 	BlendControl    m_blend_control[8];
 	BlendColor      m_blend_color;
@@ -984,7 +1042,7 @@ public:
 	[[nodiscard]] const FsrView& GetFsrView() const { return m_fsr_view; }
 
 private:
-	FsrView m_fsr_view;
+	FsrView                 m_fsr_view;
 	Prospero::PrimitiveType m_prim_type               = Prospero::PrimitiveType::kNone;
 	uint32_t                m_index_offset            = 0;
 	uint32_t                m_object_id               = 0;
@@ -1064,8 +1122,8 @@ public:
 private:
 	static void SetUserDataAddressWord(uint64_t& address, uint32_t word, uint32_t value) {
 		const auto shift = word * 32u;
-		address = (address & ~(uint64_t {0xffffffffu} << shift)) |
-		          (static_cast<uint64_t>(value) << shift);
+		address          = (address & ~(uint64_t {0xffffffffu} << shift)) |
+		                   (static_cast<uint64_t>(value) << shift);
 	}
 
 	VertexShaderInfo  m_vs;
