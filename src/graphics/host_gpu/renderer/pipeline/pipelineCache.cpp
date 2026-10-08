@@ -241,12 +241,21 @@ bool WriteCallCaptureFile(const std::filesystem::path& path, const void* data, s
 	return static_cast<bool>(file);
 }
 
+bool SelectedCalleeResourceCaptureRequested();
+
 bool DumpShaderCallInputs(const char* stage_name,
                           const ShaderRecompiler::CompileOptions& options,
                           std::span<const uint32_t> code,
-                          std::filesystem::path* output_folder = nullptr) {
+                          std::filesystem::path* output_folder = nullptr,
+                          bool selected_capture = false) {
+	// Only the validated selected CPU capture may collect required artifacts with
+	// broad shader dumps disabled. Ordinary capture callers retain the old gate.
+	if (selected_capture &&
+	    (!SelectedCalleeResourceCaptureRequested() || options.stage != ShaderType::Compute ||
+	     options.shader_hash != 0x3351560625c27256ull || output_folder == nullptr)) return false;
 	// Other stages can have fused/front-only code spans with different decoding rules.
-	if (!Config::GraphicsDebugDumpEnabled() || options.stage != ShaderType::Compute) return false;
+	if ((!Config::GraphicsDebugDumpEnabled() && !selected_capture) ||
+	    options.stage != ShaderType::Compute) return false;
 	const auto could_call = [](uint32_t word) {
 		return ((word >> 23u) & 0x1ffu) == 0x17du && ((word >> 8u) & 0xffu) == 0x21u &&
 		       ((word >> 16u) & 0x7fu) != 125u;
@@ -418,13 +427,13 @@ bool SelectedCalleeResourceCaptureRequested() {
     const auto present=[](const char* name){return std::getenv(name)!=nullptr;};
     const auto* reference=std::getenv("KYTY_SELECTED_CALLEE_REFERENCE_FILE");
     if(std::strcmp(requested,"1")!=0 || !ExternalProbeRequested() ||
-       !Config::GraphicsDebugDumpEnabled() || reference==nullptr || *reference=='\0' ||
+       reference==nullptr || *reference=='\0' ||
        present("KYTY_CAPTURE_EXTERNAL_RESOURCE_READS") ||
        present("KYTY_CAPTURE_EXTERNAL_INPUTS_ONLY") ||
        present("KYTY_EXTERNAL_UNWRITTEN_VGPR") ||
        present("KYTY_PROBE_EXTERNAL_BEFORE_BVH") ||
        present("KYTY_PROBE_EXTERNAL_AFTER_BVH"))
-        EXIT("Selected-callee resource capture requires exact value1, target probe, graphics debug dumping, reference file, and no other capture/checked/BVH mode\n");
+        EXIT("Selected-callee resource capture requires exact value1, target probe, reference file, and no other capture/checked/BVH mode\n");
     return true;
 }
 
@@ -958,7 +967,7 @@ struct PipelineCache::ProgramCache {
                 // Every probe/checked option remains false/default. The resulting
                 // normal callee is translated/materialized on CPU only, never emitted.
                 std::filesystem::path input_folder;
-                const bool input_written=DumpShaderCallInputs("cs",selected_options,params.code,&input_folder);
+                const bool input_written=DumpShaderCallInputs("cs",selected_options,params.code,&input_folder,true);
                 if(!input_written)EXIT("Selected-callee input artifact write failed; no materialization\n");
                 const auto topology=ResourceCaptureLibraryTopology(selected.overlay);
                 const bool overlay_written=WriteCallCaptureFile(input_folder/"selected-overlay-topology-u64le.bin",topology.data(),topology.size()*sizeof(uint64_t));
