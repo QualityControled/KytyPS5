@@ -1106,19 +1106,20 @@ static void LogCarRenderDiagnostic(CommandBuffer& buffer, uint64_t submit_id,
     namespace CD = CarRenderDiagnostic;
     if (!CD::Ready() || !state.ps_active) return;
     if (!CD::EligibleDraw(draw.index_count, state.depth_info.depth_test_enable)) return;
-    static CD::SignatureBudget budget;
+    static CD::SignatureBudget budget(CD::GeometryEnabled() ? CD::SignatureBudget::GeometryMaxRecordBytes :
+                                                           CD::SignatureBudget::MaxRecordBytes);
     static bool limit_reported = false, active_reported = false, stopped = false;
     if (stopped || budget.Exhausted()) return;
     if (!active_reported) {
-        std::printf("CarRenderDiagnostic active schema=1 start_file=%u max_records=64 max_record_bytes=32768 max_total_bytes=1048576 metadata_only=1 contents=unknown\n",
-                    CD::ProcessStartGate().HasStartFile());
+        std::printf("CarRenderDiagnostic active schema=1 start_file=%u max_records=64 max_record_bytes=%zu max_total_bytes=1048576 metadata_only=1 contents=unknown\n",
+                    CD::ProcessStartGate().HasStartFile(), budget.RecordBytes());
         if (CD::GeometryEnabled()) {
             std::printf("CarRenderDiagnostic geometry_filter=1 count_source=DrawCallInfo.index_count indexed=guest_indices auto=guest_vertices min_count=128 depth_test_alternative=1 candidate_only=1 vehicle_identity=unknown\n");
         }
         std::fflush(stdout);
         active_reported = true;
     }
-    CD::BoundedText text;
+    CD::BoundedText text(budget.RecordBytes());
     const auto& hw = buffer.GetRegisters();
     const auto& depth = state.depth_info;
     if (CD::GeometryEnabled()) {

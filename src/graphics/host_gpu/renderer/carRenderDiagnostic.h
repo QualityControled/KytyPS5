@@ -90,8 +90,16 @@ enum class Claim { Accepted, Duplicate, Full, Oversize };
 class SignatureBudget {
 public:
     static constexpr size_t MaxRecords = 64, MaxRecordBytes = 32768, MaxTotalBytes = 1024 * 1024;
+    static constexpr size_t GeometryMaxRecordBytes = 256 * 1024;
+    // Invalid constructor inputs retain the smaller original bound.
+    static constexpr size_t ValidatedRecordBytes(size_t requested) {
+        return requested == GeometryMaxRecordBytes ? GeometryMaxRecordBytes : MaxRecordBytes;
+    }
+    explicit SignatureBudget(size_t max_record_bytes = MaxRecordBytes):
+        m_max_record_bytes(ValidatedRecordBytes(max_record_bytes)) {}
+    size_t RecordBytes() const { return m_max_record_bytes; }
     Claim Admit(const std::string& signature) {
-        if (signature.size() > MaxRecordBytes) return Claim::Oversize;
+        if (signature.size() > m_max_record_bytes) return Claim::Oversize;
         if (std::find(m_signatures.begin(), m_signatures.end(), signature) != m_signatures.end()) return Claim::Duplicate;
         if (m_signatures.size() == MaxRecords || signature.size() > MaxTotalBytes - m_bytes) return Claim::Full;
         m_signatures.push_back(signature);
@@ -102,20 +110,25 @@ public:
     size_t Bytes() const { return m_bytes; }
     bool Exhausted() const { return m_signatures.size() == MaxRecords || m_bytes == MaxTotalBytes; }
 private:
+    const size_t m_max_record_bytes;
     std::vector<std::string> m_signatures;
     size_t m_bytes = 0;
 };
 
 class BoundedText {
 public:
+    explicit BoundedText(size_t max_record_bytes = SignatureBudget::MaxRecordBytes):
+        m_max_record_bytes(SignatureBudget::ValidatedRecordBytes(max_record_bytes)) {}
+    size_t RecordBytes() const { return m_max_record_bytes; }
     bool Add(std::string text) {
-        if (text.size() > SignatureBudget::MaxRecordBytes - m_text.size()) { m_oversize = true; return false; }
+        if (text.size() > m_max_record_bytes - m_text.size()) { m_oversize = true; return false; }
         m_text += text;
         return true;
     }
     const std::string& Text() const { return m_text; }
     bool Oversize() const { return m_oversize; }
 private:
+    const size_t m_max_record_bytes;
     std::string m_text;
     bool m_oversize = false;
 };
