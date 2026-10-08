@@ -21,6 +21,22 @@ inline bool Enabled() {
     return enabled;
 }
 
+// This opt-in narrows diagnostic records only; it never changes draw execution.
+inline bool GeometryEnabled() {
+    if (!Enabled()) return false;
+    static const bool enabled = [] {
+        const auto* value = std::getenv("KYTY_CAR_RENDER_DIAGNOSTIC_GEOMETRY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+inline bool EligibleDraw(uint32_t source_count, bool depth_test) {
+    // DrawIndex supplies guest index_count; DrawIndexAuto supplies guest vertex_count.
+    // No instance multiplication or inference that this draw represents a vehicle.
+    return !GeometryEnabled() || source_count >= 128 || depth_test;
+}
+
 inline bool ValidStartPath(std::string_view input) {
     if (input.empty() || input.size() > 1024 || input.back() == '/' || input.back() == '\\') return false;
     std::string normalized(input);

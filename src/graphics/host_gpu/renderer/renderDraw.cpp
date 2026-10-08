@@ -1105,18 +1105,26 @@ static void LogCarRenderDiagnostic(CommandBuffer& buffer, uint64_t submit_id,
                                    std::span<PreparedBindings* const> stages) {
     namespace CD = CarRenderDiagnostic;
     if (!CD::Ready() || !state.ps_active) return;
+    if (!CD::EligibleDraw(draw.index_count, state.depth_info.depth_test_enable)) return;
     static CD::SignatureBudget budget;
     static bool limit_reported = false, active_reported = false, stopped = false;
     if (stopped || budget.Exhausted()) return;
     if (!active_reported) {
         std::printf("CarRenderDiagnostic active schema=1 start_file=%u max_records=64 max_record_bytes=32768 max_total_bytes=1048576 metadata_only=1 contents=unknown\n",
                     CD::ProcessStartGate().HasStartFile());
+        if (CD::GeometryEnabled()) {
+            std::printf("CarRenderDiagnostic geometry_filter=1 count_source=DrawCallInfo.index_count indexed=guest_indices auto=guest_vertices min_count=128 depth_test_alternative=1 candidate_only=1 vehicle_identity=unknown\n");
+        }
         std::fflush(stdout);
         active_reported = true;
     }
     CD::BoundedText text;
     const auto& hw = buffer.GetRegisters();
     const auto& depth = state.depth_info;
+    if (CD::GeometryEnabled()) {
+        text.Add(fmt::format("CarGeometryCandidate source_count={} depth_test={} vehicle_identity=unknown gpu_election_not_proved=1\n",
+            draw.index_count, depth.depth_test_enable));
+    }
     text.Add(fmt::format("CarDraw draw={} native_ps=0x{:016x} ps_hash=0x{:016x} index_count={} instances={} color_mask=0x{:08x} colors={} extent={}x{} layers={} depth_id={} depth_gen={} depth_test={} depth_write={} depth_cmp={} depth_load_clear={} stencil_test={} stencil_clear={} initial_contents=unknown\n",
         draw.Name(), buffer.GetShaders().GetPs().ps_regs.data_addr,
         state.ps_input_info.stage.program->shader_hash, draw.index_count, draw.instance_count,
