@@ -43861,14 +43861,43 @@ int main(int argc, char **argv) {
         const auto test = GraphicsSmoothFlatInputAlias(flat_first, provoking_last);
         const auto compiled = CompileFragmentCase(test);
         const auto &inputs = compiled.program.info.inputs;
-        Require(test.name, "native shared vertex interface",
-                std::ranges::any_of(inputs, [](const auto &input) {
+        Require(test.name, "logical mixed input aliases",
+                std::ranges::count_if(inputs, [](const auto &input) {
                   return input.kind == ShaderRecompiler::IR::StageInputKind::Parameter;
-                }) && std::ranges::none_of(inputs, [](const auto &input) {
-                  return input.kind == ShaderRecompiler::IR::StageInputKind::Parameter &&
-                         (input.location != 0u || !input.per_vertex);
-                }),
-                "mixed flat/smooth aliases must read the actual raw vertex export at location zero");
+                }) == 2 && std::ranges::any_of(inputs, [](const auto &input) {
+                  return input.kind == ShaderRecompiler::IR::StageInputKind::Parameter && input.location == 0u;
+                }) && std::ranges::any_of(inputs, [](const auto &input) {
+                  return input.kind == ShaderRecompiler::IR::StageInputKind::Parameter && input.location == 1u;
+                }) && std::ranges::all_of(inputs, [](const auto &input) {
+                  return input.kind != ShaderRecompiler::IR::StageInputKind::Parameter ||
+                         (input.location <= 1u && input.per_vertex);
+                }), "logical guest inputs zero and one must retain shared per-vertex data");
+        std::vector<u32> input_ids, per_vertex_ids;
+        std::vector<std::pair<u32, u32>> locations;
+        for (size_t offset = 5; offset < compiled.spirv.size();) {
+          const auto count = compiled.spirv[offset] >> 16u;
+          Require(test.name, "SPIR-V instruction bounds", count != 0 &&
+                  count <= compiled.spirv.size() - offset, "invalid instruction length");
+          const auto words = std::span<const u32>(compiled.spirv).subspan(offset, count);
+          const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+          if (opcode == spv::OpVariable && count >= 4 && words[3] == spv::StorageClassInput)
+            input_ids.push_back(words[2]);
+          if (opcode == spv::OpDecorate && count == 4 && words[2] == spv::DecorationLocation)
+            locations.emplace_back(words[1], words[3]);
+          if (opcode == spv::OpDecorate && count == 3 && words[2] == spv::DecorationPerVertexKHR)
+            per_vertex_ids.push_back(words[1]);
+          offset += count;
+        }
+        u32 parameter_variables = 0;
+        for (const auto &[id, location] : locations) {
+          if (std::ranges::find(input_ids, id) == input_ids.end()) continue;
+          ++parameter_variables;
+          Require(test.name, "emitted shared vertex export", location == 0u &&
+                  std::ranges::find(per_vertex_ids, id) != per_vertex_ids.end(),
+                  "mixed aliases must share a PerVertexKHR input decorated at actual export zero");
+        }
+        Require(test.name, "emitted alias variable count", parameter_variables == 1u,
+                "logical aliases must share exactly one actual vertex interface variable");
         Require(test.name, "smooth interpolation weights",
                 std::ranges::any_of(inputs, [](const auto &input) {
                   return input.kind == ShaderRecompiler::IR::StageInputKind::BaryCoordSmooth;
