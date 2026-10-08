@@ -2,6 +2,14 @@
 
 This list covers emulator changes after `KytyPS5-2026-10-07-d2413fc`. Experimental settings are opt-in. Owned fixtures and captured CPU validation are separate from actual game observations.
 
+## r35 - 2026-10-08 - 35d1798
+
+- Port [upstream 21a1346](https://github.com/KytyPS5/KytyPS5/commit/21a1346e27db4788515cf8d0954164a27ad637eb) to preserve physical color-export locations when the active render-target mask has gaps. Retain reverse component mapping and distinguish occupancy in shader cache identity.
+- The coherent ten-target build and eight selected CPU regression groups passed. Four authored MRT modules passed native CPU emission/default Vulkan 1.2 SPIR-V validation with physical export-location and occupancy-key assertions. Official reverse component mapping and four preserved interpolation modules plus rectangle controls passed. No new GPU validation is claimed for this port.
+- The first r35 trial showed a Civic vehicle preview that remained dark, flat and incorrectly shaded, with the GT7 logo and no Garage controls. The exact menu or preview phase was unconfirmed. The run closed normally; no visual, FPS or crash repair was established. Targeted tracing retained 36 complete draw candidates in two signature groups and 360 pixel-shader image associations; these associations do not establish vehicle-draw identity or causality. Prior r34 vehicle appearance looked about the same; materials, lighting, shadows, details and performance remain unresolved. Scapes Movies ran, but returning to World Map ended in a native read access violation; cause unresolved. The earlier native fiber stack write fault is also unresolved.
+- Separately, the existing owned CPU red-zone patcher fixture passed nine modeled cases. These deliberately controlled faults do not prove Windows overwrote the game's stack or that either crash is repaired. Red-zone protection remains off in the portable starter and first vehicle-preview trial.
+- The portable starter retains the reviewed lower-AA/resolve, file backing and terminal external-call probe settings. Software R8 comparison, optional diagnostics and lookup remain off.
+
 ## r34 - 2026-10-08 - 8c291f1
 
 - Port [upstream b38b745](https://github.com/KytyPS5/KytyPS5/commit/b38b7454a6bc21f5d68bea825214fac60f53f80a) to preserve real vertex-export locations when a pixel shader reads the same export with both flat and smooth interpolation. Respect first/last provoking-vertex selection for ordinary primitives and retain rectangle interpolation's separate mapping.
