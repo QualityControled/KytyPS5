@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderCallDiagnostics.h"
 #include "graphics/shader/recompiler/ExternalLibrary.h"
+#include "graphics/shader/recompiler/SelectedCalleeCapture.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/SrtReadCapture.h"
@@ -406,6 +407,39 @@ bool DumpShaderCallInputs(const char* stage_name,
 	PipelineCacheLog("External-call diagnostic capture (selected function unknown): {}",
 	                 Common::PathToString(path));
 	return files_written;
+}
+
+bool SelectedCalleeResourceCaptureRequested() {
+    const auto* requested=std::getenv("KYTY_CAPTURE_SELECTED_CALLEE_RESOURCES");
+    if(requested==nullptr)return false;
+    const auto present=[](const char* name){return std::getenv(name)!=nullptr;};
+    const auto* reference=std::getenv("KYTY_SELECTED_CALLEE_REFERENCE_FILE");
+    if(std::strcmp(requested,"1")!=0 || !ExternalProbeRequested() ||
+       !Config::GraphicsDebugDumpEnabled() || reference==nullptr || *reference=='\0' ||
+       present("KYTY_CAPTURE_EXTERNAL_RESOURCE_READS") ||
+       present("KYTY_CAPTURE_EXTERNAL_INPUTS_ONLY") ||
+       present("KYTY_EXTERNAL_UNWRITTEN_VGPR") ||
+       present("KYTY_PROBE_EXTERNAL_BEFORE_BVH") ||
+       present("KYTY_PROBE_EXTERNAL_AFTER_BVH"))
+        EXIT("Selected-callee resource capture requires exact value1, target probe, graphics debug dumping, reference file, and no other capture/checked/BVH mode\n");
+    return true;
+}
+
+ShaderRecompiler::Diagnostics::SelectedNativeReference ReadSelectedCalleeReference() {
+    using namespace ShaderRecompiler::Diagnostics;
+    const std::filesystem::path path(std::getenv("KYTY_SELECTED_CALLEE_REFERENCE_FILE"));
+    if(!path.is_absolute())EXIT("Selected-callee native reference must be an absolute owned file path\n");
+    std::ifstream file(path,std::ios::binary|std::ios::ate);
+    if(!file)EXIT("Selected-callee native reference open failed\n");
+    const auto bytes=file.tellg();
+    if(bytes<=0 || bytes>65536 || bytes%4!=0)EXIT("Selected-callee native reference size rejected\n");
+    std::vector<uint32_t> words(static_cast<size_t>(bytes)/4u);
+    file.seekg(0);file.read(reinterpret_cast<char*>(words.data()),bytes);
+    if(!file)EXIT("Selected-callee native reference read failed\n");
+    SelectedNativeReference result;std::string failure;
+    if(!ParseSelectedNativeReference(words,SelectedReferencePolicy{},result,failure))
+        EXIT("Selected-callee native reference rejected: %s\n",failure.c_str());
+    return result;
 }
 
 bool ExternalResourceReadCaptureRequested() {
@@ -819,6 +853,7 @@ struct PipelineCache::ProgramCache {
 		const bool requested_structured_probe = ExternalStructuredProbeRequested();
 		const bool requested_after_bvh_probe = ExternalAfterBvhProbeRequested();
 		const bool requested_resource_capture = ExternalResourceReadCaptureRequested();
+		const bool requested_selected_capture = SelectedCalleeResourceCaptureRequested();
 		const auto requested_checked_vgpr = ExternalUnwrittenVgprRequested();
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -869,6 +904,91 @@ struct PipelineCache::ProgramCache {
 				lookup_key.external_unwritten_vgpr = requested_checked_vgpr;
 			}
 		}
+        // Diagnostic CPU-only branch precedes warm program lookup. It never
+        // reuses/stores the terminal probe resource plan or a shader permutation.
+        if(requested_selected_capture && params.hash==0x3351560625c27256ull) {
+            if constexpr (!std::is_same_v<InputInfo,ShaderComputeInputInfo>) {
+                EXIT("Selected-callee resource capture requires compute stage\n");
+            } else {
+                const auto reference=ReadSelectedCalleeReference();
+                if(!lookup_key.external_library)EXIT("Selected-callee capture has no complete held library\n");
+                const auto& held=*lookup_key.external_library;
+                ShaderRecompiler::Decoder::Program decoded;
+                ShaderRecompiler::Decoder::DecodeProgram(params.code,decoded);
+                auto selected=ShaderRecompiler::Diagnostics::PrepareSelectedCalleeCapture(
+                    params.hash,decoded,held,reference);
+                if(!selected.success)EXIT("Selected-callee candidate rejected: %s\n",selected.failure.c_str());
+                if(!ShaderRecompiler::ValidateExternalLibraryDependencies(held,ReadShaderGuestMemory))
+                    EXIT("Selected-callee held dependency validation failed before materialization\n");
+                ShaderStageInputInfo selected_input{};selected_input.compute=&input_info;
+                ShaderRecompiler::CompileOptions selected_options;
+                selected_options.stage=ShaderType::Compute;selected_options.shader_hash=params.hash;
+                selected_options.wave_size=input_info.wave_size;selected_options.user_data=user_data;
+                selected_options.input_info=selected_input;selected_options.external_library=&selected.overlay;
+                selected_options.dump_ir=false;
+                // Every probe/checked option remains false/default. The resulting
+                // normal callee is translated/materialized on CPU only, never emitted.
+                std::filesystem::path input_folder;
+                const bool input_written=DumpShaderCallInputs("cs",selected_options,params.code,&input_folder);
+                if(!input_written)EXIT("Selected-callee input artifact write failed; no materialization\n");
+                const auto topology=ResourceCaptureLibraryTopology(selected.overlay);
+                const bool overlay_written=WriteCallCaptureFile(input_folder/"selected-overlay-topology-u64le.bin",topology.data(),topology.size()*sizeof(uint64_t));
+                const bool reference_written=WriteCallCaptureFile(input_folder/"selected-native-reference.u32le.bin",reference.serialized_words.data(),reference.serialized_words.size()*sizeof(uint32_t));
+                const std::string candidate=fmt::format(
+                    "schema=1 scope=authored_candidate_CPU_materialization_only selected_this_run=false\n"
+                    "selection_basis=previous_run_observed_ordinal_8156_exact_reachable_native_reference\n"
+                    "caller_hash=0x{:016x} caller_base=0x{:016x} call_pc=0x{:08x} domain={} ordinal={} function={}\n"
+                    "target=0x{:016x} auxiliary=0x{:016x} relocated_addresses_allowed=true full_domain_support_proven=false\n"
+                    "selected_compile_external_probe=false selected_compile_before_bvh=false selected_compile_structured=false selected_compile_after_bvh=false selected_compile_checked_vgpr=4294967295 parent_target_probe=true parent_structured_probe={}\n"
+                    "reference_sha256=F6917CF654540D698C8DDC86D4114DF6D4720C6244E984E1A5AA829B479A1154 reference_xxh128_high=fade6f1f85f00811 reference_xxh128_low=b76ee41325b5dd93\n"
+                    "reference_file=selected-native-reference.u32le.bin reference_native_instructions={} reference_extent_bytes={} overlay_functions=1 overlay_records=1\n"
+                    "full_held_plan_artifacts=resource_reads/library-topology-u64le.bin+exact_dependency_files\n"
+                    "legacy_input_dump_epoch=separate_reread_not_authoritative_held_plan\n",
+                    params.hash,params.Base(),reference.caller_pc,reference.domain,reference.ordinal,selected.function_id,
+                    selected.target,selected.auxiliary,lookup_key.external_probe_structured,reference.instructions.size(),reference.extent_bytes);
+                const bool selection_written=WriteCallCaptureFile(input_folder/"selected-candidate.txt",candidate.data(),candidate.size());
+                if(!overlay_written || !selection_written || !reference_written)EXIT("Selected-callee overlay/reference artifact write failed; no materialization\n");
+                const auto domains=ShaderRecompiler::ExternalContextDomains(selected.overlay);
+                ShaderRecompiler::IR::SrtRuntime selected_runtime{
+                    .user_data=user_data,.shader_base=params.Base(),.read_specialization_memory=ReadShaderGuestMemory,
+                    .workgroup_counts=input_info.workgroup_counts,.external_context_domains=domains,
+                    .descriptor_limits={.sampled_images=limits.maxPerStageDescriptorSampledImages,
+                        .storage_images=limits.maxPerStageDescriptorStorageImages,.samplers=limits.maxPerStageDescriptorSamplers,
+                        .storage_buffers=limits.maxPerStageDescriptorStorageBuffers,.total_resources=limits.maxPerStageResources}};
+                ShaderRecompiler::IR::SrtReadCaptureIdentity identity;
+                identity.stage=ShaderType::Compute;identity.shader_hash=params.hash;identity.shader_base=params.Base();
+                static std::atomic_uint64_t next_selected_pass{1};identity.pass_id=next_selected_pass++;
+                identity.user_data.assign(user_data.begin(),user_data.end());
+                identity.control_schema="compute_v1:wave,host_subgroup,threads_xyz,dispatch_threads_xyz,workgroup_counts_xyz,group_id_xyz,thread_ids,workgroup_register,tg_size_en,dispatch_dimensions,lds_storage,lds_dwords,scratch_dwords,float_mode,external_probe,before_bvh,checked_vgpr,descriptor_limits_5";
+                identity.control_words={input_info.wave_size,input_info.host_subgroup_size,
+                    input_info.threads_num[0],input_info.threads_num[1],input_info.threads_num[2],
+                    input_info.dispatch_threads_num[0],input_info.dispatch_threads_num[1],input_info.dispatch_threads_num[2],
+                    input_info.workgroup_counts[0],input_info.workgroup_counts[1],input_info.workgroup_counts[2],
+                    input_info.group_id[0],input_info.group_id[1],input_info.group_id[2],
+                    static_cast<uint32_t>(input_info.thread_ids_num),static_cast<uint32_t>(input_info.workgroup_register),input_info.tg_size_en,
+                    input_info.dispatch_thread_dimensions,static_cast<uint32_t>(input_info.lds_storage),input_info.lds_size_dwords,
+                    input_info.scratch_size_dwords,input_info.float_mode,0u,0u,UINT32_MAX,
+                    selected_runtime.descriptor_limits.sampled_images,selected_runtime.descriptor_limits.storage_images,
+                    selected_runtime.descriptor_limits.samplers,selected_runtime.descriptor_limits.storage_buffers,selected_runtime.descriptor_limits.total_resources};
+                identity.caller_identity="actual-caller.bin";
+                identity.library_identity="library-topology-u64le.bin+exact_dependency_files";
+                identity.input_identity=Common::PathToString(input_folder)+"/selected-candidate.txt";
+                ShaderRecompiler::IR::SrtReadCapture capture(std::move(identity));
+                selected_runtime.post_read_observer=ShaderRecompiler::IR::SrtReadCapture::Observe;
+                selected_runtime.post_read_userdata=&capture;
+                std::printf("Selected-callee CPU candidate capture begin hash=0x%016" PRIx64 " ordinal=%u target=0x%016" PRIx64 " auxiliary=0x%016" PRIx64 "; NOT selected by this run\n",params.hash,reference.ordinal,selected.target,selected.auxiliary);std::fflush(stdout);
+                auto translated=ShaderRecompiler::TranslateProgram(params.code,selected_options);
+                const auto plan=ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+                ShaderRecompiler::IR::ResourceSnapshot resources;
+                ShaderRecompiler::IR::ResourceSpecialization specialization;
+                const bool materialized=ShaderRecompiler::IR::MaterializeResources(plan,selected_runtime,resources,specialization);
+                const bool dependencies_stable=ShaderRecompiler::ValidateExternalLibraryDependencies(held,ReadShaderGuestMemory);
+                capture.Finalize(materialized && dependencies_stable);
+                const bool saved=DumpResourceReadCapture(input_folder,capture,held,params.code,
+                    input_written && overlay_written && selection_written && reference_written && dependencies_stable,materialized && dependencies_stable);
+                EXIT("Selected-callee CPU resource diagnostic stop: materialized=%d dependencies_stable=%d capture_complete=%d files_written=%d; candidate only, no shader emission, driver module, callee or caller continuation execution\n",materialized,dependencies_stable,capture.Complete(),saved);
+            }
+        }
 		auto                                         entry = programs.find(lookup_key);
 		std::vector<ShaderRecompiler::IR::ExternalCallContextDomain> context_domains;
 		if (lookup_key.external_library) {
