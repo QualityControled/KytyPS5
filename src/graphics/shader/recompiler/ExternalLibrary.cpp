@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ExternalLibrary.h"
+#include "graphics/shader/recompiler/frontend/decode/ScalarWriteWidth.h"
 
 #include "graphics/shader/recompiler/ShaderCallDiagnostics.h"
 #include "graphics/shader/shaderBindings.h"
@@ -33,16 +34,6 @@ bool DescriptorAddress(uint64_t base, int32_t offset, uint64_t& address) {
 	return sizeof(uint32_t) * 4u - 1u <= address_mask - address;
 }
 
-uint32_t ScalarWriteWords(const Decoder::Instruction& inst) {
-	const auto name = magic_enum::enum_name(inst.opcode);
-	if (inst.family == Decoder::Family::VOPC || name.starts_with("V_CMP")) return 2u;
-	const bool count_to_i32 =
-	    name.starts_with("S_BCNT") || name.starts_with("S_FF") || name.starts_with("S_FLBIT");
-	return !count_to_i32 &&
-	               (name.ends_with("_B64") || name.ends_with("_U64") || name.ends_with("_I64"))
-	           ? 2u
-	           : std::max(inst.data_dwords, 1u);
-}
 
 bool AddCodeDependency(ExternalLibraryPlan& plan, uint64_t address,
                        const std::vector<uint32_t>& words) {
@@ -100,7 +91,7 @@ uint32_t AuxiliaryPair(const Decoder::Program& caller, uint32_t record_pc,
 		const bool copy = mov64 || inst.opcode == Decoder::Opcode::S_MOV_B32;
 		const auto old = origins;
 		if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
-			const auto width = ScalarWriteWords(inst);
+			const auto width = Decoder::ScalarDestinationDwords(inst);
 			if (inst.dst.reg >= origins.size() || width > origins.size() - inst.dst.reg)
 				return UINT32_MAX;
 			for (uint32_t word = 0; word < width; ++word) {

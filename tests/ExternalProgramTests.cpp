@@ -79,6 +79,71 @@ void Rejected(Fixture& fixture, std::string_view reason) {
 	      "invalid library lacked a precise nonfatal linker rejection");
 }
 
+// Pair writers use legal even-aligned SGPR pairs. Preserve and restore the
+// low link word so only a missed high-word clobber can cause false admission.
+void TestSavedLinkScalarWriteWidths() {
+    const auto sop2=[](uint32_t op,uint32_t dst){return 0x80000000u|(op<<23u)|(dst<<16u)|(0x81u<<8u);};
+    const auto sop1=[](uint32_t op,uint32_t dst){return 0xbe800000u|(dst<<16u)|(op<<8u);};
+    struct Case { const char* name;std::vector<uint32_t> words;Decoder::Opcode op;uint32_t dst;bool restore_low;bool returns; };
+    const std::vector<Case> cases {
+      {"CMP pair14 clobber with restored low",{0xd401000eu,0x00020501u},Decoder::Opcode::V_CMP_LT_F32,14,true,false},
+      {"CMP direct pair14 clobber",{0xd401000eu,0x00020501u},Decoder::Opcode::V_CMP_LT_F32,14,false,false},
+      {"CMP disjoint pair12",{0xd401000cu,0x00020501u},Decoder::Opcode::V_CMP_LT_F32,12,false,true},
+      {"I64 pair14 with restored low",{sop2(0x23,14)},Decoder::Opcode::S_ASHR_I64,14,true,false},
+      {"I64 disjoint pair12",{sop2(0x23,12)},Decoder::Opcode::S_ASHR_I64,12,false,true},
+      {"U64 pair14 with restored low",{sop2(0x29,14)},Decoder::Opcode::S_BFE_U64,14,true,false},
+      {"U64 disjoint pair12",{sop2(0x29,12)},Decoder::Opcode::S_BFE_U64,12,false,true},
+      {"B64 pair14 with restored low",{sop1(0x08,14)},Decoder::Opcode::S_NOT_B64,14,true,false},
+      {"B64 disjoint pair12",{sop1(0x08,12)},Decoder::Opcode::S_NOT_B64,12,false,true},
+      {"BITREPLICATE mixed output64 restored low",{sop1(0x3b,14)},Decoder::Opcode::S_BITREPLICATE_B64_B32,14,true,false},
+      {"BITREPLICATE disjoint pair12",{sop1(0x3b,12)},Decoder::Opcode::S_BITREPLICATE_B64_B32,12,false,true},
+      {"BCNT one-word result13",{sop1(0x10,13)},Decoder::Opcode::S_BCNT1_I32_B64,13,false,true},
+      {"FF1 one-word result13",{sop1(0x14,13)},Decoder::Opcode::S_FF1_I32_B64,13,false,true},
+      {"FLBIT one-word result13",{sop1(0x16,13)},Decoder::Opcode::S_FLBIT_I32_B64,13,false,true},
+      {"BCNT direct link14 clobber",{sop1(0x10,14)},Decoder::Opcode::S_BCNT1_I32_B64,14,false,false},
+      {"secondary carry pair14 restored low",{0xd70f0e01u,0x00020501u},Decoder::Opcode::V_ADD_I32,14,true,false},
+    };
+    size_t failures=0;
+    for(const auto& test:cases) {
+      std::array<uint32_t,32> padded{};std::copy(test.words.begin(),test.words.end(),padded.begin());
+      Decoder::Instruction inst{};Decoder::DecodeInstruction(padded,0,inst);
+      const auto& dst=test.op==Decoder::Opcode::V_ADD_I32?inst.dst2:inst.dst;
+      Check(inst.opcode==test.op && inst.word_count==test.words.size() &&
+            dst.kind==Decoder::OperandKind::Sgpr && dst.reg==test.dst,
+            "scalar width fixture did not decode its intended legal native writer");
+      Fixture fixture;std::vector<uint32_t> body;
+      if(test.restore_low) body.push_back(0xbe94030eu); // s20=s14 (one DWORD)
+      body.insert(body.end(),test.words.begin(),test.words.end());
+      if(test.restore_low) body.push_back(0xbe8e0314u); // Restore only s14 from s20.
+      body.push_back(0xbe80200eu);fixture.OneFunction(std::move(body));
+      const auto linked=fixture.Link();
+      const bool pass=test.returns?linked.success:!linked.success&&linked.failure.find("saved-link return")!=std::string::npos;
+      std::printf("SavedLinkWidthLegal: %s expected_return=%u link_success=%u %s reason=%s\n",
+                  test.name,unsigned(test.returns),unsigned(linked.success),pass?"PASS":"FAIL",linked.failure.c_str());
+      failures+=!pass;
+    }
+    for(const auto& body:std::vector<std::vector<uint32_t>>{
+          {0xbe92040eu,0xbe802012u}, // copy14:15 to18:19 then return18
+          {0xbe8e040eu,0xbe80200eu}, // legal same-pair copy snapshots old14:15
+          {0xbe92040eu,0xbe8e0380u,0xbe802012u}}) {
+      Fixture f;f.OneFunction(body);Check(f.Link().success,"valid even-pair copied/self-copy return rejected");
+    }
+    std::printf("SavedLinkWidthLegal: 16 decoded cases +3 even-pair copied/self-copy controls; failures=%zu\n",failures);
+    Check(failures==0,"native scalar destination extent corrupted saved-link provenance");
+}
+
+void TestCapturedBodySavedLinkWidth(const char* path) {
+    // Body compatibility only: an authored aliased call/link pair, no claimed
+    // runtime-held-plan identity, resource materialization, emission or execution.
+    Fixture fixture;
+    fixture.OneFunction(CapturedExternalTest::ReadWords(path));
+    const auto linked=fixture.Link();
+    if (!linked.success) std::fprintf(stderr,"captured body rejection: %s\n",linked.failure.c_str());
+    Check(linked.success && linked.entries.size()==1u,"captured body no longer has its valid full saved-link return");
+    std::printf("CapturedSavedLinkBody: appended_instructions=%zu entries=%zu transfers=%zu; authored caller, native body only, no resources/GPU\n",
+                linked.program.instructions.size()-fixture.caller.instructions.size(),linked.entries.size(),linked.transfers.size());
+}
+
 void TestAliasedFullAddressDispatcherAndCFG() {
 	Fixture fixture; const auto linked = fixture.Link();
 	Check(linked.success && linked.failure.empty() && linked.entries.size() == 2u,
@@ -626,6 +691,12 @@ void TestFullCapturedLibraryLink(const char* caller_path, const char* folder_pat
 } // namespace
 
 int main(int argc, char **argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--saved-link-width-only") {
+    TestSavedLinkScalarWriteWidths(); return 0;
+  }
+  if (argc == 3 && std::string_view(argv[1]) == "--saved-link-width-captured-body") {
+    TestCapturedBodySavedLinkWidth(argv[2]); return 0;
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--checked-dominance-rejection") {
     ProbeFixture fixture;
     fixture.library.functions = {{0u, Fixture::A, {0xbe80200eu}}, {1u, Fixture::B, {0xbe80200eu}}};
@@ -686,9 +757,10 @@ int main(int argc, char **argv) {
   TestConsistentOverlapAndAdjacentRanges();
   TestUnsupportedLeafFormsAreRejected();
   TestSavedLinkMustSurviveEveryReturnPath();
+  TestSavedLinkScalarWriteWidths();
   TestProvenanceAndCandidateSetValidation();
   TestUncoveredAndTruncatedBranchClosure();
-  std::puts("ExternalProgramTests: all eighteen groups passed (offline native "
+  std::puts("ExternalProgramTests: all nineteen groups passed (offline native "
             "linkage/probe/CFG only)");
   if (argc == 4)
     TestFullCapturedLibraryLink(argv[2], argv[3]);

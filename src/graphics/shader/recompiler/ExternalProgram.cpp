@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ExternalProgram.h"
+#include "graphics/shader/recompiler/frontend/decode/ScalarWriteWidth.h"
 
 #include <algorithm>
 #include <array>
@@ -166,10 +167,7 @@ void ValidateLinks(const Body& body, uint64_t entry, uint32_t link_reg) {
 			for (uint32_t i = 0; i < count && dst.reg + i < state.size(); ++i)
 				state[dst.reg + i] = 0;
 		};
-		uint32_t count = std::max(inst.data_dwords, 1u);
-		if (magic_enum::enum_name(inst.opcode).find("_B64") != std::string_view::npos)
-			count = std::max(count, 2u);
-		write(inst.dst, count);
+		write(inst.dst, Decoder::ScalarDestinationDwords(inst));
 		write(inst.dst2, 2u);
 		if ((inst.opcode == Opcode::S_MOV_B32 || inst.opcode == Opcode::S_MOV_B64) &&
 		    inst.dst.kind == Decoder::OperandKind::Sgpr &&

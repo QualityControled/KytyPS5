@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ShaderCallDiagnostics.h"
+#include "graphics/shader/recompiler/frontend/decode/ScalarWriteWidth.h"
 
 #include "graphics/shader/shaderBindings.h"
 
@@ -26,19 +27,6 @@ bool IsUnknownWriter(const Instruction& inst) {
 	       !IsSwappc(inst);
 }
 
-uint32_t ScalarWriteWords(const Instruction& inst) {
-	if (inst.family == Decoder::Family::VOPC ||
-	    magic_enum::enum_name(inst.opcode).starts_with("V_CMP")) {
-		return 2u;
-	}
-	const auto name = magic_enum::enum_name(inst.opcode);
-	const bool count_to_i32 =
-	    name.starts_with("S_BCNT") || name.starts_with("S_FF") || name.starts_with("S_FLBIT");
-	return !count_to_i32 &&
-	               (name.ends_with("_B64") || name.ends_with("_U64") || name.ends_with("_I64"))
-	           ? 2u
-			   : std::max(inst.data_dwords, 1u);
-}
 
 bool WritesScalar(const Instruction& inst, uint32_t reg) {
 	if (IsSwappc(inst)) {
@@ -48,7 +36,7 @@ bool WritesScalar(const Instruction& inst, uint32_t reg) {
 	const auto writes = [&](const Decoder::Operand& dst, uint32_t words) {
 		return dst.kind == OperandKind::Sgpr && reg >= dst.reg && reg - dst.reg < words;
 	};
-	return writes(inst.dst, ScalarWriteWords(inst)) || writes(inst.dst2, 2u);
+	return writes(inst.dst, Decoder::ScalarDestinationDwords(inst)) || writes(inst.dst2, 2u);
 }
 
 bool IsFlowBarrier(const Instruction& inst) {

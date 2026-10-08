@@ -413,37 +413,33 @@ void TestNativeDescriptorAddressNormalization() {
 }
 
 void TestAuxiliaryPairWriteWidthsAndClobbers() {
-	const auto check_write = [](std::initializer_list<uint32_t> code, Decoder::Opcode opcode,
-	                            uint32_t expected_auxiliary, bool secondary) {
-		Fixture fixture;
-		fixture.caller.instructions.pop_back();
-		fixture.Append(0xae4u, code);
-		const auto& write = fixture.caller.instructions.back();
-		Check(write.opcode == opcode, "auxiliary clobber fixture opcode encoding changed");
-		Check(secondary ? write.dst2.kind == Decoder::OperandKind::Sgpr && write.dst2.reg == 15u
-		                : write.dst.kind == Decoder::OperandKind::Sgpr && write.dst.reg == 15u,
-		      "auxiliary clobber fixture did not write the intended scalar destination");
-		// Restore the code-pointer high word, leaving a possible s16 auxiliary-word clobber intact.
-		fixture.Append(0xaecu, {0xbe8f0305u});
-		fixture.Append(0xaf0u, {0xbe8e210eu});
-		const auto loaded = fixture.Load();
-		Check(loaded.plan.complete && loaded.failure.empty(), "proven code pointer was lost during auxiliary tracing");
-		Check(loaded.plan.call_sites[0].auxiliary_sgpr == expected_auxiliary,
-		      "auxiliary provenance survived a scalar pair clobber or lost a one-word write");
-	};
-	check_write({(0x35u << 26u) | (0x01u << 16u) | 15u, 0x00020501u},
-	            Decoder::Opcode::V_CMP_LT_F32, UINT32_MAX, false);
-	check_write({(0x35u << 26u) | (0x30fu << 16u) | (15u << 8u) | 1u, 0x00020501u},
-	            Decoder::Opcode::V_ADD_I32, UINT32_MAX, true);
-	check_write({0x878f0606u}, Decoder::Opcode::S_AND_B64, UINT32_MAX, false);
-	check_write({0xbe8f1006u}, Decoder::Opcode::S_BCNT1_I32_B64, 16u, false);
-	Fixture copied;
-	copied.caller.instructions.pop_back();
-	copied.Append(0xae4u, {0xbe910410u}); // Overlapping MOV64 snapshots s16:s17 before writing s17:s18.
-	copied.Append(0xae8u, {0xbe8e210eu});
-	const auto copied_result = copied.Load();
-	Check(copied_result.plan.complete && copied_result.plan.call_sites[0].auxiliary_sgpr == 17u,
-	      "overlapping scalar MOV64 did not preserve its source-before-destination provenance");
+    const auto check_write=[](std::initializer_list<uint32_t> code,Decoder::Opcode op,uint32_t expected,bool secondary) {
+      Fixture fixture;fixture.caller.instructions.pop_back();
+      fixture.Append(0xae4u,{0xbe940310u}); // Preserve auxiliary low16 in20.
+      fixture.Append(0xae8u,code);const auto& write=fixture.caller.instructions.back();
+      Check(write.opcode==op,"auxiliary width fixture opcode changed");
+      const auto& dst=secondary?write.dst2:write.dst;
+      Check(dst.kind==Decoder::OperandKind::Sgpr&&dst.reg==16u,"wide auxiliary writer is not even16:17");
+      fixture.Append(0xaf0u,{0xbe900314u}); // Restore only low16 from20.
+      fixture.Append(0xaf4u,{0xbe8e210eu});
+      const auto result=fixture.Load();
+      Check(result.plan.complete&&result.failure.empty(),"width fixture lost independent code target provenance");
+      const auto actual=result.plan.call_sites[0].auxiliary_sgpr;
+      std::printf("AuxWidthLegal: opcode=%s expected=%u actual=%u\n",magic_enum::enum_name(op).data(),expected,actual);
+      Check(actual==expected,"auxiliary high-word clobber survived low-word restoration");
+    };
+    check_write({0xd4010010u,0x00020501u},Decoder::Opcode::V_CMP_LT_F32,UINT32_MAX,false);
+    check_write({0xd70f1001u,0x00020501u},Decoder::Opcode::V_ADD_I32,UINT32_MAX,true);
+    check_write({0x87900606u},Decoder::Opcode::S_AND_B64,UINT32_MAX,false);
+    check_write({0xbe903b00u},Decoder::Opcode::S_BITREPLICATE_B64_B32,UINT32_MAX,false);
+    check_write({0xbe901006u},Decoder::Opcode::S_BCNT1_I32_B64,16u,false);
+    Fixture copied;copied.caller.instructions.pop_back();
+    copied.Append(0xae4u,{0xbe920410u}); // Legal18:19 snapshot from16:17.
+    copied.Append(0xae8u,{0xbe900380u}); // Remove original low16, leaving unique18:19.
+    copied.Append(0xaecu,{0xbe8e210eu});
+    const auto copy=copied.Load();
+    Check(copy.plan.complete&&copy.plan.call_sites[0].auxiliary_sgpr==18u,
+          "legal MOV64 snapshot did not retain exact auxiliary origin");
 	for (const auto opcode: {Decoder::Opcode::UNKNOWN, Decoder::Opcode::UNSUPPORTED,
 	                         Decoder::Opcode::S_ENDPGM, Decoder::Opcode::S_BRANCH,
 	                         Decoder::Opcode::S_SETPC_B64, Decoder::Opcode::S_SWAPPC_B64}) {
@@ -460,6 +456,18 @@ void TestAuxiliaryPairWriteWidthsAndClobbers() {
 		Rejected(barrier.Load(), "unknown writer or control-flow edge retained linear table provenance");
 		Check(barrier.memory.requests.empty(), "unproven flow or writer reached guest-memory reader");
 	}
+}
+
+void TestMixedOutputTargetClobber() {
+    Fixture f;f.caller.instructions.pop_back();
+    f.Append(0xae4u,{0xbe94030eu}); // Save target low14.
+    f.Append(0xae8u,{0xbe8e3b00u}); // BITREPLICATE writes full target14:15.
+    f.Append(0xaecu,{0xbe8e0314u}); // Restore only low14.
+    f.Append(0xaf0u,{0xbe8e210eu});
+    const auto result=f.Load();
+    Check(!result.plan.complete&&!result.failure.empty(),"mixed output64 kept stale target high15 origin");
+    Check(f.memory.requests.empty(),"unproved mixed-output target reached guest reader");
+    std::puts("MixedOutputTarget: high-word provenance rejected before reads");
 }
 
 void TestAuxiliaryPairTransportWithinRecordDestination() {
@@ -536,6 +544,9 @@ void TestAuxiliaryPairTransportWithinRecordDestination() {
 
 int main(int argc, char** argv) {
 	try {
+		if (argc==2 && std::string_view(argv[1])=="--mixed-target-width-only") {
+			TestMixedOutputTargetClobber();return 0;
+		}
 		if (argc == 2 && std::string_view(argv[1]) == "--address-only") {
 			TestNativeDescriptorAddressNormalization();
 			std::puts("ExternalLibraryTests: native descriptor normalization passed");
@@ -562,8 +573,9 @@ int main(int argc, char** argv) {
 		TestOnlyProvedTableOriginInputsMatter();
 		TestNativeDescriptorAddressNormalization();
 		TestAuxiliaryPairWriteWidthsAndClobbers();
+		TestMixedOutputTargetClobber();
 		TestAuxiliaryPairTransportWithinRecordDestination();
-		std::puts("ExternalLibraryTests: all twelve groups passed (mock mapped reads; no guest execution)");
+		std::puts("ExternalLibraryTests: all thirteen groups passed (mock mapped reads; no guest execution)");
 		return 0;
 	} catch (const std::exception& error) {
 		std::fprintf(stderr, "ExternalLibraryTests: failed: %s\n", error.what());
