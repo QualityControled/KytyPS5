@@ -1434,6 +1434,18 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer,
 	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);
+	if (src.experimental_reduced_eqaa_2x &&
+	    (source.backing.samples != 2 || destination.backing.samples != 1 ||
+	     source.backing.image_type != vk::ImageType::e2D ||
+	     destination.backing.image_type != vk::ImageType::e2D ||
+	     source.backing.format != destination.backing.format ||
+	     source.info.extent != src.desc.info.extent ||
+	     destination.info.extent != dst.desc.info.extent ||
+	     src.guest_mip_level != 0 || dst.guest_mip_level != 0 ||
+	     (src.desc.info.data.address < dst.desc.info.data.End() &&
+	      dst.desc.info.data.address < src.desc.info.data.End()))) {
+		EXIT("experimental EQAA resolve requires disjoint same-format native 2-to-1 base-mip images\n");
+	}
 	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
 	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
 	return true;

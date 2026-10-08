@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/eqaaDepthState.h"
 #include "graphics/shader/recompiler/EqaaReduced2xPolicy.h"
+#include "graphics/shader/recompiler/EqaaReduced2xResolvePolicy.h"
 #include "graphics/shader/recompiler/PixelSampleSensitivity.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -557,6 +558,16 @@ struct RenderExecutorTestAccess {
                                        const ShaderPixelInputInfo *pixel = nullptr) {
     executor.ResolveRenderColorTarget(buffer, color, 0, slot, false, false, pixel,
                                       pixel ? "OwnedEqaaDraw" : nullptr);
+  }
+
+  static void ResolveFixedFunctionColorTarget(RenderExecutor &executor,
+                                               CommandBuffer &buffer,
+                                               RenderColorInfo &color, uint32_t slot) {
+    executor.ResolveRenderColorTarget(buffer, color, 0, slot, true, true);
+  }
+
+  static bool ResolveColorTargets(RenderExecutor &executor, CommandBuffer &buffer) {
+    return executor.ResolveColorTargets(buffer, 0);
   }
 
   static void BindRenderTarget(RenderExecutor &executor, ImageId id) {
@@ -15888,8 +15899,9 @@ public:
   void CheckRasterization(
       bool depth_feedback,
       Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float,
-      bool color_only_eqaa = false) {
-    const char *name = color_only_eqaa ? "EqaaColorOnlyNative2x" :
+      bool color_only_eqaa = false, bool fixed_resolve_profile = false) {
+    const char *name = fixed_resolve_profile ? "EqaaFixedResolveNative2xMip4" :
+                       color_only_eqaa ? "EqaaColorOnlyNative2x" :
                        depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
     uint32_t packed_color = 0;
     std::array<float, 4> packed_expected{};
@@ -16062,8 +16074,10 @@ public:
                   pixel_program.pixel_sample_sensitivity.complete,
               "actual native fragment did not retain its original sensitivity summary");
       registers.SetColorBase(0, {.addr = depth_address + 0x40000});
-      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
-                                 .channel_type = Prospero::ChannelType::kFloat,
+      registers.SetColorInfo(0, {.format = fixed_resolve_profile ? Prospero::ChannelLayout::k8_8_8_8
+                                                               : Prospero::ChannelLayout::k32_32_32_32,
+                                 .channel_type = fixed_resolve_profile ? Prospero::ChannelType::kUNorm
+                                                                     : Prospero::ChannelType::kFloat,
                                  .channel_order = Prospero::ChannelOrder::kStandard});
       registers.SetColorAttrib(0, {.num_samples = 2, .num_fragments = 1});
       registers.SetColorAttrib2(0, {.height = extent - 1, .width = extent - 1});
@@ -16085,13 +16099,38 @@ public:
                   color.desc.info.samples == 2 && cache.GetImage(color.image_id).backing.samples == 2 &&
                   !depth.image_id && ShaderRecompiler::Diagnostics::IsReducedEqaaDepthAbsent(registers),
               "native two-sample color discovery manufactured depth or changed storage samples");
-      auto resolved = color.desc;
-      resolved.info.data = {depth_address + 0x80000, extent * extent * 16};
-      resolved.info.samples = 1;
-      resolved.info.tile_mode = Prospero::TileMode::kLinear;
-      resolved.info.pitch = extent;
-      resolved.info.mip_layout[0] = {0, resolved.info.data.size, extent, extent};
-      eqaa_resolved = cache.FindImage(resolved);
+      if (fixed_resolve_profile) {
+        Require(name, "resolve opt-in", ShaderRecompiler::Diagnostics::EqaaReduced2xResolveRequested(),
+                "fixed-function fixture requires both exact opt-in flags");
+        registers.SetColorBase(1, {.addr = depth_address + 0x80000});
+        registers.SetColorInfo(1, registers.GetRenderTarget(0).info);
+        registers.SetColorAttrib(1, {});
+        registers.SetColorAttrib2(1, {.height = extent - 1, .width = extent - 1, .num_mip_levels = 3});
+        registers.SetColorAttrib3(1, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                     .dimension = 1, .metadata_pipe_aligned = true});
+        registers.SetColorControl({.mode = 3, .op = 0xcc});
+        RenderColorInfo resolved {};
+        RenderExecutorTestAccess::ResolveFixedFunctionColorTarget(executor, scheduler.Current(), resolved, 1);
+        eqaa_resolved = resolved.image_id;
+        Require(name, "four-mip exact destination", eqaa_resolved && resolved.desc.info.samples == 1 &&
+                    resolved.desc.info.resources.levels == 4 && cache.GetImage(eqaa_resolved).backing.mip_levels == 4 &&
+                    resolved.guest_mip_level == 0 && resolved.guest_array_layer == 0 &&
+                    resolved.desc.info.pixel_format == vk::Format::eR8G8B8A8Unorm,
+                "fixed-function destination lost format, storage samples or selected mip association");
+        vk::ClearValue sentinel {};
+        sentinel.color.float32 = std::array<float, 4>{0.25f, 0.25f, 0.25f, 0.25f};
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), eqaa_resolved,
+                                        {vk::ImageAspectFlagBits::eColor, 0, 4, 0, 1}, sentinel);
+        registers.SetColorControl({.mode = 1});
+      } else {
+        auto resolved = color.desc;
+        resolved.info.data = {depth_address + 0x80000, extent * extent * 16};
+        resolved.info.samples = 1;
+        resolved.info.tile_mode = Prospero::TileMode::kLinear;
+        resolved.info.pitch = extent;
+        resolved.info.mip_layout[0] = {0, resolved.info.data.size, extent, extent};
+        eqaa_resolved = cache.FindImage(resolved);
+      }
     }
     std::array<float, 18> vertices{
         -0.75f, -0.75f, 1, 1, 1, 1, 0.75f, -0.75f, 0.5f, 1, 1, 1,
@@ -16197,7 +16236,12 @@ public:
       RenderExecutorTestAccess::ResetBindings(executor);
     };
     const auto read_color = [&] {
-      if (color_only_eqaa) {
+      if (fixed_resolve_profile) {
+        registers.SetColorControl({.mode = 3, .op = 0xcc});
+        Require(name, "production mode3 resolve", RenderExecutorTestAccess::ResolveColorTargets(executor, scheduler.Current()),
+                "production fixed-function resolve did not preserve the source/destination outputs");
+        registers.SetColorControl({.mode = 1});
+      } else if (color_only_eqaa) {
         cache.GetImage(eqaa_resolved).Resolve(cache.GetImage(color.image_id), {0, 1, 0, 1}, {0, 1, 0, 1});
       }
       return ReadCachedTexel(name, context, color_only_eqaa ? eqaa_resolved : color.image_id,
@@ -16205,6 +16249,40 @@ public:
     };
     draw(filled);
     const auto solid_pixels = read_color();
+    if (fixed_resolve_profile) {
+      const auto center = (extent / 2) * extent + extent / 2;
+      Require(name, "RGBA8 native 2x fixed resolve", solid_pixels.size() == extent * extent &&
+                  solid_pixels[center] == 0xffffffffu && solid_pixels[0] == 0 &&
+                  pipeline(true, 2, 2).pipeline == filled.pipeline,
+              "real draw/resolve output, untouched outside coverage or native2x pipeline reuse failed");
+      Require(name, "two stored sample averaging", std::ranges::any_of(solid_pixels, [](u32 value) {
+                return value == 0x80808080u || value == 0x7f7f7f7fu;
+              }), "resolved coverage never averaged a covered and uncovered physical sample");
+      for (uint32_t mip = 1; mip < 4; ++mip) {
+        const auto side = extent >> mip;
+        const auto untouched = ReadCachedTexel(name, context, eqaa_resolved, {}, {side, side, 1}, 0, mip);
+        Require(name, "unselected mip sentinel", untouched.size() == side * side &&
+                    std::ranges::all_of(untouched, [](u32 value) { return value == 0x40404040u; }),
+                "base-mip resolve overwrote an unselected allocated mip");
+      }
+      Require(name, "unchanged guest sample storage", registers.GetRenderTarget(0).attrib.num_samples == 2 &&
+                  registers.GetRenderTarget(0).attrib.num_fragments == 1 &&
+                  registers.GetRenderTarget(1).attrib.num_samples == 0 &&
+                  registers.GetRenderTarget(1).attrib.num_fragments == 0 &&
+                  cache.GetImage(color.image_id).backing.samples == 2 &&
+                  cache.GetImage(eqaa_resolved).backing.samples == 1,
+              "trial substituted allocation counts or changed the guest descriptors");
+      resources.UnmapMemory(depth_address, allocation_size);
+      scheduler.Finish();
+      DestroyBuffer(&buffer);
+      m_device.destroyShaderModule(pixel_shader.module);
+      m_device.destroyShaderModule(vertex_shader.module);
+      Require(name, "release owned resolve memory", Libs::LibKernel::Memory::KernelMunmap(depth_address, allocation_size) == 0 &&
+                  Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+              "owned resolve mapping/allocation release failed");
+      std::printf("[gpu]     %-32s ok\n", name);
+      return;
+    }
     if (color_only_eqaa) {
       const auto center = 4 * ((extent / 2) * extent + extent / 2);
       Require(name, "native 2x draw and resolve", solid_pixels[center] == 0x3f800000u &&
@@ -44426,6 +44504,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--rewind-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--eqaa-resolve-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRasterization(false, Prospero::BufferFormat::k32_32_32_32Float, true, true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--eqaa-color-only") == 0) {

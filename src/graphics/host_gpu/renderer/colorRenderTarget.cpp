@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/EqaaReduced2xPolicy.h"
+#include "graphics/shader/recompiler/EqaaReduced2xResolvePolicy.h"
 #include "graphics/shader/recompiler/PixelSampleSensitivity.h"
 #include "graphics/shader/shader.h"
 
@@ -429,6 +430,60 @@ DecideReducedEqaa2xForDraw(const CommandBuffer& buffer, uint32_t slot,
 	return ClassifyReducedEqaa2x(in);
 }
 
+static ShaderRecompiler::Diagnostics::ReducedEqaa2xResolveDecision
+DecideReducedEqaa2xForResolve(const CommandBuffer& buffer, uint32_t slot,
+    bool ignore_target_mask, bool exact_format, const ShaderPixelInputInfo* prepared_ps,
+    const char* draw_name, uint32_t slice_offset) {
+	using namespace ShaderRecompiler::Diagnostics;
+	ReducedEqaa2xResolveInputs in;
+	in.requested = EqaaReduced2xResolveRequested();
+	if (!in.requested) return ReducedEqaa2xResolveDecision::Disabled;
+	const auto& hw = buffer.GetRegisters();
+	const auto& src = hw.GetRenderTarget(0);
+	const auto& dst = hw.GetRenderTarget(1);
+	in.existing_resolve_source_path = slot == 0 && ignore_target_mask && exact_format &&
+	    prepared_ps == nullptr && draw_name == nullptr;
+	in.color_mode = hw.GetColorControl().mode;
+	in.color_rop = hw.GetColorControl().op;
+	in.source_encoded_coverage = src.attrib.num_samples;
+	in.source_encoded_fragments = src.attrib.num_fragments;
+	in.destination_encoded_coverage = dst.attrib.num_samples;
+	in.destination_encoded_fragments = dst.attrib.num_fragments;
+	in.source_address = src.base.addr;
+	in.destination_address = dst.base.addr;
+	in.source_format = {static_cast<uint32_t>(src.info.format), static_cast<uint32_t>(src.info.channel_type),
+	                    static_cast<uint32_t>(src.info.channel_order)};
+	in.destination_format = {static_cast<uint32_t>(dst.info.format), static_cast<uint32_t>(dst.info.channel_type),
+	                         static_cast<uint32_t>(dst.info.channel_order)};
+	in.source_2d_single_mip_tiled = src.attrib3.dimension == 1 && src.attrib3.depth == 0 &&
+	    src.attrib3.tile_mode == Prospero::TileMode::kRenderTarget &&
+	    src.attrib2.num_mip_levels == 0 && src.view.current_mip_level == 0;
+	in.destination_2d_base_mip = dst.attrib3.dimension == 1 && dst.attrib3.depth == 0 &&
+	    dst.view.current_mip_level == 0;
+	in.destination_levels = dst.attrib2.num_mip_levels + 1u;
+	const auto source_view = ResolveTargetViewInfo(src.view.base_array_slice_index,
+	    src.view.last_array_slice_index, slice_offset);
+	const auto destination_view = ResolveTargetViewInfo(dst.view.base_array_slice_index,
+	    dst.view.last_array_slice_index, slice_offset);
+	in.view_bounds_known = source_view.type != TargetViewType::Unsupported &&
+	    destination_view.type != TargetViewType::Unsupported;
+	in.source_layers = source_view.layer_count;
+	in.destination_layers = destination_view.layer_count;
+	in.source_width = src.attrib2.width + 1u;
+	in.source_height = src.attrib2.height + 1u;
+	in.destination_width = dst.attrib2.width + 1u;
+	in.destination_height = dst.attrib2.height + 1u;
+	const auto& raw = hw.GetSampleRegisterSnapshot();
+	in.raw_sample_state_complete = std::all_of(raw.words.begin(), raw.words.end(),
+	    [](const auto& word) { return word.valid; });
+	in.aa_mask_low = raw.words[static_cast<size_t>(HW::SampleRegister::AaMaskX0Y0X1Y0)].value;
+	in.aa_mask_high = raw.words[static_cast<size_t>(HW::SampleRegister::AaMaskX0Y1X1Y1)].value;
+	in.sample_exclusion = raw.words[static_cast<size_t>(HW::SampleRegister::SampleExclusionMask)].value;
+	in.alpha_to_mask_enabled = RawAlphaToMaskEnabled(
+	    raw.words[static_cast<size_t>(HW::SampleRegister::AlphaToMask)].value);
+	return ClassifyReducedEqaa2xResolve(in);
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t render_target_slice_offset, uint32_t rt_slot,
@@ -467,11 +522,18 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		using namespace ShaderRecompiler::Diagnostics;
 		const auto decision =
 		    DecideReducedEqaa2xForDraw(buffer, rt_slot, prepared_ps, prepared_draw_name);
-		const bool admitted = decision == ReducedEqaa2xDecision::AdmitApproximation;
+		const auto resolve_decision = DecideReducedEqaa2xForResolve(buffer, rt_slot,
+		    ignore_target_mask, exact_format, prepared_ps, prepared_draw_name,
+		    render_target_slice_offset);
+		const bool resolve_admitted = resolve_decision ==
+		    ReducedEqaa2xResolveDecision::AdmitResolveApproximation;
+		const bool admitted = decision == ReducedEqaa2xDecision::AdmitApproximation || resolve_admitted;
 		// Keep a successful private trial from dumping hundreds of lines on every draw.
 		static std::atomic_uint admitted_snapshot_count = 0;
-		const bool              print_snapshot =
-		    !admitted || admitted_snapshot_count.fetch_add(1, std::memory_order_relaxed) < 4;
+		static std::atomic_uint resolve_snapshot_count = 0;
+		auto& snapshot_count = resolve_admitted ? resolve_snapshot_count : admitted_snapshot_count;
+		const bool print_snapshot = !admitted ||
+		    snapshot_count.fetch_add(1, std::memory_order_relaxed) < 4;
 		if (print_snapshot) {
 			PrintUnsupportedColorSamples(buffer, rt_slot, mask, render_target_slice_offset,
 			                             ignore_target_mask, exact_format, !admitted);
@@ -484,11 +546,22 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 				            rt_slot, ReducedEqaa2xDecisionName(decision));
 				std::fflush(stdout);
 			}
+			if (EqaaReduced2xResolveRequested()) {
+				std::printf("ExperimentalEqaa2x resolve_rejected source_slot=%u reason=%s fatal_preserved=1\n",
+				    rt_slot, ReducedEqaa2xResolveDecisionName(resolve_decision));
+				std::fflush(stdout);
+			}
 			EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 			     rt.attrib.num_samples, rt.attrib.num_fragments);
 		}
 		r.experimental_reduced_eqaa_2x = true;
-		if (print_snapshot) {
+		if (print_snapshot && resolve_admitted) {
+			std::printf("ExperimentalEqaa2x resolve_admitted source_slot=0 destination_slot=1 "
+			            "requested_coverage=4 native_source=2 native_destination=1 "
+			            "fixed_function_resolve=1 prepared_ps_not_required=1 approximation=1 "
+			            "initial_contents=unknown guest_metadata_unchanged=1\n");
+			std::fflush(stdout);
+		} else if (print_snapshot) {
 			std::printf("ExperimentalEqaa2x admitted slot=%u requested_coverage=4 native_color=2 "
 			            "native_depth=%u depth_absent=%u raster_samples=2 approximation=1 initial_contents=unknown "
 			            "guest_metadata_unchanged=1 stencil_blend_preserved=1\n",

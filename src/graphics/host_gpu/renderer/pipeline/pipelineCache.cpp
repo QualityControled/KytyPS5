@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/SelectedCalleeCapture.h"
 #include "graphics/shader/recompiler/PixelSampleSensitivity.h"
 #include "graphics/shader/recompiler/EqaaReduced2xPolicy.h"
+#include "graphics/shader/recompiler/EqaaReduced2xResolvePolicy.h"
 #include "graphics/host_gpu/renderer/eqaaDepthState.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -1327,7 +1328,8 @@ void PipelineCache::InitializeDriverCache() {
 	        fmt::format("-external-vgpr{}.bin", checked_vgpr) : std::string(".bin");
 	if (ShaderRecompiler::Diagnostics::EqaaReduced2xRequested()) {
 		cache_suffix.resize(cache_suffix.size() - std::string_view(".bin").size());
-		cache_suffix += "-experimental-eqaa2x-v3-depth-absence.bin";
+		cache_suffix += ShaderRecompiler::Diagnostics::EqaaReduced2xResolveRequested()
+		    ? "-experimental-eqaa2x-v4-resolve.bin" : "-experimental-eqaa2x-v3-depth-absence.bin";
 	}
 	m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + cache_suffix);
 	const auto path         = Common::PathToString(m_driver_cache_path);
