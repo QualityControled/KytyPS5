@@ -898,6 +898,8 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t         render_target_slice_offset,
                                             DrawRenderState& state) {
+	MenuPerformanceDiagnostic::TimedScope diagnostic_scope(
+	    MenuPerformanceDiagnostic::TimedOperation::DrawRenderState);
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active =
@@ -1040,6 +1042,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
                                          bool                         primitive_restart_enable) {
+	MenuPerformanceDiagnostic::TimedScope preparation_scope(
+	    MenuPerformanceDiagnostic::TimedOperation::DrawResourcePreparation);
 	auto&      ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
@@ -1117,6 +1121,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
+	preparation_scope.Finish();
+	MenuPerformanceDiagnostic::TimedScope recording_scope(
+	    MenuPerformanceDiagnostic::TimedOperation::DrawRecordingTail);
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
@@ -1201,7 +1208,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
-	Common::LockGuard lock(m_context.GetMutex());
+	// Prvalue return preserves the original noncopyable guard's lock lifetime.
+	Common::LockGuard lock = [&] {
+		MenuPerformanceDiagnostic::TimedScope diagnostic_scope(
+		    MenuPerformanceDiagnostic::TimedOperation::DrawContextLockWait);
+		return Common::LockGuard(m_context.GetMutex());
+	}();
 	if (args.index_count == 0 || args.instance_count == 0) {
 		return;
 	}
@@ -1311,7 +1323,12 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
 	                    args.first_instance);
 
-	Common::LockGuard lock(m_context.GetMutex());
+	// Prvalue return preserves the original noncopyable guard's lock lifetime.
+	Common::LockGuard lock = [&] {
+		MenuPerformanceDiagnostic::TimedScope diagnostic_scope(
+		    MenuPerformanceDiagnostic::TimedOperation::DrawContextLockWait);
+		return Common::LockGuard(m_context.GetMutex());
+	}();
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		return;
 	}

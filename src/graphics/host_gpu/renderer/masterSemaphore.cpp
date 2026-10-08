@@ -56,7 +56,12 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	// Only the original potentially blocking Vulkan call, excluding both Refresh calls.
+	const auto result = [&] {
+		MenuPerformanceDiagnostic::TimedScope diagnostic_scope(
+		    MenuPerformanceDiagnostic::TimedOperation::SemaphoreWaitBlocking);
+		return m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	}();
 	if (result != vk::Result::eSuccess) {
 		EXIT("GPU timeline wait failed: Vulkan result=%d device_lost=%d tick=%" PRIu64 "\n",
 		     static_cast<int>(result), result == vk::Result::eErrorDeviceLost, tick);

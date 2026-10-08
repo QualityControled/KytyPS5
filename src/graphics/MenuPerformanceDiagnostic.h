@@ -31,8 +31,11 @@ inline bool EmptyDeferredPollSkipRequested() {
 struct Counters {
 	std::array<std::atomic_uint64_t, 5> timeline_refresh_calls {};
 	std::array<std::atomic_uint64_t, 5> timeline_refresh_ns {};
-	std::array<std::atomic_uint64_t, 4> renderer_calls {};
-	std::array<std::atomic_uint64_t, 4> renderer_ns {};
+	std::array<std::atomic_uint64_t, 9> renderer_calls {};
+	std::array<std::atomic_uint64_t, 9> renderer_in_draw_calls {};
+	std::array<std::atomic_uint64_t, 9> renderer_in_draw_ns {};
+	std::array<std::atomic_uint64_t, 9> renderer_nested_calls {};
+	std::array<std::atomic_uint64_t, 9> renderer_ns {};
 	std::atomic_uint64_t                pending_empty_skips {0};
 	std::atomic_uint64_t                graphics_pipeline_hits {0};
 	std::atomic_uint64_t                graphics_pipeline_misses {0};
@@ -79,29 +82,31 @@ inline uint64_t& BackingReadRequestedBytes() {
 
 class BackingReadScope {
 public:
-	explicit BackingReadScope(uint64_t requested_bytes) : m_enabled(Enabled()) {
+	explicit BackingReadScope(uint64_t requested_bytes): m_enabled(Enabled()) {
 		if (!m_enabled) return;
 		m_start = std::chrono::steady_clock::now();
 		++BackingReadDepth();
-		m_previous_request = BackingReadRequestedBytes();
+		m_previous_request          = BackingReadRequestedBytes();
 		BackingReadRequestedBytes() = requested_bytes;
 		State().backing_read_calls.fetch_add(1, std::memory_order_relaxed);
 		State().backing_read_requested_bytes.fetch_add(requested_bytes, std::memory_order_relaxed);
 	}
 	~BackingReadScope() {
 		if (!m_enabled) return;
-		State().backing_read_ns.fetch_add(static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::nanoseconds>(
-		        std::chrono::steady_clock::now() - m_start).count()), std::memory_order_relaxed);
+		State().backing_read_ns.fetch_add(
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - m_start)
+			                          .count()),
+		    std::memory_order_relaxed);
 		--BackingReadDepth();
 		BackingReadRequestedBytes() = m_previous_request;
 	}
-	BackingReadScope(const BackingReadScope&) = delete;
+	BackingReadScope(const BackingReadScope&)            = delete;
 	BackingReadScope& operator=(const BackingReadScope&) = delete;
 
 private:
-	bool m_enabled;
-	uint64_t m_previous_request = 0;
+	bool                                  m_enabled;
+	uint64_t                              m_previous_request = 0;
 	std::chrono::steady_clock::time_point m_start {};
 };
 
@@ -112,7 +117,7 @@ public:
 	explicit BackingDownloadScope(bool synchronous)
 	    : m_enabled(Enabled() && synchronous && BackingReadDepth() != 0) {
 		if (m_enabled) {
-			m_start = std::chrono::steady_clock::now();
+			m_start           = std::chrono::steady_clock::now();
 			m_requested_bytes = BackingReadRequestedBytes();
 		}
 	}
@@ -120,19 +125,22 @@ public:
 	void Completed(uint64_t payload_bytes, uint64_t staging_bytes) {
 		if (!m_enabled) return;
 		auto& counters = State();
-		counters.backing_download_requested_bytes.fetch_add(m_requested_bytes, std::memory_order_relaxed);
+		counters.backing_download_requested_bytes.fetch_add(m_requested_bytes,
+		                                                    std::memory_order_relaxed);
 		counters.backing_download_payload_bytes.fetch_add(payload_bytes, std::memory_order_relaxed);
 		counters.backing_download_staging_bytes.fetch_add(staging_bytes, std::memory_order_relaxed);
-		counters.backing_download_ns.fetch_add(static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::nanoseconds>(
-		        std::chrono::steady_clock::now() - m_start).count()), std::memory_order_relaxed);
+		counters.backing_download_ns.fetch_add(
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - m_start)
+			                          .count()),
+		    std::memory_order_relaxed);
 		counters.backing_sync_downloads.fetch_add(1, std::memory_order_relaxed);
 		m_enabled = false;
 	}
 
 private:
-	bool m_enabled;
-	uint64_t m_requested_bytes = 0;
+	bool                                  m_enabled;
+	uint64_t                              m_requested_bytes = 0;
 	std::chrono::steady_clock::time_point m_start {};
 };
 
@@ -143,7 +151,12 @@ enum class TimedOperation {
 	DrawTotal,
 	DescriptorBinding,
 	GraphicsPipelineCreate,
-	PendingPop
+	PendingPop,
+	SemaphoreWaitBlocking,
+	DrawContextLockWait,
+	DrawRenderState,
+	DrawResourcePreparation,
+	DrawRecordingTail
 };
 
 // Roles: other, deferred-pop, command-pool reuse, IsFree refresh, explicit Wait.
@@ -179,22 +192,40 @@ inline void GraphicsPipelineLookup(bool hit) {
 	    .fetch_add(1, std::memory_order_relaxed);
 }
 
+// Thread-local nesting is observed only while the diagnostic is enabled.
+inline uint32_t& TimedScopeDepth() {
+	static thread_local uint32_t depth = 0;
+	return depth;
+}
+inline uint32_t& DrawScopeDepth() {
+	static thread_local uint32_t depth = 0;
+	return depth;
+}
+
 // Elapsed host wall time in completed scopes, including any existing waits.
 // This is not thread CPU time and introduces no resource reads or GPU waits.
 class TimedScope {
 public:
-	explicit TimedScope(TimedOperation operation) : m_enabled(Enabled()), m_operation(operation) {
+	explicit TimedScope(TimedOperation operation): m_enabled(Enabled()), m_operation(operation) {
 		if (m_enabled) {
-			m_start = std::chrono::steady_clock::now();
+			m_start   = std::chrono::steady_clock::now();
+			m_nested  = TimedScopeDepth() != 0;
+			m_in_draw = DrawScopeDepth() != 0 || m_operation == TimedOperation::DrawTotal;
+			++TimedScopeDepth();
+			if (m_operation == TimedOperation::DrawTotal) ++DrawScopeDepth();
 			if (m_operation == TimedOperation::Compile)
 				State().compile_scope_active.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
-	~TimedScope() {
+	~TimedScope() { Finish(); }
+	// Explicit completion separates adjacent preparation/recording phases without
+	// changing the original function, resource, command or lock lifetime.
+	void Finish() {
 		if (!m_enabled) return;
-		const auto elapsed = static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::nanoseconds>(
-		        std::chrono::steady_clock::now() - m_start).count());
+		const auto elapsed =
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - m_start)
+			                          .count());
 		auto& counters = State();
 		if (m_operation == TimedOperation::WarmMaterialize) {
 			counters.warm_materialize_ns.fetch_add(elapsed, std::memory_order_relaxed);
@@ -210,22 +241,36 @@ public:
 			    static_cast<size_t>(m_operation) - static_cast<size_t>(TimedOperation::DrawTotal);
 			counters.renderer_ns[index].fetch_add(elapsed, std::memory_order_relaxed);
 			counters.renderer_calls[index].fetch_add(1, std::memory_order_relaxed);
+			if (m_in_draw) {
+				counters.renderer_in_draw_calls[index].fetch_add(1, std::memory_order_relaxed);
+				counters.renderer_in_draw_ns[index].fetch_add(elapsed, std::memory_order_relaxed);
+			}
+			if (m_nested)
+				counters.renderer_nested_calls[index].fetch_add(1, std::memory_order_relaxed);
 		}
+		if (m_operation == TimedOperation::DrawTotal) --DrawScopeDepth();
+		--TimedScopeDepth();
+		m_enabled = false;
 	}
-	TimedScope(const TimedScope&) = delete;
+	TimedScope(const TimedScope&)            = delete;
 	TimedScope& operator=(const TimedScope&) = delete;
 
 private:
-	bool m_enabled;
-	TimedOperation m_operation;
+	bool                                  m_enabled;
+	TimedOperation                        m_operation;
+	bool                                  m_nested  = false;
+	bool                                  m_in_draw = false;
 	std::chrono::steady_clock::time_point m_start {};
 };
 
 struct RendererSnapshot {
 	std::array<uint64_t, 5> timeline_calls {};
 	std::array<uint64_t, 5> timeline_ns {};
-	std::array<uint64_t, 4> renderer_calls {};
-	std::array<uint64_t, 4> renderer_ns {};
+	std::array<uint64_t, 9> renderer_calls {};
+	std::array<uint64_t, 9> renderer_in_draw_calls {};
+	std::array<uint64_t, 9> renderer_in_draw_ns {};
+	std::array<uint64_t, 9> renderer_nested_calls {};
+	std::array<uint64_t, 9> renderer_ns {};
 	uint64_t                empty_skips     = 0;
 	uint64_t                pipeline_hits   = 0;
 	uint64_t                pipeline_misses = 0;
@@ -239,7 +284,13 @@ inline RendererSnapshot ReadRendererCounters() {
 	}
 	for (size_t i = 0; i < result.renderer_calls.size(); ++i) {
 		result.renderer_calls[i] = state.renderer_calls[i].load(std::memory_order_relaxed);
-		result.renderer_ns[i]    = state.renderer_ns[i].load(std::memory_order_relaxed);
+		result.renderer_in_draw_calls[i] =
+		    state.renderer_in_draw_calls[i].load(std::memory_order_relaxed);
+		result.renderer_in_draw_ns[i] =
+		    state.renderer_in_draw_ns[i].load(std::memory_order_relaxed);
+		result.renderer_nested_calls[i] =
+		    state.renderer_nested_calls[i].load(std::memory_order_relaxed);
+		result.renderer_ns[i] = state.renderer_ns[i].load(std::memory_order_relaxed);
 	}
 	result.empty_skips     = state.pending_empty_skips.load(std::memory_order_relaxed);
 	result.pipeline_hits   = state.graphics_pipeline_hits.load(std::memory_order_relaxed);
@@ -255,13 +306,26 @@ inline void ReportRendererCounters(uint64_t elapsed_ms, const RendererSnapshot& 
 	            current.empty_skips - previous.empty_skips,
 	            current.pipeline_hits - previous.pipeline_hits,
 	            current.pipeline_misses - previous.pipeline_misses);
-	constexpr std::array names {"draw", "descriptor_binding", "graphics_pipeline_create",
-	                            "pending_pop"};
+	constexpr std::array names {"draw",
+	                            "descriptor_binding",
+	                            "graphics_pipeline_create",
+	                            "pending_pop",
+	                            "semaphore_wait_blocking",
+	                            "draw_context_lock_wait",
+	                            "draw_render_state",
+	                            "draw_resource_preparation",
+	                            "draw_recording_tail"};
 	for (size_t i = 0; i < names.size(); ++i) {
-		std::printf(" %s_calls=%" PRIu64 " %s_wall_ms=%.3f", names[i],
-		            current.renderer_calls[i] - previous.renderer_calls[i], names[i],
-		            static_cast<double>(current.renderer_ns[i] - previous.renderer_ns[i]) /
-		                1000000.0);
+		std::printf(
+		    " %s_calls=%" PRIu64 " %s_in_draw_calls=%" PRIu64 " %s_nested_calls=%" PRIu64
+		    " %s_wall_ms=%.3f %s_in_draw_wall_ms=%.3f",
+		    names[i], current.renderer_calls[i] - previous.renderer_calls[i], names[i],
+		    current.renderer_in_draw_calls[i] - previous.renderer_in_draw_calls[i], names[i],
+		    current.renderer_nested_calls[i] - previous.renderer_nested_calls[i], names[i],
+		    static_cast<double>(current.renderer_ns[i] - previous.renderer_ns[i]) / 1000000.0,
+		    names[i],
+		    static_cast<double>(current.renderer_in_draw_ns[i] - previous.renderer_in_draw_ns[i]) /
+		        1000000.0);
 	}
 	constexpr std::array roles {"other", "pending_pop", "command_pool", "is_free", "wait"};
 	for (size_t i = 0; i < roles.size(); ++i) {
@@ -270,7 +334,8 @@ inline void ReportRendererCounters(uint64_t elapsed_ms, const RendererSnapshot& 
 		            static_cast<double>(current.timeline_ns[i] - previous.timeline_ns[i]) /
 		                1000000.0);
 	}
-	std::printf(" nested_wall_scopes_not_additive=1\n");
+	std::printf(
+	    " nested_wall_scopes_not_additive=1 completed_scopes_only=1 nontransactional_snapshot=1\n");
 }
 
 struct Snapshot {
