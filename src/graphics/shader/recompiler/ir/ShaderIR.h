@@ -484,6 +484,7 @@ struct ShaderInfo {
 	bool                             uses_external_call_probe = false;
 	bool                             uses_external_probe_before_bvh = false;
 	bool                             uses_checked_external_calls = false;
+	bool                             uses_external_probe_after_bvh = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

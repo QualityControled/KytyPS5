@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/cache/shaderCallFaultManager.h"
 
 #include "common/assert.h"
+#include "common/atomicFileReplace.h"
+#include "graphics/shader/recompiler/BvhResultHostPolicy.h"
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -23,6 +25,19 @@
 namespace Libs::Graphics {
 
 namespace {
+
+uint64_t CheckedFaultRecordSize() {
+    const auto& mode = ShaderRecompiler::Diagnostics::FrozenAfterBvhMode();
+    if (mode.error != ShaderRecompiler::Diagnostics::AfterBvhModeError::None)
+        EXIT("Invalid after-BVH mode: %s\n", ShaderRecompiler::Diagnostics::AfterBvhModeErrorName(mode.error));
+    return ShaderRecompiler::Diagnostics::FaultRecordBytes(mode.enabled);
+}
+uint64_t CheckedFaultAreaStride(uint64_t bytes,uint64_t atom,uint64_t areas) {
+    uint64_t stride = 0;
+    if (!ShaderRecompiler::Diagnostics::FaultAreaStride(bytes,atom,areas,stride))
+        EXIT("Invalid fault readback stride: record=%" PRIu64 " atom=%" PRIu64 " areas=%" PRIu64 "\n",bytes,atom,areas);
+    return stride;
+}
 
 bool ReadBvhBufferView(void*, uint64_t address, uint8_t* output, size_t bytes) {
 	return GuestGpu::IsGpuThread() && bytes == ShaderRecompiler::BvhNodeCapture::NodeBlockBytes &&
@@ -214,45 +229,138 @@ void ShaderCallFaultManager::FinalizeBvhCapture() {
 	     record[13], record[12], record[15], record[14]);
 }
 
+void ShaderCallFaultManager::FinalizeBvhResultCapture() {
+    using namespace ShaderRecompiler;
+    if (!m_pending_bvh_result) EXIT("No pending after-BVH raw record; terminal stop\n");
+    const auto record = *m_pending_bvh_result;
+    m_pending_bvh_result.reset();
+    const auto tick = std::exchange(m_pending_bvh_result_tick,0);
+    const bool tick_complete = tick != 0 && m_scheduler.IsFree(tick);
+    const bool on_gpu_thread = GuestGpu::IsGpuThread();
+    const bool sidecar_valid = Diagnostics::ValidBvhResultSidecar(record);
+    const auto pc = uint64_t{record[4]} | (uint64_t{record[5]} << 32);
+    // This first result capture performs no node/BDA/guest-memory reads. Native
+    // opcode/address cross-checking is an explicit later decoder extension.
+    const bool result_valid = sidecar_valid && tick_complete && on_gpu_thread && pc != 0;
+    const char* status = record[0] == 0 ? "empty_no_bvh_result" :
+        record[0] != 1 ? "invalid_claim_no_bvh_result" :
+        record[1] != 8 ? "other_terminal_record_no_bvh_result" :
+        !result_valid ? "invalid_kind8_no_validated_result" : "completed_structural_kind8_result";
+    bool raw_written=false,ray_written=false,result_written=false,manifest_written=false;
+    std::filesystem::path folder;
+    std::string io_error;
+    if (Config::GraphicsDebugDumpEnabled() && on_gpu_thread && tick_complete) {
+        const auto base=Config::GetShaderLogFolder()/"bvh_results";
+        std::error_code error;std::filesystem::create_directories(base,error);
+        static std::atomic_uint64_t id=0;bool created=false;
+        for (unsigned attempt=0;!error&&attempt<64&&!created;++attempt) {
+            folder=base/fmt::format("{:04d}_{:016x}_{:016x}",id++,
+                uint64_t{record[6]}|(uint64_t{record[7]}<<32),pc);
+            created=std::filesystem::create_directory(folder,error);
+        }
+        if (!created || error) io_error=error?error.message():"unique directory attempts exhausted";
+        else {
+            const auto raw=Diagnostics::EncodeBvhResultLittleEndian(record);
+            raw_written=WriteBvhCaptureFile(folder/"event34.bin",raw.data(),raw.size());
+            // Never interpret a call/layout/prior fault or invalid sidecar as a BVH ray/result.
+            if (result_valid && raw_written) {
+                ray_written=WriteBvhCaptureFile(folder/"ray.bin",raw.data()+Diagnostics::BvhRayWord*4,
+                                               Diagnostics::BvhRayWords*4);
+                result_written=WriteBvhCaptureFile(folder/"result4.bin",raw.data()+Diagnostics::BvhResultWord*4,
+                                                  Diagnostics::BvhResultWords*4);
+            }
+            if (!raw_written) io_error="event34 write/flush/close failed";
+            else if (result_valid && !ray_written) io_error="ray40 write/flush/close failed";
+            else if (result_valid && !result_written) io_error="result16 write/flush/close failed";
+            const bool complete=result_valid && raw_written && ray_written && result_written;
+            const auto manifest=fmt::format(
+                "capture_schema=after_bvh_host_v1 record_schema={} version={} raw_record_bytes=136 expected_ray_raw_bytes=40 expected_result_raw_bytes=16\n"
+                "status={} complete={} result_structurally_validated={} sidecar_valid={}\n"
+                "record_kind={} claimed={} after_dispatch_wait={} dispatch_tick={}\n"
+                "outside_deferred_callback=true capture_thread=guest_gpu\n"
+                "intersection_helper_executed_from_emitter_record={} result_same_CAS_winner_by_emitter_protocol={} nativePC_nonzero={}\n"
+                "raw_payload_written={} ray_payload_written={} result_payload_written={}\n"
+                "node_reads_attempted=0 node_or_BDA_view_captured=false native_opcode_decoded_by_host=false\n"
+                "event_time_memory_atomicity_proven=false recorded_active_wave_returned_after_result={} following_PM4_consumers_permitted=false\n"
+                "other_record_kind_preserved=true global_CAS_winner_order_unproved=true\n",
+                result_valid ? "BVHR" : "raw_fault_storage", result_valid ? 2u : 0u,
+                status,complete,result_valid,sidecar_valid,record[1],record[0],tick_complete,tick,
+                result_valid,result_valid,pc!=0,raw_written,ray_written,result_written,result_valid);
+            const auto temporary=folder/"manifest-final.tmp";
+            if (WriteBvhCaptureFile(temporary,manifest.data(),manifest.size())) {
+                manifest_written=Common::AtomicReplaceFile(temporary,folder/"manifest.txt");
+                if (!manifest_written && io_error.empty()) io_error="manifest atomic replacement failed";
+            } else if (io_error.empty()) io_error="manifest temporary write/flush/close failed";
+        }
+    } else io_error=!on_gpu_thread?"not GPU thread":!tick_complete?"dispatch not complete":"debug dumping disabled";
+    std::printf("After-BVH diagnostic: status=%s kind=%u claimed=%u sidecar_valid=%u "
+                "dispatch_complete=%u tick=%" PRIu64 " event_written=%u ray_written=%u result_written=%u "
+                "manifest_written=%u folder=%s error=%s\n",status,record[1],record[0],sidecar_valid,
+                tick_complete,tick,raw_written,ray_written,result_written,manifest_written,folder.string().c_str(),io_error.c_str());
+    // Preserve every known prior claim's raw metadata without decoding it as results.
+    std::printf("After-BVH raw header: detail=0x%08x%08x pc=0x%08x%08x hash=0x%08x%08x "
+                "words8_15=[%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x]\n",
+                record[3],record[2],record[5],record[4],record[7],record[6],
+                record[8],record[9],record[10],record[11],record[12],record[13],record[14],record[15]);
+    if (result_valid)
+        std::printf("After-BVH result bits: [%08x,%08x,%08x,%08x] selected_lane=%u\n",
+                    record[30],record[31],record[32],record[33],record[27]);
+    std::fflush(stdout);
+    EXIT("After-BVH diagnostic terminal stop: status=%s files_complete=%u; "
+         "no following shader/PM4 consumers permitted\n",status,
+         result_valid&&raw_written&&ray_written&&result_written&&manifest_written);
+}
+
 ShaderCallFaultManager::ShaderCallFaultManager(GraphicContext& graphics,
                                                CommandScheduler& scheduler)
     : m_scheduler(scheduler),
-      m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, RecordSize),
-	  m_area_stride(std::max<uint64_t>(RecordSize,
-	      graphics.physical_device_properties.limits.nonCoherentAtomSize)),
+      m_record_size(CheckedFaultRecordSize()),
+      m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, m_record_size),
+	  m_area_stride(CheckedFaultAreaStride(m_record_size,
+          graphics.physical_device_properties.limits.nonCoherentAtomSize,MaxPending)),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
 	                        MaxPending * m_area_stride) {
-	m_fault_buffer.Fill(0, RecordSize, 0);
+	m_fault_buffer.Fill(0, m_record_size, 0);
 }
 
-Buffer* ShaderCallFaultManager::GetBuffer() noexcept {
+Buffer* ShaderCallFaultManager::GetBuffer(uint64_t required_record_bytes) noexcept {
+	if ((required_record_bytes != 128u && required_record_bytes != 136u) || required_record_bytes > m_record_size)
+		EXIT("Shader fault record exceeds fixed process capacity: required=%" PRIu64 " capacity=%" PRIu64 "\n",required_record_bytes,m_record_size);
 	m_used = true;
 	return &m_fault_buffer;
 }
 
-void ShaderCallFaultManager::Process(bool wait_for_completion) {
+void ShaderCallFaultManager::Process(bool wait_for_completion,bool after_bvh_capture) {
+	if (after_bvh_capture && (!wait_for_completion || m_record_size != 136u || !m_used))
+		EXIT("After-BVH inspection requires used136B channel and synchronous wait; terminal stop\n");
 	if (!m_used) return;
 	m_used = false;
 	if (const auto tick = m_ticks[m_area]; tick != 0u) {
 		m_scheduler.Wait(tick);
 		m_scheduler.PopPendingOperations();
 		if (m_pending_bvh) FinalizeBvhCapture();
+		if (m_pending_bvh_result) FinalizeBvhResultCapture();
 	}
 	const auto area = m_area;
 	// Each pending read occupies its own noncoherent atom. Invalidation must not overlap a
 	// different in-flight slot even when the device's atom is larger than the fault record.
 	const uint64_t offset = area * m_area_stride;
-	m_download_buffer.CopyFrom(m_scheduler.Current(), m_fault_buffer, 0, offset, RecordSize,
+	m_download_buffer.CopyFrom(m_scheduler.Current(), m_fault_buffer, 0, offset, m_record_size,
 	                           vk::AccessFlagBits::eShaderWrite,
 	                           vk::AccessFlagBits::eHostRead,
 	                           vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
 	                           vk::AccessFlagBits::eHostRead);
 	const auto scheduled_tick = m_scheduler.CurrentTick();
-	m_scheduler.DeferOperation([this, offset, area, wait_for_completion, scheduled_tick] {
-		m_download_buffer.Invalidate(offset, RecordSize);
-		std::array<uint32_t, ShaderRecompiler::Diagnostics::BvhDiagnosticWords> record {};
-		std::memcpy(record.data(), m_download_buffer.Mapped().data() + offset, RecordSize);
+	m_scheduler.DeferOperation([this, offset, area, wait_for_completion, after_bvh_capture, scheduled_tick] {
+		m_download_buffer.Invalidate(offset, m_record_size);
+		std::array<uint32_t, ShaderRecompiler::Diagnostics::BvhMaximumDiagnosticWords> record {};
+		std::memcpy(record.data(), m_download_buffer.Mapped().data() + offset, m_record_size);
 		m_ticks[area] = 0;
+		if (after_bvh_capture) {
+			m_pending_bvh_result = record;
+			m_pending_bvh_result_tick = scheduled_tick;
+			return; // Empty/other CAS claims are also finalized outside callbacks.
+		}
 		if (record[0] == 0u) return;
 		const uint64_t target = uint64_t {record[2]} | (uint64_t {record[3]} << 32u);
 		const uint64_t pc = uint64_t {record[4]} | (uint64_t {record[5]} << 32u);
@@ -286,7 +394,9 @@ void ShaderCallFaultManager::Process(bool wait_for_completion) {
 		}
 		if (record[1] == 7u) {
 			if (!wait_for_completion) EXIT("BVH snapshot requires synchronous fault inspection; no node read\n");
-			m_pending_bvh = record;
+			std::array<uint32_t, ShaderRecompiler::Diagnostics::BvhDiagnosticWords> before_record {};
+			std::copy_n(record.begin(),before_record.size(),before_record.begin());
+			m_pending_bvh = before_record;
 			m_pending_bvh_tick = scheduled_tick;
 			return;
 		}
@@ -311,6 +421,7 @@ void ShaderCallFaultManager::Process(bool wait_for_completion) {
 		m_scheduler.Wait(scheduled_tick);
 		m_scheduler.PopPendingOperations();
 		if (m_pending_bvh) FinalizeBvhCapture();
+		if (m_pending_bvh_result) FinalizeBvhResultCapture();
 	}
 }
 

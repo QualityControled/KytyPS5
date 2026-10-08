@@ -503,6 +503,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		EXIT("external call probe requires an explicit compute external-library plan");
 	if (options.external_probe_before_bvh && !options.external_call_probe)
 		EXIT("before-BVH diagnostic requires the explicit external call probe variant");
+	if (options.external_probe_after_bvh &&
+	    (!options.external_call_probe || options.external_probe_before_bvh))
+		EXIT("after-BVH result diagnostic requires the caller-only target probe and excludes before-BVH mode");
 	if (options.external_probe_structured && !options.external_call_probe)
 		EXIT("structured external probe requires the explicit caller-only diagnostic variant");
 	const bool checked_external = options.external_unwritten_vgpr != UINT32_MAX;
@@ -665,6 +668,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .external_call_probe = options.external_call_probe,
 	    .external_probe_before_bvh = options.external_probe_before_bvh,
 	    .external_probe_structured = structured_probe_eligible,
+	    .external_probe_after_bvh = options.external_probe_after_bvh,
 	    .external_caller_address = options.external_library != nullptr
 	        ? options.external_library->caller_address : 0u,
 	    .checked_external_calls = checked_external,

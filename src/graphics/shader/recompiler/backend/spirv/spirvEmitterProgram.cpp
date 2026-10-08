@@ -204,7 +204,8 @@ void RecordShaderCallFault(ValueEmitContext& ctx, uint32_t kind, uint32_t low, u
 		state.builder.AddFunction(spv::OpStore, pointer(i + 1u), details[i]);
 	// The extended BVH probe adds a full ray tuple after the existing header.
 	// Other events retain their original eight extra DWORDs and write range.
-	if (extra.size() > 24u || (kind != 7u && extra.size() > 8u))
+	const auto maximum_extra = kind == 8u ? 26u : kind == 7u ? 24u : 8u;
+	if (extra.size() > maximum_extra || (kind == 8u && extra.size() != 26u))
 		Fail("external diagnostic exceeds its record payload");
 	for (uint32_t i = 0; i < extra.size(); ++i)
 		state.builder.AddFunction(spv::OpStore, pointer(i + 8u), extra[i]);

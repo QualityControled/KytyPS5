@@ -997,6 +997,10 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 }
 
 void ValidateTranslateOptions(const TranslateOptions& options) {
+	if (options.external_probe_after_bvh &&
+	    (!options.external_call_probe || options.external_probe_before_bvh ||
+	     options.checked_external_calls || options.stage != ShaderType::Compute))
+		EXIT("after-BVH result translation requires an exclusive compute caller-only probe");
 	if (options.wave_size != 32u && options.wave_size != 64u) {
 		EXIT("shader translation requires wave32 or wave64, got %u", options.wave_size);
 	}
@@ -1072,6 +1076,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	});
 	result.info.uses_external_call_probe = options.external_call_probe;
 	result.info.uses_external_probe_before_bvh = options.external_probe_before_bvh;
+	result.info.uses_external_probe_after_bvh = options.external_probe_after_bvh;
 	result.external_caller_address = options.external_caller_address;
 	result.info.uses_checked_external_calls = options.checked_external_calls;
 	for (const auto& entry: options.external_entries) {

@@ -85,7 +85,7 @@ public:
         uint64_t address, uint64_t bytes, uint64_t completed_dispatch_tick);
 
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
-	[[nodiscard]] Buffer* GetShaderCallFaultBuffer();
+	[[nodiscard]] Buffer* GetShaderCallFaultBuffer(uint64_t required_record_bytes = 128u);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -96,7 +96,7 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
-	void               ProcessShaderCallFaultBuffer(bool wait_for_completion = false);
+	void               ProcessShaderCallFaultBuffer(bool wait_for_completion = false, bool after_bvh_capture = false);
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 

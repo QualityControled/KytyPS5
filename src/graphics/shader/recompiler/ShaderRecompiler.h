@@ -34,6 +34,9 @@ struct CompileOptions {
 	// Opt-in caller-only probe lowering; retain dispatcher fallback on any CFG
 	// or exact call-metadata validation failure. Ordinary shaders are unchanged.
 	bool                        external_probe_structured = false;
+	// Execute each active BVH normally, then capture one completed tuple/result
+	// and end the native wave. The host must stop even if no event is recorded.
+	bool                        external_probe_after_bvh = false;
 	// Strict coverage variant: only link leaf bodies proved not to write this
 	// VGPR. Every other target faults and ends its wave; the host must inspect
 	// the fault channel before any dispatch consumer is submitted.

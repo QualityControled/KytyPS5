@@ -94,6 +94,7 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::ExternalCallProbe:
 		case ValueOpcode::ExternalCallInputGuard:
 		case ValueOpcode::ExternalBvhProbe:
+		case ValueOpcode::ExternalBvhResultProbe:
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::SetTessellationAttribute:
 		case ValueOpcode::MeshAllocate:

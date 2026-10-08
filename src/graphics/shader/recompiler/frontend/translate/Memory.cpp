@@ -956,6 +956,17 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 				WriteOperand(OffsetOperand(inst.dst, component),
 				    ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(component)}));
 			}
+			if (program.info.uses_external_probe_after_bvh) {
+				if (!program.info.uses_external_call_probe ||
+				    program.info.uses_external_probe_before_bvh ||
+				    inst.pc > UINT64_MAX - program.external_caller_address)
+					EXIT("after-BVH result probe has no valid exclusive caller-only native address");
+				// Retain pre-instruction SSA inputs, including aliased vdata/vaddr.
+				// The original helper and all predicated destination writes remain.
+				ir.Emit(IR::ValueOpcode::ExternalBvhResultProbe,
+				    {descriptor, ray, active, IR::Value(inst.image_address_components - 10u), result},
+				    program.external_caller_address + inst.pc);
+			}
 			return;
 		}
 		case Decoder::Opcode::S_LOAD_DWORD:

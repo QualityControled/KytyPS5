@@ -502,6 +502,17 @@ if(KYTY_CLANG_CL)
 	target_compile_options(bvh_node_capture_tests PRIVATE /EHsc)
 endif()
 
+add_executable(bvh_result_schema_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BvhResultSchemaTests.cpp")
+add_executable(bvh_result_host_policy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BvhResultHostPolicyTests.cpp")
+foreach(kyty_result_test bvh_result_schema_tests bvh_result_host_policy_tests)
+	target_include_directories(${kyty_result_test} PRIVATE ${inc_headers})
+	if(KYTY_CLANG_CL)
+		target_compile_options(${kyty_result_test} PRIVATE /EHsc)
+	endif()
+endforeach()
+
 add_executable(bda_resident_capture_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BdaResidentCaptureTests.cpp"
 )
@@ -685,7 +696,8 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests shader_call_capture_tests external_library_tests external_program_tests ir_use_tests bvh_node_capture_tests bda_resident_capture_tests)
+			virtual_memory_allocation_tests shader_call_capture_tests external_library_tests external_program_tests ir_use_tests bvh_node_capture_tests bda_resident_capture_tests
+			bvh_result_schema_tests bvh_result_host_policy_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 endif()
@@ -717,6 +729,12 @@ if(BUILD_TESTING)
 	add_test(NAME srt_read_capture COMMAND $<TARGET_FILE:srt_read_capture_tests>)
 	add_test(NAME shader_call_capture COMMAND $<TARGET_FILE:shader_call_capture_tests>)
 	add_test(NAME bvh_node_capture COMMAND $<TARGET_FILE:bvh_node_capture_tests>)
+	add_test(NAME bvh_result_schema COMMAND $<TARGET_FILE:bvh_result_schema_tests>)
+	add_test(NAME bvh_result_host_policy COMMAND $<TARGET_FILE:bvh_result_host_policy_tests>)
+	add_test(NAME bvh_result_host_policy_frozen
+		COMMAND $<TARGET_FILE:bvh_result_host_policy_tests> --frozen-mode)
+	add_test(NAME after_probe_prepare
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --after-probe-prepare-only)
 	add_test(NAME bda_resident_capture COMMAND $<TARGET_FILE:bda_resident_capture_tests>)
 	add_test(NAME shader_bda_resident_capture COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-resident-capture-only)
 	add_test(NAME external_library COMMAND $<TARGET_FILE:external_library_tests>)
@@ -811,6 +829,8 @@ if(BUILD_TESTING)
 		srt_read_capture_tests
 		shader_call_capture_tests
 		bvh_node_capture_tests
+		bvh_result_schema_tests
+		bvh_result_host_policy_tests
 		bda_resident_capture_tests
 		external_library_tests
 		captured_compute_manifest_tests

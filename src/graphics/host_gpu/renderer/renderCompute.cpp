@@ -335,6 +335,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const auto& program   = *input_info.stage.program;
+    if (program.info.uses_external_probe_after_bvh &&
+        (!program.info.uses_external_call_probe || !program.info.uses_external_call_fault ||
+         program.info.uses_external_probe_before_bvh || program.info.uses_checked_external_calls ||
+         std::ranges::none_of(program.bindings.descriptors,[](const auto& binding) {
+             return binding.kind==ShaderRecompiler::IR::DescriptorBindingKind::ShaderCallFaultBuffer;
+         })))
+        EXIT("After-BVH dispatch requires exact diagnostic mode and dedicated136B fault binding\n");
 	const auto& resources = *input_info.stage.resources;
 	if (!program.info.uses_external_call_probe && !program.info.uses_checked_external_calls &&
 	    resources.specialization_reads.empty() &&
@@ -479,8 +486,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 	if (program.info.uses_external_call_probe || program.info.uses_checked_external_calls) {
-		m_context.GetBufferCache().ProcessShaderCallFaultBuffer(true);
+		m_context.GetBufferCache().ProcessShaderCallFaultBuffer(true,program.info.uses_external_probe_after_bvh);
 	}
+	if (program.info.uses_external_probe_after_bvh)
+		EXIT("After-BVH dispatch returned without finalized result evidence; stopped before following PM4 consumers\n");
 	if (one_group_probe) {
 		EXIT("Single-workgroup external-call diagnostic completed without a shader fault record; "
 		     "only native workgroup 0 ran, stopped before following PM4 consumers\n");
@@ -510,6 +519,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
+    if (program.info.uses_external_probe_after_bvh &&
+        (!program.info.uses_external_call_probe || !program.info.uses_external_call_fault ||
+         program.info.uses_external_probe_before_bvh || program.info.uses_checked_external_calls ||
+         std::ranges::none_of(program.bindings.descriptors,[](const auto& binding) {
+             return binding.kind==ShaderRecompiler::IR::DescriptorBindingKind::ShaderCallFaultBuffer;
+         })))
+        EXIT("After-BVH dispatch requires exact diagnostic mode and dedicated136B fault binding\n");
 	if (program.info.uses_external_call_probe && OneGroupExternalProbeRequested()) {
 		EXIT("Single-workgroup external-call probe rejects indirect dispatch before execution\n");
 	}
@@ -548,8 +564,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 	if (program.info.uses_external_call_probe || program.info.uses_checked_external_calls) {
-		m_context.GetBufferCache().ProcessShaderCallFaultBuffer(true);
+		m_context.GetBufferCache().ProcessShaderCallFaultBuffer(true,program.info.uses_external_probe_after_bvh);
 	}
+	if (program.info.uses_external_probe_after_bvh)
+		EXIT("After-BVH indirect dispatch returned without finalized result evidence; stopped before following PM4 consumers\n");
 }
 
 } // namespace Libs::Graphics

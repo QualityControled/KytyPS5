@@ -413,6 +413,103 @@ void EmitExternalBvhProbe(ValueEmitContext& ctx, const IR::Inst& inst) {
 	EmitLabel(s, proceed);
 }
 
+void EmitExternalBvhResultProbe(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ctx.half != 0u) return;
+	auto& s = ctx.state;
+	const auto* ray = ctx.ImageAddress(inst.Arg(1));
+	if (!s.program.info.uses_external_call_probe || !s.program.info.uses_external_probe_after_bvh ||
+	    s.program.info.uses_external_probe_before_bvh || s.program.info.uses_checked_external_calls ||
+	    s.program.stage != ShaderType::Compute || ray == nullptr ||
+	    !inst.Arg(3).IsImmediate() || inst.Arg(3).GetType() != IR::Type::U32 ||
+	    (inst.Arg(3).U32() != 1u && inst.Arg(3).U32() != 2u) ||
+	    ray->NumArgs() < inst.Arg(3).U32() + 10u || inst.NumArgs() != 5u ||
+        inst.Arg(4).GetType() != IR::Type::U32x4)
+		ctx.Fail(inst, "after-BVH result trap requires the exclusive caller-only probe and original tuple/result");
+	const auto node_words = inst.Arg(3).U32();
+	// EmitBlock completed the original helper producer in BOTH virtual halves.
+	// Ballot is outside all helper/CAS branches; every physical invocation participates.
+	const auto exec = ctx.Ballot(inst.Arg(2));
+	const auto exec_lo = Extract(s, TypeU32(s), exec, 0u);
+	const auto exec_hi = Extract(s, TypeU32(s), exec, 1u);
+	const auto any_active = Binary(s, spv::OpINotEqual, TypeBool(s),
+	    Binary(s, spv::OpBitwiseOr, TypeU32(s), exec_lo, exec_hi), ConstantU32(s, 0));
+	const auto trap = s.builder.AllocateId();
+	const auto proceed = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpSelectionMerge, proceed, spv::SelectionControlMaskNone);
+	s.builder.AddFunction(spv::OpBranchConditional, any_active, trap, proceed);
+	EmitLabel(s, trap);
+	const auto active_low = ctx.Arg(inst, 2);
+	const auto active_high = ctx.other_half != nullptr
+	    ? ctx.other_half->Arg(inst, 2) : ConstantBool(s, false);
+	const auto local_active = Binary(s, spv::OpLogicalOr, TypeBool(s), active_low, active_high);
+	const auto choose_word = [&](uint32_t low, uint32_t high) {
+		return ctx.other_half == nullptr ? low : Select(s, TypeU32(s), active_low, low, high);
+	};
+	std::array<uint32_t, 4> descriptor;
+	for (uint32_t word = 0; word < descriptor.size(); ++word) {
+		const auto low = Extract(s, TypeU32(s), ctx.Arg(inst, 0), word);
+		const auto high = ctx.other_half != nullptr
+		    ? Extract(s, TypeU32(s), ctx.other_half->Arg(inst, 0), word) : low;
+		descriptor[word] = choose_word(low, high);
+	}
+	const auto node_lo = choose_word(ctx.Arg(*ray, 0), ctx.other_half != nullptr
+	    ? ctx.other_half->Arg(*ray, 0) : ctx.Arg(*ray, 0));
+	const auto node_hi = node_words == 2u
+	    ? choose_word(ctx.Arg(*ray, 1), ctx.other_half != nullptr
+	        ? ctx.other_half->Arg(*ray, 1) : ctx.Arg(*ray, 1))
+	    : ConstantU32(s, 0);
+	const auto node = PackU64(s, node_lo, node_hi);
+	const auto base = Binary(s, spv::OpShiftLeftLogical, TypeU64(s),
+	    PackU64(s, descriptor[0], Binary(s, spv::OpBitwiseAnd, TypeU32(s),
+	                                   descriptor[1], ConstantU32(s, 0xff))), ConstantU32(s, 8));
+	const auto address = Binary(s, spv::OpIAdd, TypeU64(s), base,
+	    Binary(s, spv::OpShiftLeftLogical, TypeU64(s),
+	        Binary(s, spv::OpShiftRightLogical, TypeU64(s), node, ConstantU32(s, 3)),
+	        ConstantU32(s, 6)));
+	const auto low_address = Unary(s, spv::OpUConvert, TypeU32(s), address);
+	const auto high_address = Unary(s, spv::OpUConvert, TypeU32(s),
+	    Binary(s, spv::OpShiftRightLogical, TypeU64(s), address, ConstantU32(s, 32)));
+	std::array<uint32_t, Diagnostics::BvhResultDiagnosticExtraWords> extra;
+	extra.fill(ConstantU32(s, 0));
+	for (uint32_t word = 0; word < descriptor.size(); ++word) extra[word] = descriptor[word];
+	extra[4] = node_lo;
+	extra[5] = node_hi;
+	extra[6] = exec_lo;
+	extra[7] = exec_hi;
+	for (uint32_t word = 0; word < Diagnostics::BvhRayWords; ++word) {
+		const auto low = ctx.Arg(*ray, node_words + word);
+		const auto high = ctx.other_half != nullptr
+		    ? ctx.other_half->Arg(*ray, node_words + word) : low;
+		extra[Diagnostics::BvhRayWord - 8 + word] = choose_word(low, high);
+	}
+	extra[Diagnostics::BvhNodeWidthWord - 8] = ConstantU32(s, node_words);
+	const auto chosen_half = ctx.other_half == nullptr ? ConstantU32(s, 0)
+	    : Select(s, TypeU32(s), active_low, ConstantU32(s, 0), ConstantU32(s, 32));
+	extra[Diagnostics::BvhNativeLaneWord - 8] = Binary(s, spv::OpIAdd, TypeU32(s),
+	    EmitSubgroupLocalInvocationId(s), chosen_half);
+	extra[Diagnostics::BvhSchemaMagicWord - 8] = ConstantU32(s, Diagnostics::BvhSchemaMagic);
+	extra[Diagnostics::BvhSchemaVersionWord - 8] = ConstantU32(s, Diagnostics::BvhResultSchemaVersion);
+	// Select outputs using the SAME half as every retained input component.
+	for (uint32_t word = 0; word < Diagnostics::BvhResultWords; ++word) {
+		const auto low = Extract(s, TypeU32(s), ctx.Arg(inst, 4), word);
+		const auto high = ctx.other_half != nullptr
+		    ? Extract(s, TypeU32(s), ctx.other_half->Arg(inst, 4), word) : low;
+		extra[Diagnostics::BvhResultWord - 8 + word] = choose_word(low, high);
+	}
+	// An inactive physical lane cannot win with stale VGPR words. All lanes
+	// converge and return after the active winner(s) have attempted the CAS.
+	const auto winner = s.builder.AllocateId();
+	const auto recorded = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpSelectionMerge, recorded, spv::SelectionControlMaskNone);
+	s.builder.AddFunction(spv::OpBranchConditional, local_active, winner, recorded);
+	EmitLabel(s, winner);
+	RecordExternalDiagnosticFault(ctx, 8, low_address, high_address, inst.Flags<uint64_t>(), extra);
+	s.builder.AddFunction(spv::OpBranch, recorded);
+	EmitLabel(s, recorded);
+	s.builder.AddFunction(spv::OpReturn);
+	EmitLabel(s, proceed);
+}
+
 uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	const auto* ray = ctx.ImageAddress(inst.Arg(1));

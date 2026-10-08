@@ -647,15 +647,17 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
-Buffer* BufferCache::GetShaderCallFaultBuffer() {
+Buffer* BufferCache::GetShaderCallFaultBuffer(uint64_t required_record_bytes) {
 	if (!m_shader_call_fault_manager) {
 		m_shader_call_fault_manager = std::make_unique<ShaderCallFaultManager>(m_graphics, m_scheduler);
 	}
-	return m_shader_call_fault_manager->GetBuffer();
+	return m_shader_call_fault_manager->GetBuffer(required_record_bytes);
 }
 
-void BufferCache::ProcessShaderCallFaultBuffer(bool wait_for_completion) {
-	if (m_shader_call_fault_manager) m_shader_call_fault_manager->Process(wait_for_completion);
+void BufferCache::ProcessShaderCallFaultBuffer(bool wait_for_completion,bool after_bvh_capture) {
+	if (after_bvh_capture && !m_shader_call_fault_manager)
+		EXIT("After-BVH dispatch lacks fault manager; terminal stop\n");
+	if (m_shader_call_fault_manager) m_shader_call_fault_manager->Process(wait_for_completion,after_bvh_capture);
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

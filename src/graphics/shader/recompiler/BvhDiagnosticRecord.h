@@ -16,6 +16,12 @@ inline constexpr size_t BvhSchemaMagicWord = 28;
 inline constexpr size_t BvhSchemaVersionWord = 29;
 inline constexpr uint32_t BvhSchemaMagic = 0x42564852u;
 inline constexpr uint32_t BvhSchemaVersion = 1u;
+inline constexpr size_t BvhResultDiagnosticWords = 34;
+inline constexpr size_t BvhResultDiagnosticExtraWords = BvhResultDiagnosticWords - 8;
+inline constexpr size_t BvhResultWord = 30;
+inline constexpr size_t BvhResultWords = 4;
+inline constexpr uint32_t BvhResultSchemaVersion = 2u;
+inline constexpr size_t BvhMaximumDiagnosticWords = BvhResultDiagnosticWords;
 
 // The sidecar belongs to the same active invocation/half that won the event CAS.
 // Zero node-high bits cannot establish the native opcode's pointer width.
@@ -24,6 +30,18 @@ inline constexpr bool ValidBvhRaySidecar(std::span<const uint32_t> words) {
         (words[BvhNodeWidthWord] != 1u && words[BvhNodeWidthWord] != 2u) ||
         words[BvhNativeLaneWord] >= 64u || words[BvhSchemaMagicWord] != BvhSchemaMagic ||
         words[BvhSchemaVersionWord] != BvhSchemaVersion || words[30] != 0u || words[31] != 0u ||
+        (words[BvhNodeWidthWord] == 1u && words[13] != 0u)) return false;
+    const auto exec = uint64_t{words[14]} | (uint64_t{words[15]} << 32u);
+    return ((exec >> words[BvhNativeLaneWord]) & 1u) != 0u;
+}
+
+// Sidecar structure only. Host validation must additionally verify the native
+// PC, decoded opcode width, descriptor/node address bounds and completed wait.
+inline constexpr bool ValidBvhResultSidecar(std::span<const uint32_t> words) {
+    if (words.size() != BvhResultDiagnosticWords || words[0] != 1u || words[1] != 8u ||
+        (words[BvhNodeWidthWord] != 1u && words[BvhNodeWidthWord] != 2u) ||
+        words[BvhNativeLaneWord] >= 64u || words[BvhSchemaMagicWord] != BvhSchemaMagic ||
+        words[BvhSchemaVersionWord] != BvhResultSchemaVersion ||
         (words[BvhNodeWidthWord] == 1u && words[13] != 0u)) return false;
     const auto exec = uint64_t{words[14]} | (uint64_t{words[15]} << 32u);
     return ((exec >> words[BvhNativeLaneWord]) & 1u) != 0u;

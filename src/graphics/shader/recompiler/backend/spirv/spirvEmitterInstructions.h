@@ -211,6 +211,7 @@ uint32_t EmitExternalCallContextWord(ValueEmitContext& ctx, const IR::Inst& inst
 void EmitExternalCallProbe(ValueEmitContext& ctx, const IR::Inst& inst);
 void EmitExternalCallInputGuard(ValueEmitContext& ctx, const IR::Inst& inst);
 void EmitExternalBvhProbe(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitExternalBvhResultProbe(ValueEmitContext& ctx, const IR::Inst& inst);
 void RecordExternalDiagnosticFault(ValueEmitContext& ctx, uint32_t kind, uint32_t low,
 	                              uint32_t high, uint64_t guest_pc,
 	                              std::span<const uint32_t> extra);

@@ -1349,6 +1349,7 @@ struct TestCase {
   uint64_t shader_hash = 0;
   bool external_call_probe = false;
   bool external_probe_before_bvh = false;
+  bool external_probe_after_bvh = false;
   bool external_probe_structured = false;
   uint32_t external_unwritten_vgpr = UINT32_MAX;
 };
@@ -1628,6 +1629,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   options.shader_hash = test.shader_hash;
   options.external_call_probe = test.external_call_probe;
   options.external_probe_before_bvh = test.external_probe_before_bvh;
+  options.external_probe_after_bvh = test.external_probe_after_bvh;
   options.external_probe_structured = test.external_probe_structured;
   options.external_unwritten_vgpr = test.external_unwritten_vgpr;
 
@@ -35129,6 +35131,130 @@ void CheckNativeStructuredBvh(VulkanHarness *vulkan, bool structured) {
   if (vulkan) std::printf("NativeBeforeBvh: %zu GPU cases passed structured=%u (native loop, EXEC0/highhalf, BVH-before-call, alias, no-call, full32 CAS)\n",cases,structured);
 }
 
+// CPU-only native frontend coverage; no Vulkan device or guest memory access.
+NativeStructuredBvhFixture MakeNativeAfterBvhPrepare(u32 wave, u32 width,
+                                                    bool structured, bool exact_nsa) {
+  auto fixture = MakeNativeStructuredBvh(wave, width, structured);
+  auto &test = fixture.test;
+  test.name = exact_nsa ? "NativeAfterBvhExactNsaAlias" : "NativeAfterBvhPrepare";
+  test.external_probe_before_bvh = false;
+  test.external_probe_after_bvh = true;
+  if (!exact_nsa) return fixture;
+  Require(test.name, "original narrow NSA fixture", width == 1u,
+          "the original captured e6 encoding is a narrow pointer instruction");
+  // Preserve the authored table descriptor while using the exact native sharp
+  // s4..s7 and v1 node/output alias. Prefix/suffix insertions move all later
+  // branch endpoints equally; the bounded loop before the insertion is intact.
+  std::vector<u32> prefix;
+  for (u32 word = 0; word < 4u; ++word) {
+    prefix.push_back(EncodeSMovB32(52u + word, 4u + word));
+    prefix.push_back(EncodeSMovB32(4u + word, 40u + word));
+  }
+  prefix.push_back(EncodeVop1(0x01u, 1u, Vgpr(4u)));
+  constexpr std::array<u32, 10> ray_regs{41u, 43u, 45u, 44u, 36u, 35u, 34u, 46u, 47u, 48u};
+  for (u32 word = 0; word < ray_regs.size(); ++word)
+    prefix.push_back(EncodeVop1(0x01u, ray_regs[word], Vgpr(5u + word)));
+  constexpr std::array<u32, 5> original_nsa{
+      0xf1989f07u, 0x00010101u, 0x2c2d2b29u, 0x2e222324u, 0x0000302fu};
+  std::vector<u32> suffix{EncodeVop1(0x01u, 20u, Vgpr(1u))};
+  for (u32 word = 0; word < 4u; ++word)
+    suffix.push_back(EncodeSMovB32(4u + word, 52u + word));
+  auto &code = test.code;
+  const auto index = fixture.bvh_pc / sizeof(u32);
+  code.insert(code.begin() + index, prefix.begin(), prefix.end());
+  const auto nsa_index = index + prefix.size();
+  code.erase(code.begin() + nsa_index, code.begin() + nsa_index + 2u);
+  code.insert(code.begin() + nsa_index, original_nsa.begin(), original_nsa.end());
+  code.insert(code.begin() + nsa_index + original_nsa.size(), suffix.begin(), suffix.end());
+  const auto moved = u32((prefix.size() + original_nsa.size() - 2u + suffix.size()) * sizeof(u32));
+  fixture.bvh_pc += u32(prefix.size() * sizeof(u32));
+  fixture.call_pc += moved;
+  auto &site = fixture.library.call_sites.front();
+  site.caller_pc += moved;
+  site.record_load_pc += moved;
+  Require(test.name, "exact five-word original NSA", std::equal(original_nsa.begin(), original_nsa.end(),
+          code.begin() + fixture.bvh_pc / sizeof(u32)), "fixture lost the native NSA encoding");
+  return fixture;
+}
+
+void CheckAfterProbePreparation() {
+  using Opcode = ShaderRecompiler::IR::ValueOpcode;
+  size_t cases = 0u;
+  for (bool structured : {false, true}) for (u32 wave : {32u, 64u})
+    for (u32 variant = 0; variant < 3u; ++variant) {
+      const bool exact_nsa = variant == 2u;
+      const u32 width = variant == 1u ? 2u : 1u;
+      auto fixture = MakeNativeAfterBvhPrepare(wave, width, structured, exact_nsa);
+      fixture.test.external_library = &fixture.library;
+      const auto compiled = CompileCase(fixture.test, 32u);
+      Require(fixture.test.name, "requested native lowering", compiled.program.dispatcher_fallback != structured,
+              "the CPU fixture used a different frontend route");
+      spvtools::SpirvTools validator(SPV_ENV_VULKAN_1_3);
+      validator.SetMessageConsumer([](spv_message_level_t, const char *,
+                                     const spv_position_t &, const char *message) {
+        std::fprintf(stderr, "AfterProbePrepare SPIR-V: %s\n", message);
+      });
+      Require(fixture.test.name, "default Vulkan1.3 validation", validator.Validate(compiled.spirv),
+              "after-result module failed the default validator");
+      size_t result_tags = 0u, call_tags = 0u, before_tags = 0u;
+      for (const auto *block : compiled.program.blocks) for (const auto &inst : block->Instructions()) {
+        if (inst.GetOpcode() == Opcode::ExternalBvhResultProbe) {
+          ++result_tags;
+          Require(fixture.test.name, "true native result PC", inst.Flags<uint64_t>() ==
+                  fixture.library.caller_address + fixture.bvh_pc,
+                  "result observation moved away from the native BVH instruction");
+          const auto *intersection = inst.Arg(4).Resolve().TryInstruction();
+          Require(fixture.test.name, "actual retained result dependency", intersection != nullptr &&
+                  intersection->GetOpcode() == Opcode::BvhIntersect && intersection->Flags<u32>() == width,
+                  "result observation does not depend on the real narrow/wide intersection");
+        }
+        if (inst.GetOpcode() == Opcode::ExternalCallProbe) {
+          ++call_tags;
+          Require(fixture.test.name, "true aliased native call PC", inst.Flags<uint64_t>() ==
+                  fixture.library.caller_address + fixture.call_pc,
+                  "caller stop moved away from its aliased SWAPPC instruction");
+        }
+        before_tags += inst.GetOpcode() == Opcode::ExternalBvhProbe;
+      }
+      Require(fixture.test.name, "exclusive native observation tags",
+              result_tags == 1u && call_tags == 1u && before_tags == 0u,
+              "native frontend lost, duplicated, or mixed its observation mode");
+      std::printf("AfterProbePrepared: structured=%u wave=%u nodewords=%u exact_original_nsa=%u words=%zu idbound=%u PASS\n",
+                  structured, wave, width, exact_nsa, compiled.spirv.size(), compiled.spirv[3]);
+      ++cases;
+    }
+  std::printf("AfterProbePrepare: %zu native both-route default-Vulkan1.3 modules passed; CPU only, no guest memory or GPU execution\n", cases);
+}
+
+void CheckAfterProbeRejection(std::string_view mode) {
+  auto fixture = MakeNativeAfterBvhPrepare(64u, 1u, true, false);
+  auto &test = fixture.test;
+  test.external_library = &fixture.library;
+  if (mode == "--reject-after-without-target") test.external_call_probe = false;
+  else if (mode == "--reject-after-with-before") test.external_probe_before_bvh = true;
+  else if (mode == "--reject-after-with-checked") test.external_unwritten_vgpr = 27u;
+  else if (mode == "--reject-after-wrong-stage") {
+    ShaderPixelInputInfo pixel{};
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Pixel;
+    options.input_info.pixel = &pixel;
+    options.external_library = &fixture.library;
+    options.external_call_probe = options.external_probe_after_bvh = true;
+    options.user_data = test.user_data;
+    (void)ShaderRecompiler::TranslateProgram(test.code, options);
+    Fail(test.name, "compute-only result probe", "result probe accepted a pixel shader");
+  } else if (mode == "--reject-after-with-barrier") {
+    test.code.insert(test.code.begin(), EncodeSopp(0x0au, 0u));
+    auto &site = fixture.library.call_sites.front();
+    site.caller_pc += sizeof(u32);
+    site.record_load_pc += sizeof(u32);
+  } else {
+    Fail(test.name, "known negative mode", "unrecognized result-probe rejection case");
+  }
+  (void)CompileCase(test, 32u);
+  Fail(test.name, "result-probe precondition", "invalid after-result mode was accepted");
+}
+
 void CheckStructuredProbeOrdinary(VulkanHarness &vulkan) {
   RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32u,32u));
   RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64u,64u));
@@ -43441,11 +43567,36 @@ int main(int argc, char **argv) {
                "capture-folder and function-limit; malformed captured requests never start the GPU suite\n", stderr);
     return 2;
   }
+  const bool after_cpu_flag = argc > 1 && (
+      std::strcmp(argv[1], "--after-probe-prepare-only") == 0 ||
+      std::strcmp(argv[1], "--reject-after-without-target") == 0 ||
+      std::strcmp(argv[1], "--reject-after-with-before") == 0 ||
+      std::strcmp(argv[1], "--reject-after-with-checked") == 0 ||
+      std::strcmp(argv[1], "--reject-after-wrong-stage") == 0 ||
+      std::strcmp(argv[1], "--reject-after-with-barrier") == 0);
+  if (after_cpu_flag && argc != 2) {
+    std::fputs("AfterProbePrepare: CPU-only after-probe mode requires exactly one flag; "
+               "malformed requests never initialize Vulkan\n", stderr);
+    return 2;
+  }
+  const bool after_prepare = argc == 2 && std::strcmp(argv[1], "--after-probe-prepare-only") == 0;
+  const bool after_rejection = argc == 2 && (
+      std::strcmp(argv[1], "--reject-after-without-target") == 0 ||
+      std::strcmp(argv[1], "--reject-after-with-before") == 0 ||
+      std::strcmp(argv[1], "--reject-after-with-checked") == 0 ||
+      std::strcmp(argv[1], "--reject-after-wrong-stage") == 0 ||
+      std::strcmp(argv[1], "--reject-after-with-barrier") == 0);
   const bool structured_prepare=argc==2 && std::strcmp(argv[1],"--structured-probe-prepare-only")==0;
   const bool structured_without_probe=argc==2 && std::strcmp(argv[1],"--reject-structured-without-probe")==0;
   const bool structured_barrier=argc==2 && std::strcmp(argv[1],"--reject-structured-with-barrier")==0;
   EnsureConfigInitialized(!captured_translation_only && !dispatcher_determinism &&
-                          !structured_prepare && !structured_without_probe && !structured_barrier);
+                          !structured_prepare && !structured_without_probe && !structured_barrier &&
+                          !after_prepare && !after_rejection);
+  if (after_prepare) {
+    CheckAfterProbePreparation();
+    return 0;
+  }
+  if (after_rejection) CheckAfterProbeRejection(argv[1]);
   if (structured_prepare) {
     CheckStructuredMetadataIsolation();
     CheckNativeStructuredBvh(nullptr,false);

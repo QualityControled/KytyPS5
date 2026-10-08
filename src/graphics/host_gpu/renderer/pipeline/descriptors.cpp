@@ -1144,7 +1144,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						break;
 					}
 					case BindingKind::ShaderCallFaultBuffer: {
-						const auto* fault = m_context.GetBufferCache().GetShaderCallFaultBuffer();
+						const auto required_bytes = program.info.uses_external_probe_after_bvh ? 136u : 128u;
+						const auto* fault = m_context.GetBufferCache().GetShaderCallFaultBuffer(required_bytes);
 						m_descriptor_buffers.emplace_back(fault->Handle(), 0, fault->Size());
 						break;
 					}

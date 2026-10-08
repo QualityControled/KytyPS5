@@ -345,3 +345,5 @@ VALUE_OPCODE(Sendmsg, Void)
 VALUE_OPCODE(TtraceData, Void)
 VALUE_OPCODE(InstPrefetch, Void)
 VALUE_OPCODE(SelectU32, U32, U1, U32, U32)
+// Append to retain all existing opcode identities in diagnostic overlays.
+VALUE_OPCODE(ExternalBvhResultProbe, Void, U32x4, ImageAddress, U1, U32, U32x4)
