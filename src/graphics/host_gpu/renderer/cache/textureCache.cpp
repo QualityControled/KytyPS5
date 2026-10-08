@@ -20,6 +20,7 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -93,6 +94,14 @@ TextureCache::InspectExistingImageOwnersForDiagnostic(uint64_t address) {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+[[nodiscard]] bool ExactFirstPageImageLookupEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_EXPERIMENTAL_IMAGE_EXACT_PAGE_LOOKUP");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                     vk::ClearColorValue& clear) {
@@ -1335,7 +1344,29 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
+		if (ExactFirstPageImageLookupEnabled()) {
+			ImagePageTable::PageRange pages {};
+			if (ImagePageTable::TryGetPageRange(desc.info.data.address, desc.info.data.size,
+			                                  pages)) {
+				const auto* owners = m_image_page_table.Find(pages.first);
+				if (owners != nullptr) {
+					// Every SameBacking match has this exact start and size, so the
+					// normal range scan encounters it on this first ownership page.
+					// Preserve the last unique match in that same owner-list order.
+					ImageIds exact_matches;
+					owners->ForEach([&](ImageId id) {
+						const auto* image = m_slot_images.try_get(id);
+						if (image != nullptr && !exact_matches.Contains(id) &&
+						    image->Overlaps(desc.info.data.address, desc.info.data.size, false) &&
+						    SameBacking(image->info, desc.info, exact_format)) {
+							exact_matches.push_back(id);
+							result = id;
+						}
+					});
+				}
+			}
+		}
+		const auto candidates = result ? ImageIds {} :
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
