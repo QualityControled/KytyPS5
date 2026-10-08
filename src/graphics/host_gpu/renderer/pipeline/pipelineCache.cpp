@@ -677,6 +677,71 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 	return hash;
 }
 
+// Failure-only metadata: bounded existing CPU facts, without guest reads or materialization retries.
+static size_t FormatSoftwareColorComparisonFailure(std::span<char> output,
+    uint32_t stage, uint64_t hash, uint64_t base, bool materialized,
+    const ShaderRecompiler::IR::ResourcePlan& plan,
+    const ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+    const ShaderRecompiler::IR::SoftwareColorComparisonFailureReport& report) {
+    if (output.empty()) return 0;
+    size_t used = 0;
+    const auto append = [&](const char* format, auto... args) {
+        if (used + 1u >= output.size()) return;
+        int count;
+        if constexpr (sizeof...(args) == 0) count = std::snprintf(output.data() + used, output.size() - used, "%s", format);
+        else count = std::snprintf(output.data() + used, output.size() - used, format, args...);
+        if (count > 0) used += std::min(static_cast<size_t>(count), output.size() - used - 1u);
+    };
+    append("SoftwareColorDrefFailure begin schema=1 stage=%u hash=%016llx base=%016llx "
+           "phase=%s materialized=%u configured=0 reason=%s image=%u sampler=%u "
+           "pair_plan_first_use_pc_present=%u pair_plan_first_use_pc=%08x scope_reason=%u "
+           "guest_reads_added=0 gpu_execution_not_proved=1\n", stage,
+           static_cast<unsigned long long>(hash), static_cast<unsigned long long>(base),
+           materialized ? "configure" : "materialize", materialized,
+           materialized ? ShaderRecompiler::IR::SoftwareColorComparisonFailureName(report.reason) : "base_materialize_false",
+           report.image, report.sampler, report.pair_first_use_pc_present, report.pair_first_use_pc, report.scope_reason);
+    append("SoftwareColorDrefFailure counts plan_images=%zu plan_samplers=%zu pairs=%zu sources=%zu "
+           "snapshot_images=%zu snapshot_samplers=%zu snapshot_buffers=%zu specialized_images=%zu "
+           "specialized_samplers=%zu partial_snapshot=%u\n", plan.info.images.size(), plan.info.samplers.size(),
+           plan.info.sampled_pairs.size(), plan.descriptor_sources.size(), snapshot.images.size(), snapshot.samplers.size(),
+           snapshot.buffers.size(), specialization.images.size(), specialization.samplers.size(), !materialized);
+    // A failed base refresh can leave partial/stale payloads. Never print those as valid descriptors.
+    if (materialized && report.image < plan.info.images.size()) {
+        const auto& image = plan.info.images[report.image];
+        append("SoftwareColorDrefFailure image source=%u plan_first_use_pc=%08x class=%u "
+               "dimension=%u indirect_root=%u read=%u written=%u atomic=%u compare=%u seen=%u eligible=%u\n",
+               image.source, image.first_use_pc, static_cast<uint32_t>(image.resource_class),
+               static_cast<uint32_t>(image.dimension), image.indirect_root, image.read, image.written,
+               image.atomic, image.depth_compare, image.software_comparison_seen, image.software_comparison_eligible);
+        if (report.image < specialization.images.size()) {
+            const auto& value = specialization.images[report.image];
+            append("SoftwareColorDrefFailure specialization dimension=%u mips=%u conversion_format=%u "
+                   "comparison_mode=%u shader_swizzle=%08x\n", static_cast<uint32_t>(value.dimension),
+                   value.mip_count, static_cast<uint32_t>(value.conversion_format),
+                   static_cast<uint32_t>(value.comparison_mode), value.shader_swizzle);
+        }
+        if (report.image < snapshot.images.size() && snapshot.images[report.image].dword_count == 8u) {
+            const auto& words = snapshot.images[report.image].dwords;
+            append("SoftwareColorDrefFailure texture_snapshot8=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+                   words[0],words[1],words[2],words[3],words[4],words[5],words[6],words[7]);
+        } else append("SoftwareColorDrefFailure texture_snapshot8=unavailable\n");
+    }
+    if (materialized && report.sampler < plan.info.samplers.size()) {
+        const auto& sampler = plan.info.samplers[report.sampler];
+        append("SoftwareColorDrefFailure sampler source=%u plan_first_use_pc=%08x indirect_root=%u\n",
+               sampler.source, sampler.first_use_pc, sampler.indirect_root);
+        if (report.sampler < snapshot.samplers.size() && snapshot.samplers[report.sampler].dword_count == 4u) {
+            const auto& words = snapshot.samplers[report.sampler].dwords;
+            append("SoftwareColorDrefFailure sampler_snapshot4=%08x,%08x,%08x,%08x\n",
+                   words[0],words[1],words[2],words[3]);
+        } else append("SoftwareColorDrefFailure sampler_snapshot4=unavailable\n");
+    }
+    append("SoftwareColorDrefFailure end metadata_only=1 fatal_preserved=1 max_bytes=32768 "
+           "plan_pc_is_association_only=1\n");
+    return used;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -1192,8 +1257,18 @@ struct PipelineCache::ProgramCache {
 				     "files_written=%d; stopped before external shader compilation or GPU execution\n",
 				     succeeded, resource_capture->Complete(), saved);
 			}
-			return succeeded && ShaderRecompiler::IR::ConfigureSoftwareColorComparison(
-			    plan, resources, specialization, lookup_key.software_color_dref, r8_native_comparison_supported);
+			ShaderRecompiler::IR::SoftwareColorComparisonFailureReport failure_report;
+			const bool configured = succeeded && ShaderRecompiler::IR::ConfigureSoftwareColorComparison(
+			    plan, resources, specialization, lookup_key.software_color_dref, r8_native_comparison_supported,
+			    lookup_key.software_color_dref ? &failure_report : nullptr);
+			if (lookup_key.software_color_dref && !configured) {
+				std::vector<char> output(32768);
+				const auto bytes = FormatSoftwareColorComparisonFailure(output, static_cast<uint32_t>(stage),
+				    params.hash, params.Base(), succeeded, plan, resources, specialization, failure_report);
+				std::fwrite(output.data(), 1u, bytes, stdout);
+				std::fflush(stdout);
+			}
+			return configured;
 		};
 		if (entry != programs.end()) {
 			{

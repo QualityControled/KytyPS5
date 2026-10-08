@@ -1648,24 +1648,37 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 
 bool ConfigureSoftwareColorComparison(const ResourcePlan& plan, const ResourceSnapshot& snapshot,
                                       ResourceSpecialization& specialization, bool enabled,
-                                      bool r8_native_comparison_supported) {
+                                      bool r8_native_comparison_supported,
+                                      SoftwareColorComparisonFailureReport* failure_report) {
+	if (failure_report != nullptr) *failure_report = {};
+	const auto reject = [&](SoftwareColorComparisonFailure reason, uint32_t image = UINT32_MAX,
+	                        uint32_t sampler = UINT32_MAX, const SampledResourcePair* pair = nullptr,
+	                        uint32_t scope_reason = UINT32_MAX) {
+		if (failure_report != nullptr) {
+			*failure_report = {reason, image, sampler, pair != nullptr ? pair->first_use_pc : 0u,
+			                   pair != nullptr, scope_reason};
+		}
+		return false;
+	};
 	if (!enabled || r8_native_comparison_supported) return true;
-	if (snapshot.images.size() != specialization.images.size()) return false;
+	if (snapshot.images.size() != specialization.images.size()) return reject(SoftwareColorComparisonFailure::ImageCountMismatch);
 	bool any = false;
 	for (uint32_t index = 0; index < plan.info.images.size(); ++index) {
 		const auto& image = plan.info.images[index];
 		if (!image.depth_compare || !image.software_comparison_seen) continue;
-		if (index >= snapshot.images.size() || snapshot.images[index].dword_count != 8u) return false;
+		if (index >= snapshot.images.size() || snapshot.images[index].dword_count != 8u) return reject(SoftwareColorComparisonFailure::InvalidImageSnapshot, index);
 		ShaderTextureResource descriptor;
 		std::copy_n(snapshot.images[index].dwords.begin(), 8u, descriptor.fields);
 		if (descriptor.Format() != Prospero::BufferFormat::k8UNorm) continue;
-		if (descriptor.IsNull() || descriptor.BaseLevel() != 0u || descriptor.LastLevel() != 0u ||
+		const bool unsupported_texture = descriptor.IsNull() || descriptor.BaseLevel() != 0u || descriptor.LastLevel() != 0u ||
 		    descriptor.MaxMip() != 0u || descriptor.MinLod() != 0u || descriptor.BaseArray5() != 0u ||
-		    descriptor.PrtDefColor() || descriptor.CornerSample() || descriptor.MsaaDepth() ||
-		    descriptor.MetaCompress() || !image.software_comparison_eligible) return false;
+		    descriptor.PrtDefColor() || descriptor.CornerSample() || descriptor.MsaaDepth() || descriptor.MetaCompress();
+		if (unsupported_texture || !image.software_comparison_eligible) return reject(
+		    unsupported_texture ? SoftwareColorComparisonFailure::UnsupportedTextureFields
+		                        : SoftwareColorComparisonFailure::UnsupportedLiveConsumer, index);
 		for (uint32_t channel = 0; channel < 4u; ++channel) {
 			const auto selector = (descriptor.DstSelXYZW() >> (channel * 3u)) & 7u;
-			if (selector == 2u || selector == 3u) return false;
+			if (selector == 2u || selector == 3u) return reject(SoftwareColorComparisonFailure::ReservedSwizzle, index);
 		}
 		SoftwareColorComparison::Scope scope;
 		scope.enabled = scope.capability_known = scope.comparison = true;
@@ -1685,16 +1698,16 @@ bool ConfigureSoftwareColorComparison(const ResourcePlan& plan, const ResourceSn
 			if (pair.image != index) continue;
 			if (pair.sampler >= plan.info.samplers.size() || pair.sampler >= snapshot.samplers.size() ||
 			    plan.info.samplers[pair.sampler].indirect_root != SamplerResource::NoIndirectSampler ||
-			    snapshot.samplers[pair.sampler].dword_count != 4u) return false;
+			    snapshot.samplers[pair.sampler].dword_count != 4u) return reject(SoftwareColorComparisonFailure::InvalidSamplerSnapshot, index, pair.sampler, &pair);
 			std::copy_n(snapshot.samplers[pair.sampler].dwords.begin(), 4u, scope.sampler.begin());
 			const auto decision = SoftwareColorComparison::Classify(scope);
 			if (decision.mode != SoftwareColorComparison::Mode::SoftwarePointR8 &&
-			    decision.mode != SoftwareColorComparison::Mode::SoftwareLinearR8) return false;
-			if (selected_mode && *selected_mode != decision.mode) return false;
+			    decision.mode != SoftwareColorComparison::Mode::SoftwareLinearR8) return reject(SoftwareColorComparisonFailure::RejectedScope, index, pair.sampler, &pair, static_cast<uint32_t>(decision.reason));
+			if (selected_mode && *selected_mode != decision.mode) return reject(SoftwareColorComparisonFailure::ConflictingSamplerModes, index, pair.sampler, &pair);
 			selected_mode = decision.mode;
 			paired = true;
 		}
-		if (!paired) return false;
+		if (!paired) return reject(SoftwareColorComparisonFailure::MissingSampledPair, index);
 		auto& specialized = specialization.images[index];
 		specialized.comparison_mode = *selected_mode == SoftwareColorComparison::Mode::SoftwareLinearR8
 		    ? ImageComparisonMode::SoftwareLinearR8 : ImageComparisonMode::SoftwarePointR8;
@@ -1703,7 +1716,8 @@ bool ConfigureSoftwareColorComparison(const ResourcePlan& plan, const ResourceSn
 	}
 	if (!any) return true;
 	specialization.software_color_dref_enabled = true;
-	return BuildBindingAliases(plan, snapshot, specialization);
+	if (!BuildBindingAliases(plan, snapshot, specialization)) return reject(SoftwareColorComparisonFailure::BindingAliases);
+	return true;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

@@ -62,11 +62,44 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
+// Optional failure-only metadata. Indices/PC identify plan associations, not executed operations.
+enum class SoftwareColorComparisonFailure : uint8_t {
+    None, ImageCountMismatch, InvalidImageSnapshot, UnsupportedTextureFields,
+    UnsupportedLiveConsumer, ReservedSwizzle, InvalidSamplerSnapshot, RejectedScope, ConflictingSamplerModes,
+    MissingSampledPair, BindingAliases
+};
+struct SoftwareColorComparisonFailureReport {
+    SoftwareColorComparisonFailure reason = SoftwareColorComparisonFailure::None;
+    uint32_t image = UINT32_MAX;
+    uint32_t sampler = UINT32_MAX;
+    uint32_t pair_first_use_pc = 0;
+    bool pair_first_use_pc_present = false;
+    uint32_t scope_reason = UINT32_MAX;
+};
+
+constexpr const char* SoftwareColorComparisonFailureName(SoftwareColorComparisonFailure reason) {
+    switch (reason) {
+        case SoftwareColorComparisonFailure::None: return "none";
+        case SoftwareColorComparisonFailure::ImageCountMismatch: return "image_count_mismatch";
+        case SoftwareColorComparisonFailure::InvalidImageSnapshot: return "invalid_image_snapshot";
+        case SoftwareColorComparisonFailure::UnsupportedTextureFields: return "unsupported_texture_fields";
+        case SoftwareColorComparisonFailure::UnsupportedLiveConsumer: return "unsupported_live_consumer";
+        case SoftwareColorComparisonFailure::ReservedSwizzle: return "reserved_swizzle";
+        case SoftwareColorComparisonFailure::InvalidSamplerSnapshot: return "invalid_sampler_snapshot";
+        case SoftwareColorComparisonFailure::RejectedScope: return "rejected_scope";
+        case SoftwareColorComparisonFailure::ConflictingSamplerModes: return "conflicting_sampler_modes";
+        case SoftwareColorComparisonFailure::MissingSampledPair: return "missing_sampled_pair";
+        case SoftwareColorComparisonFailure::BindingAliases: return "binding_aliases";
+    }
+    return "unknown";
+}
+
 // Pure post-materialization configuration. No additional guest reads or descriptor mutation.
 // Capability must come from the physical device optimal-tiling FormatProperties3 query.
 bool ConfigureSoftwareColorComparison(const ResourcePlan& plan, const ResourceSnapshot& snapshot,
                                       ResourceSpecialization& specialization, bool enabled,
-                                      bool r8_native_comparison_supported);
+                                      bool r8_native_comparison_supported,
+                                      SoftwareColorComparisonFailureReport* failure_report = nullptr);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
