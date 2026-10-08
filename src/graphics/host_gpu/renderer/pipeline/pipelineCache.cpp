@@ -19,6 +19,8 @@
 #include "graphics/shader/recompiler/ShaderCallDiagnostics.h"
 #include "graphics/shader/recompiler/ExternalLibrary.h"
 #include "graphics/shader/recompiler/SelectedCalleeCapture.h"
+#include "graphics/shader/recompiler/PixelSampleSensitivity.h"
+#include "graphics/shader/recompiler/EqaaReduced2xPolicy.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/SrtReadCapture.h"
@@ -636,6 +638,7 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 		PipelineKeyHash::Mix(hash, id);
 	}
 	PipelineKeyHash::Mix(hash, key.ps_shader_id);
+	PipelineKeyHash::Mix(hash, key.experimental_eqaa_policy);
 	PipelineKeyHash::Mix(hash, key.vertex_input.binding_count);
 	for (uint32_t i = 0; i < key.vertex_input.binding_count; i++) {
 		PipelineKeyHash::Mix(hash, key.vertex_input.bindings[i].stride);
@@ -770,6 +773,30 @@ struct PipelineCache::ProgramCache {
 			            options.shader_hash);
 			std::fflush(stdout);
 		}
+		ShaderRecompiler::IR::PixelSampleSensitivity pixel_sample_sensitivity;
+		if (options.stage == ShaderType::Pixel &&
+		    Config::GraphicsDebugDumpEnabled() &&
+		    ShaderRecompiler::Diagnostics::EqaaShaderCaptureEnabled()) {
+			pixel_sample_sensitivity = ShaderRecompiler::Diagnostics::CollectPixelSampleSensitivity(
+			    options.stage, true, translated.program.info, translated.program.memory_info,
+			    specialization);
+			for (const auto* block : translated.program.blocks)
+				for (const auto& inst : *block) {
+					ShaderRecompiler::Diagnostics::ObservePixelSampleOpcode(
+					    pixel_sample_sensitivity, inst.GetOpcode());
+					if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::GetBuiltin) {
+						const auto& kind = inst.Arg(0);
+						const bool known = kind.IsImmediate() && kind.GetType() == ShaderRecompiler::IR::Type::U32;
+						ShaderRecompiler::Diagnostics::ObservePixelSampleBuiltin(
+						    pixel_sample_sensitivity, known, known ? kind.U32() : UINT32_MAX);
+					} else if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::SetAttribute) {
+						const auto index = inst.Flags<ShaderRecompiler::IR::ExportFlags>().index;
+						ShaderRecompiler::Diagnostics::ObservePixelSampleExport(
+						    pixel_sample_sensitivity, index < translated.program.export_info.size()
+						                                  ? &translated.program.export_info[index] : nullptr);
+					}
+				}
+		}
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (options.external_library != nullptr) {
@@ -828,9 +855,11 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
+		auto compiled_info = std::move(result.program).TakeCompiledInfo();
+		compiled_info.pixel_sample_sensitivity = pixel_sample_sensitivity;
 		return {
 		    .specialization = std::move(specialization),
-		    .program        = std::move(result.program).TakeCompiledInfo(),
+		    .program        = std::move(compiled_info),
 		    .handle         = {.id = ++next_shader_id, .module = module},
 		};
 	}
@@ -1263,7 +1292,7 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 
-	const auto cache_suffix = requested_after_bvh_probe ?
+	auto cache_suffix = requested_after_bvh_probe ?
 	    (requested_structured_probe ? std::string("-external-probe-structured-after-bvh.bin") :
 	                                  std::string("-external-probe-after-bvh.bin")) :
 	    requested_structured_probe ?
@@ -1273,6 +1302,10 @@ void PipelineCache::InitializeDriverCache() {
 	    ExternalProbeRequested() ? std::string("-external-probe.bin") :
 	    checked_vgpr != std::numeric_limits<uint32_t>::max() ?
 	        fmt::format("-external-vgpr{}.bin", checked_vgpr) : std::string(".bin");
+	if (ShaderRecompiler::Diagnostics::EqaaReduced2xRequested()) {
+		cache_suffix.resize(cache_suffix.size() - std::string_view(".bin").size());
+		cache_suffix += "-experimental-eqaa2x-v1.bin";
+	}
 	m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + cache_suffix);
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
@@ -1557,6 +1590,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto slot = colors[i].target_slot;
+		if (colors[i].experimental_reduced_eqaa_2x) key.experimental_eqaa_policy = 1;
 		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
 		rendering.color_count = std::max(rendering.color_count, slot + 1);
 		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
@@ -1642,6 +1676,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 	EXIT_IF(attachment_samples == 0 ||
 	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
+
+	if (key.experimental_eqaa_policy != 0) {
+		EXIT_IF(!ShaderRecompiler::Diagnostics::EqaaReduced2xRequested() ||
+		        attachment_samples != 2 || !with_depth || depth.desc.info.samples != 2 ||
+		        !ps_active || ps_input_info == nullptr || ps_input_info->ps_sample_shading);
+	}
 
 	if (ps_active && depth.depth_test_enable && ps_input_info->ps_execute_on_noop) {
 		static std::atomic<uint32_t> log_count {0};

@@ -558,6 +558,40 @@ struct ResourceBlock {
 	std::vector<uint32_t> srt_reads;
 };
 
+// Diagnostic-only facts retained before resource specialization can eliminate FMASK
+// resources. These conservative counts are not a reduced-AA admission proof.
+struct PixelSampleSensitivity {
+	bool captured = false;
+	bool complete = false;
+	uint32_t input_kind_mask = 0;
+	uint32_t output_kind_mask = 0;
+	uint32_t unknown_inputs = 0;
+	uint32_t unknown_outputs = 0;
+	bool sample_id = false;
+	bool packed_ancillary = false;
+	bool centroid_input = false;
+	bool sample_mask_export = false;
+	uint32_t original_images = 0;
+	uint32_t materialized_images = 0;
+	uint32_t fmask_candidates = 0;
+	uint32_t msaa_candidates = 0;
+	uint32_t unknown_image_candidates = 0;
+	uint32_t indirect_images = 0;
+	uint32_t indirect_buffers = 0;
+	uint32_t indirect_samplers = 0;
+	uint32_t address_memory_rows = 0;
+	uint32_t indirect_buffer_rows = 0;
+	uint32_t dynamic_descriptor_rows = 0;
+	uint64_t original_instruction_count = 0;
+	uint64_t image_read_count = 0;
+	uint64_t image_write_count = 0;
+	uint64_t image_query_dimensions_count = 0;
+	uint64_t image_query_lod_count = 0;
+	uint64_t image_sample_count = 0;
+	uint64_t image_gather_count = 0;
+	bool operator==(const PixelSampleSensitivity&) const = default;
+};
+
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 struct CompiledShaderInfo {
 	ShaderType                    stage               = ShaderType::Unknown;
@@ -570,6 +604,7 @@ struct CompiledShaderInfo {
 	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
+	PixelSampleSensitivity        pixel_sample_sensitivity;
 };
 
 struct UniformFillPlan {

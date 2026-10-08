@@ -152,11 +152,13 @@ private:
 		uint64_t                 ps_shader_id = 0;
 		PipelineVertexInputState vertex_input;
 		PipelineStaticParameters static_params;
+		uint32_t experimental_eqaa_policy = 0;
 
 		bool operator==(const GraphicsPipelineKey& other) const {
 			return rendering == other.rendering && vertex_shader_ids == other.vertex_shader_ids &&
 			       ps_shader_id == other.ps_shader_id && vertex_input == other.vertex_input &&
-			       static_params == other.static_params;
+			       static_params == other.static_params &&
+			       experimental_eqaa_policy == other.experimental_eqaa_policy;
 		}
 	};
 

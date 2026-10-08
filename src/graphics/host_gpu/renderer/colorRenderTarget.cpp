@@ -14,6 +14,9 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/EqaaReduced2xPolicy.h"
+#include "graphics/shader/recompiler/PixelSampleSensitivity.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
@@ -45,7 +48,8 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 // No guest memory, image/cache lookup, GPU operation, or register writes.
 static void PrintUnsupportedColorSamples(const CommandBuffer& buffer, uint32_t slot,
                                          uint32_t effective_mask, uint32_t slice_offset,
-                                         bool ignore_target_mask, bool exact_format) {
+                                         bool ignore_target_mask, bool exact_format,
+                                         bool fatal_preserved = true) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
 		return;
 	}
@@ -251,14 +255,182 @@ static void PrintUnsupportedColorSamples(const CommandBuffer& buffer, uint32_t s
 	            uc.GetPrimitiveResetControl(), ps.data_addr, ps.user_data_addr,
 	            ps.auxiliary_table_addr, vs.es_regs.data_addr, vs.gs_regs.data_addr,
 	            vs.hs_regs.data_addr, vs.ls_regs.data_addr);
-	std::printf("ColorSampleDiagnostic end unsupported_configuration_preserved=1\n");
+	std::printf("ColorSampleDiagnostic end unsupported_configuration_preserved=%u\n",
+	            static_cast<unsigned>(fatal_preserved));
 	std::fflush(stdout);
+}
+
+// Read-only CPU facts from the PS prepared for this draw and existing image owners.
+// This does not synchronize, read metadata bytes, or establish initialized contents.
+static void PrintPreparedPixelSampleState(const ShaderPixelInputInfo* ps) {
+	if (ps == nullptr) return;
+	std::printf("EqaaPreparedPS wave=%u sample_shading=%u depth_export=%u sample_mask_export=%u "
+	            "ancillary=%u perspective_center_vgpr=%u perspective_centroid_vgpr=%u "
+	            "input_num=%u system_input_base=%u custom_interpolation_mask=0x%08x "
+	            "scratch_dwords=%u compiled_program_known=%u\n",
+	            ps->wave_size, static_cast<unsigned>(ps->ps_sample_shading),
+	            static_cast<unsigned>(ps->ps_depth_export_enable),
+	            static_cast<unsigned>(ps->ps_sample_mask_export_enable),
+	            static_cast<unsigned>(ps->ps_ancillary), ps->ps_perspective_center_vgpr,
+	            ps->ps_perspective_centroid_vgpr, ps->input_num, ps->ps_system_input_base,
+	            ps->custom_interpolation_mask, ps->scratch_size_dwords,
+	            static_cast<unsigned>(ps->stage.program != nullptr));
+	if (ps->stage.program == nullptr) return;
+	const auto& program = *ps->stage.program;
+	const auto& summary = program.pixel_sample_sensitivity;
+	std::printf("EqaaPreparedPS shader_hash=0x%016" PRIx64
+	            " retained_original_summary=%u summary_complete=%u "
+	            "absence_is_not_admission_proof=1\n",
+	            program.shader_hash, static_cast<unsigned>(summary.captured),
+	            static_cast<unsigned>(summary.complete));
+	if (!summary.captured) return;
+	std::printf("EqaaPSSensitivity original_input_mask=0x%08x original_output_mask=0x%08x "
+	            "unknown_inputs=%u unknown_outputs=%u sample_id=%u packed_ancillary=%u "
+	            "centroid_input=%u sample_mask_export=%u original_images=%u "
+	            "materialized_images=%u fmask_candidates=%u msaa_candidates=%u "
+	            "unknown_image_candidates=%u indirect_images=%u indirect_buffers=%u "
+	            "indirect_samplers=%u address_memory_rows=%u indirect_buffer_rows=%u "
+	            "dynamic_descriptor_rows=%u\n",
+	            summary.input_kind_mask, summary.output_kind_mask, summary.unknown_inputs,
+	            summary.unknown_outputs, static_cast<unsigned>(summary.sample_id),
+	            static_cast<unsigned>(summary.packed_ancillary),
+	            static_cast<unsigned>(summary.centroid_input),
+	            static_cast<unsigned>(summary.sample_mask_export), summary.original_images,
+	            summary.materialized_images, summary.fmask_candidates, summary.msaa_candidates,
+	            summary.unknown_image_candidates, summary.indirect_images, summary.indirect_buffers,
+	            summary.indirect_samplers, summary.address_memory_rows,
+	            summary.indirect_buffer_rows, summary.dynamic_descriptor_rows);
+	std::printf("EqaaPSOriginalOpcodes instructions=%" PRIu64 " image_read=%" PRIu64
+	            " image_write=%" PRIu64 " image_query_dimensions=%" PRIu64
+	            " image_query_lod=%" PRIu64 " image_sample=%" PRIu64 " image_gather=%" PRIu64 "\n",
+	            summary.original_instruction_count, summary.image_read_count,
+	            summary.image_write_count, summary.image_query_dimensions_count,
+	            summary.image_query_lod_count, summary.image_sample_count,
+	            summary.image_gather_count);
+}
+
+static void PrintExistingImageOwnerState(const char*                         role,
+                                         const ImageOwnerDiagnosticSnapshot& snapshot) {
+	std::printf("EqaaImageOwners role=%s address=0x%016" PRIx64
+	            " scope=registered_base_page_data_or_stencil valid_address=%u "
+	            "page_owners=%zu inspected=%zu matched=%zu reported=%zu stale=%zu "
+	            "unregistered=%zu outside_range=%zu truncated=%u initialization=unknown "
+	            "metadata_bytes_not_read=1 device_contents_unvalidated=1\n",
+	            role, snapshot.address, static_cast<unsigned>(snapshot.valid_address),
+	            snapshot.page_owner_count, snapshot.inspected, snapshot.matched, snapshot.row_count,
+	            snapshot.stale, snapshot.unregistered, snapshot.outside_range,
+	            static_cast<unsigned>(snapshot.truncated));
+	for (size_t i = 0; i < snapshot.row_count; ++i) {
+		const auto& r = snapshot.rows[i];
+		std::printf("EqaaImageOwner role=%s row=%zu id=%u generation=%u registered=%u "
+		            "data=0x%016" PRIx64 "+0x%016" PRIx64 " stencil=0x%016" PRIx64 "+0x%016" PRIx64
+		            " metadata=0x%016" PRIx64 "+0x%016" PRIx64 " metadata_kind=%u "
+		            "htile_clear_mask=0x%08x guest_samples=%u backing_samples=%u "
+		            "backing_present=%u guest_format=%d backing_format=%d image_type=%d "
+		            "extent=%u,%u,%u layers=%u levels=%u\n",
+		            role, i, r.index, r.generation, static_cast<unsigned>(r.registered),
+		            r.data_address, r.data_size, r.stencil_address, r.stencil_size,
+		            r.metadata_address, r.metadata_size, r.metadata_kind, r.htile_clear_mask,
+		            r.guest_samples, r.backing_samples, static_cast<unsigned>(r.backing_present),
+		            r.guest_format, r.backing_format, r.image_type, r.width, r.height, r.depth,
+		            r.layers, r.levels);
+		std::printf(
+		    "EqaaImageOwnerFlags role=%s row=%zu cpu_dirty=%u definitely_cpu_dirty=%u "
+		    "maybe_cpu_dirty=%u gpu_modified=%u buffer_modified=%u tracked=%u "
+		    "texture=%u storage=%u render_target=%u depth_target=%u video_out=%u "
+		    "bound=%u target=%u needs_rebind=%u force_general=%u shader_write=%u "
+		    "global_layout=%d global_access=0x%016" PRIx64 " global_stage=0x%016" PRIx64
+		    " attachment_layout=%d attachment_access=0x%016" PRIx64
+		    " subresource_states=%zu global_layout_uniformity=%s contents=unknown\n",
+		    role, i, static_cast<unsigned>(r.cpu_dirty),
+		    static_cast<unsigned>(r.definitely_cpu_dirty), static_cast<unsigned>(r.maybe_cpu_dirty),
+		    static_cast<unsigned>(r.gpu_modified), static_cast<unsigned>(r.buffer_modified),
+		    static_cast<unsigned>(r.tracked), static_cast<unsigned>(r.texture),
+		    static_cast<unsigned>(r.storage), static_cast<unsigned>(r.render_target),
+		    static_cast<unsigned>(r.depth_target), static_cast<unsigned>(r.video_out),
+		    static_cast<unsigned>(r.bound), static_cast<unsigned>(r.target),
+		    static_cast<unsigned>(r.needs_rebind), static_cast<unsigned>(r.force_general),
+		    static_cast<unsigned>(r.shader_write), r.global_layout, r.global_access, r.global_stage,
+		    r.attachment_layout, r.attachment_access, r.subresource_state_count,
+		    r.subresource_state_count == 0 ? "global_state_only" : "per_subresource_unknown");
+	}
+}
+
+static void PrintEqaaShaderAndOwners(const CommandBuffer& buffer, TextureCache& cache,
+                                     uint32_t slot, const ShaderPixelInputInfo* prepared_ps,
+                                     const char* draw_name) {
+	if (!Config::GraphicsDebugDumpEnabled() ||
+	    !ShaderRecompiler::Diagnostics::EqaaShaderCaptureEnabled())
+		return;
+	const auto& hw    = buffer.GetRegisters();
+	const auto& rt    = hw.GetRenderTarget(slot);
+	const auto& depth = hw.GetDepthRenderTarget();
+	std::printf(
+	    "EqaaShaderStateDiagnostic schema=1 slot=%u draw=%s prepared_ps_status=%s "
+	    "native_ps_address=0x%016" PRIx64 " current_draw_depth_acquisition_has_not_occurred=%u "
+	    "metadata_bytes_not_read=1 device_contents_unvalidated=1 "
+	    "snapshot_did_not_mutate_rendering_state=1\n",
+	    slot, draw_name ? draw_name : "unavailable_resolve",
+	    !draw_name    ? "unavailable_resolve"
+		: prepared_ps ? "prepared_this_draw"
+		              : "inactive_this_draw",
+	    buffer.GetShaders().GetPs().ps_regs.data_addr, static_cast<unsigned>(draw_name != nullptr));
+	PrintPreparedPixelSampleState(prepared_ps);
+	const std::array<std::pair<const char*, uint64_t>, 8> queries {
+	    {{"failing_color", rt.base.addr},
+		 {"depth_read", depth.z_read_base_addr},
+		 {"depth_write", depth.z_write_base_addr},
+		 {"stencil_read", depth.stencil_read_base_addr},
+		 {"stencil_write", depth.stencil_write_base_addr},
+		 {"cmask_address_only", rt.cmask.addr},
+		 {"fmask_address_only", rt.fmask.addr},
+		 {"htile_address_only", depth.htile_data_base_addr}}};
+	for (const auto& [role, address]: queries) {
+		const auto snapshot = cache.InspectExistingImageOwnersForDiagnostic(address);
+		PrintExistingImageOwnerState(role, snapshot);
+	}
+	std::printf("EqaaShaderStateDiagnostic end no_reads_no_sync_no_image_mutation=1\n");
+	std::fflush(stdout);
+}
+
+static ShaderRecompiler::Diagnostics::ReducedEqaa2xDecision
+DecideReducedEqaa2xForDraw(const CommandBuffer& buffer, uint32_t slot,
+                           const ShaderPixelInputInfo* prepared_ps, const char* draw_name) {
+	using namespace ShaderRecompiler::Diagnostics;
+	ReducedEqaa2xInputs in;
+	in.requested = EqaaReduced2xRequested();
+	if (!in.requested) return ReducedEqaa2xDecision::Disabled;
+	const auto& hw = buffer.GetRegisters();
+	// Resolve and metadata modes are not normal prepared pixel draws.
+	if (draw_name == nullptr || prepared_ps == nullptr || hw.GetColorControl().mode != 1)
+		return ReducedEqaa2xDecision::MissingPixelSummary;
+	const auto& raw              = hw.GetSampleRegisterSnapshot();
+	in.raw_sample_state_complete = std::all_of(raw.words.begin(), raw.words.end(),
+	                                           [](const auto& word) { return word.valid; });
+	in.encoded_coverage_samples  = hw.GetRenderTarget(slot).attrib.num_samples;
+	in.encoded_color_fragments   = hw.GetRenderTarget(slot).attrib.num_fragments;
+	in.encoded_depth_samples     = hw.GetDepthRenderTarget().z_info.num_samples;
+	in.aa_mask_low  = raw.words[static_cast<size_t>(HW::SampleRegister::AaMaskX0Y0X1Y0)].value;
+	in.aa_mask_high = raw.words[static_cast<size_t>(HW::SampleRegister::AaMaskX0Y1X1Y1)].value;
+	in.sample_exclusion =
+	    raw.words[static_cast<size_t>(HW::SampleRegister::SampleExclusionMask)].value;
+	in.alpha_to_mask_enabled = RawAlphaToMaskEnabled(
+	    raw.words[static_cast<size_t>(HW::SampleRegister::AlphaToMask)].value);
+	in.ps_sample_shading     = prepared_ps->ps_sample_shading;
+	in.ps_sample_mask_export = prepared_ps->ps_sample_mask_export_enable;
+	in.ps_ancillary          = prepared_ps->ps_ancillary;
+	in.pixel                 = prepared_ps->stage.program != nullptr
+	                               ? &prepared_ps->stage.program->pixel_sample_sensitivity
+	                               : nullptr;
+	return ClassifyReducedEqaa2x(in);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t render_target_slice_offset, uint32_t rt_slot,
-                                              bool ignore_target_mask, bool exact_format) {
+                                              bool ignore_target_mask, bool exact_format,
+                                              const ShaderPixelInputInfo* prepared_ps,
+                                              const char*                 prepared_draw_name) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 
@@ -288,10 +460,37 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
-		PrintUnsupportedColorSamples(buffer, rt_slot, mask, render_target_slice_offset,
-		                             ignore_target_mask, exact_format);
-		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
-		     rt.attrib.num_samples, rt.attrib.num_fragments);
+		using namespace ShaderRecompiler::Diagnostics;
+		const auto decision =
+		    DecideReducedEqaa2xForDraw(buffer, rt_slot, prepared_ps, prepared_draw_name);
+		const bool admitted = decision == ReducedEqaa2xDecision::AdmitApproximation;
+		// Keep a successful private trial from dumping hundreds of lines on every draw.
+		static std::atomic_uint admitted_snapshot_count = 0;
+		const bool              print_snapshot =
+		    !admitted || admitted_snapshot_count.fetch_add(1, std::memory_order_relaxed) < 4;
+		if (print_snapshot) {
+			PrintUnsupportedColorSamples(buffer, rt_slot, mask, render_target_slice_offset,
+			                             ignore_target_mask, exact_format, !admitted);
+			PrintEqaaShaderAndOwners(buffer, m_context.GetTextureCache(), rt_slot, prepared_ps,
+			                         prepared_draw_name);
+		}
+		if (!admitted) {
+			if (EqaaReduced2xRequested()) {
+				std::printf("ExperimentalEqaa2x rejected slot=%u reason=%s fatal_preserved=1\n",
+				            rt_slot, ReducedEqaa2xDecisionName(decision));
+				std::fflush(stdout);
+			}
+			EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
+			     rt.attrib.num_samples, rt.attrib.num_fragments);
+		}
+		r.experimental_reduced_eqaa_2x = true;
+		if (print_snapshot) {
+			std::printf("ExperimentalEqaa2x admitted slot=%u requested_coverage=4 native_color=2 "
+			            "native_depth=2 raster_samples=2 approximation=1 initial_contents=unknown "
+			            "guest_metadata_unchanged=1 stencil_blend_preserved=1\n",
+			            rt_slot);
+			std::fflush(stdout);
+		}
 	}
 	const uint32_t levels = rt.attrib2.num_mip_levels + 1u;
 	if (levels == 0 || levels > 16 || rt.view.current_mip_level >= levels) {

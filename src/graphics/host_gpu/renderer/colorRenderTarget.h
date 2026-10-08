@@ -15,10 +15,12 @@ struct RenderColorInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc         desc;
 	ImageId                         image_id;
-	uint32_t                        target_slot      = 0;
+	uint32_t                        target_slot       = 0;
 	uint32_t                        guest_mip_level   = 0;
 	uint32_t                        guest_array_layer = 0;
 	Prospero::ColorComponentMapping export_mapping;
+	// Explicit private visual-quality trial; native physical image samples remain unchanged.
+	bool experimental_reduced_eqaa_2x = false;
 
 	[[nodiscard]] vk::Extent2D Extent() const {
 		return {std::max(desc.info.extent.width >> guest_mip_level, 1u),
