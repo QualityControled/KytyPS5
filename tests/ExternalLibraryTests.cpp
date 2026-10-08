@@ -461,6 +461,77 @@ void TestAuxiliaryPairWriteWidthsAndClobbers() {
 		Check(barrier.memory.requests.empty(), "unproven flow or writer reached guest-memory reader");
 	}
 }
+
+void TestAuxiliaryPairTransportWithinRecordDestination() {
+	const auto overlap = [] {
+		Fixture fixture;
+		fixture.caller.instructions.clear();
+		// Minimal exact 3351560625c27256 descriptor/load/MOV/call encoding.
+		fixture.Append(0x6cu, {0xf4081800u, 0xfa0000c0u});
+		fixture.Append(0x180u, {0x8f6a846au});
+		fixture.Append(0x184u, {0xf4280430u, 0xd4000000u});
+		fixture.Append(0x18cu, {0xbf8cc07fu});
+		fixture.Append(0x190u, {0xbe8e0310u});
+		fixture.Append(0x194u, {0xbe8f0311u});
+		fixture.Append(0x198u, {0xbe900312u});
+		fixture.Append(0x19cu, {0xbe910313u});
+		fixture.Append(0x1a0u, {0xbf8c3f70u});
+		fixture.Append(0x1a4u, {0xbe8e210eu});
+		fixture.memory.Add((uint64_t{fixture.user_data[1]} << 32u | fixture.user_data[0]) + 192u,
+		                   Descriptor(Fixture::Table, 16u, 3u));
+		return fixture;
+	};
+	const auto check_aux = [](Fixture& fixture, uint32_t expected, const char* message) {
+		const auto loaded=fixture.Load();
+		Check(loaded.plan.complete && loaded.failure.empty(), "overlap fixture lost its table/code origin");
+		const auto& site=loaded.plan.call_sites.at(0);
+		Check(site.auxiliary_sgpr==expected, message);
+		Check(site.context_domain==0u && site.records.size()==3u && site.candidate_addresses.size()==2u,
+		      "auxiliary transport changed the complete context domain or candidate set");
+	};
+	Fixture actual=overlap();
+	check_aux(actual,16u,"transported auxiliary pair inside original record destination was discarded");
+	const auto exact=actual.Load();
+	Check(exact.plan.call_sites[0].record_sgpr==16u && exact.plan.call_sites[0].record_load_pc==0x184u &&
+	          exact.plan.call_sites[0].caller_pc==0x1a4u && exact.plan.call_sites[0].target_sgpr==14u &&
+	          exact.plan.call_sites[0].return_sgpr==14u &&
+	          actual.caller.instructions.back().opcode==Decoder::Opcode::S_SWAPPC_B64,
+	      "exact 335 record destination, aliased target, or call decode changed");
+	Fixture no_transport=overlap();
+	no_transport.caller.instructions.erase(no_transport.caller.instructions.begin()+4,
+	                                      no_transport.caller.instructions.begin()+8);
+	// Keep only descriptor/load/wait/call, using the genuine loaded target at s16:s17.
+	no_transport.caller.instructions.resize(4);
+	no_transport.Append(0x1a4u,{0xbe8e2110u});
+	check_aux(no_transport,UINT32_MAX,"original auxiliary payload anchor was mistaken for a transported parameter");
+	Fixture external;
+	check_aux(external,16u,"legacy external transport changed");
+	Fixture ambiguous=overlap();
+	ambiguous.caller.instructions.pop_back();
+	ambiguous.Append(0x1a4u,{0xbe940310u});
+	ambiguous.Append(0x1a8u,{0xbe950311u});
+	ambiguous.Append(0x1acu,{0xbe8e210eu});
+	check_aux(ambiguous,UINT32_MAX,"two copied auxiliary pairs were arbitrarily disambiguated");
+	Fixture clobber=overlap();
+	clobber.caller.instructions.pop_back();
+	clobber.Append(0x1a4u,{0xbe900380u}); // Scalar one-word constant write to s16.
+	clobber.Append(0x1a8u,{0xbe8e210eu});
+	check_aux(clobber,UINT32_MAX,"partial scalar overwrite retained transported provenance");
+	Fixture pair_clobber=overlap();
+	pair_clobber.caller.instructions.pop_back();
+	pair_clobber.Append(0x1a4u,{0x87901212u}); // S_AND_B64 s16:s17, s18:s19, s18:s19.
+	pair_clobber.Append(0x1a8u,{0xbe8e210eu});
+	Check(pair_clobber.caller.instructions[pair_clobber.caller.instructions.size()-2u].opcode==Decoder::Opcode::S_AND_B64,
+	      "pair clobber fixture opcode encoding changed");
+	check_aux(pair_clobber,UINT32_MAX,"scalar pair overwrite retained transported provenance");
+	Fixture lost_target=overlap();
+	lost_target.caller.instructions.pop_back();
+	lost_target.Append(0x1a4u,{0xbe8e0410u}); // Overwrite target/return14:15 with auxiliary16:17.
+	lost_target.Append(0x1a8u,{0xbe8e210eu});
+	Rejected(lost_target.Load(),"auxiliary relocation into target/return pair hid the loss of function origin");
+	Check(lost_target.memory.requests.empty(),"lost code-pointer provenance reached the memory reader");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -468,6 +539,11 @@ int main(int argc, char** argv) {
 		if (argc == 2 && std::string_view(argv[1]) == "--address-only") {
 			TestNativeDescriptorAddressNormalization();
 			std::puts("ExternalLibraryTests: native descriptor normalization passed");
+			return 0;
+		}
+		if (argc == 2 && std::string_view(argv[1]) == "--auxiliary-overlap-only") {
+			TestAuxiliaryPairTransportWithinRecordDestination();
+			std::puts("ExternalLibraryTests: overlapping auxiliary transport passed");
 			return 0;
 		}
 		if (argc == 2 && std::string_view(argv[1]) == "--auxiliary-only") {
@@ -486,7 +562,8 @@ int main(int argc, char** argv) {
 		TestOnlyProvedTableOriginInputsMatter();
 		TestNativeDescriptorAddressNormalization();
 		TestAuxiliaryPairWriteWidthsAndClobbers();
-		std::puts("ExternalLibraryTests: all eleven groups passed (mock mapped reads; no guest execution)");
+		TestAuxiliaryPairTransportWithinRecordDestination();
+		std::puts("ExternalLibraryTests: all twelve groups passed (mock mapped reads; no guest execution)");
 		return 0;
 	} catch (const std::exception& error) {
 		std::fprintf(stderr, "ExternalLibraryTests: failed: %s\n", error.what());

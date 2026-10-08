@@ -120,7 +120,9 @@ uint32_t AuxiliaryPair(const Decoder::Program& caller, uint32_t record_pc,
 	}
 	uint32_t result = UINT32_MAX;
 	for (uint32_t reg = 0; reg + 1u < origins.size(); ++reg) {
-		if (reg >= record_sgpr && reg < record_sgpr + 4u) continue;
+		// Ignore the original payload anchor, but allow a transported auxiliary pair
+		// to overlap the original four-word load destination. Origins prove the MOVs.
+		if (reg == record_sgpr + 2u) continue;
 		if (origins[reg] == 2 && origins[reg + 1u] == 3) {
 			if (result != UINT32_MAX) return UINT32_MAX;
 			result = reg;
