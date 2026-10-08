@@ -16,7 +16,7 @@ Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft
 Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1') -ErrorAction Stop
 $packageRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $emulatorPath = Join-Path $packageRoot 'kyty_emulator.exe'
-$expectedExeHash = '0614A673355BCEA46929F134F44651E5DD4AE247EB467CA749B4567A21EC3C61'
+$expectedExeHash = '538C94026D26E874F403AC1CAA5760E8C0275273EF4835FA7F55DD1956ABC9DD'
 if ((Get-FileHash -LiteralPath $emulatorPath -Algorithm SHA256).Hash -ine $expectedExeHash) {
     throw 'The emulator differs from this experimental package. Use its matching starter or run your replacement directly.'
 }

@@ -2,6 +2,20 @@
 
 This list covers emulator changes after `KytyPS5-2026-10-07-d2413fc`. Experimental settings are opt-in. Owned fixtures and captured CPU validation are separate from actual game observations.
 
+## r33 - 2026-10-08 - 8f8d34d
+
+- Raise the optional geometry-candidate trace limit from 32 KiB to 256 KiB per record so a larger binding record can be retained. The ordinary trace remains 32 KiB per record. Both modes retain the 64-record and 1 MiB total limits, duplicate suppression and scene activation control.
+- CPU bound/flag checks and the coherent emulator/compute-test build passed. Rendering commands and shader admission are unchanged. The public starter leaves this and all optional diagnostic traces off.
+- Actual geometry tracing retained 34 complete indexed/depth-tested candidates and 432 pixel-shader image associations, with zero oversized records. The bounded total was 1,046,290 bytes. The run closed normally while vehicle appearance remained dark or flat.
+- A moving-preview lookup comparison measured about 8.53 versus 8.30 completed guest flips per second, but differing shader counts and camera motion prevent a matched A/B conclusion. Lookup remains off in the public starter.
+- No vehicle material, lighting, shadow, crash or FPS repair is claimed. A native fiber stack write access violation observed in a prior Garage run remains unresolved.
+
+## r32 - 2026-10-08 - 1f6917e
+
+- Add an optional filter that retains draw candidates with a source index/vertex count of at least 128 or enabled depth testing. The label is a geometry candidate, not proof that a draw renders a vehicle.
+- Exact flag, bounded trace and source checks passed. The first filtered capture reached its scene activation control but could not retain its first eligible record within the old 32 KiB record limit.
+- This diagnostic filter does not change image contents, render commands or visual quality. It is disabled by default.
+
 ## r31 - 2026-10-08 - cf9ce5a
 
 - Add opt-in metadata at the existing invalid-buffer-range failure guard, associating the requested range with current shader buffers or merged vertex-buffer slots. Records are bounded to 32 KiB, and the original range query and fatal rejection remain unchanged.
@@ -54,6 +68,7 @@ World Map and Garage were reached, and rotating vehicle geometry was observed. T
 
 - Vehicle materials, lighting, shadows and uniform paint remain incorrect or incomplete. A selected replay/movie rendered a moving car with wrong appearance before an invalid graphics-buffer-range guard stopped it; the responsible stage/resource is unidentified.
 - Playable races and actual returning external shader calls are unproved. Terminal probes can deliberately stop those paths.
+- A native fiber stack write access violation observed in a Garage run remains unresolved. The diagnostic updates do not fix it.
 - Menu performance remains low; no supported FPS-gain claim is made.
 - Music silence is user-reported and unresolved.
 - Finite returning-call and certified image-status work is not included merely because its owned fixtures pass.
