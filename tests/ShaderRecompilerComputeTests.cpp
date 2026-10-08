@@ -186,6 +186,17 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static auto ResidentIdentity(const BufferCache &cache, const Buffer &owner) {
+    return std::tuple{cache.m_buffers, cache.m_total_used_memory, cache.m_gc_tick,
+                      owner.lru_id, owner.stream_score, owner.is_deleted};
+  }
+
+  static void WriteBdaEntry(BufferCache &cache, uint64_t address, uint64_t entry) {
+    const auto offset = BufferCache::PageIndex(address) * sizeof(uint64_t);
+    cache.WriteDataBuffer(*cache.GetBdaPageTableBuffer(), offset, &entry,
+                          sizeof(entry));
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -2405,6 +2416,226 @@ public:
     scheduler.Finish();
     context.ShutdownGpu();
     std::printf("[host]    %-32s ok\n", "GpuMappedRangeLifecycle");
+  }
+
+  void CheckResidentBdaCapture() {
+    constexpr const char *name = "ResidentBdaCapture";
+    constexpr uint64_t base = 0x0000000201900000ull;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t allocation_size = page * 3;
+    constexpr uint64_t address = base + 0x100;
+    constexpr uint32_t payload = 0x13579bdf;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, page, 0, &direct_offset) == 0,
+            "resident diagnostic direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, page) ==
+                    0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "resident diagnostic direct-memory mapping failed");
+    std::memset(mapped, 0xa5, allocation_size);
+    uint64_t complete_tick = 0;
+    bool deferred_ran = false;
+    gpu.SendCommandSync([&] {
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto [owner, offset] = cache.ObtainBuffer(address, 128, true, false);
+      Require(name, "resident owner", owner != nullptr,
+              "test owner allocation failed");
+      owner->Fill(offset, 128, payload);
+      const auto id = BufferCacheTestAccess::PageOwner(cache, address);
+      Require(name, "live owner identity",
+              id && BufferCacheTestAccess::IsBufferAllocated(cache, id) &&
+                  &cache.GetBuffer(id) == owner,
+              "owner was not registered for the queried page");
+      const auto expected_bda =
+          owner->BufferDeviceAddress() + (base - owner->CpuAddress());
+      BufferCacheTestAccess::WriteBdaEntry(cache, base, expected_bda);
+      // A later normal completion must remain queued across all readback waits.
+      scheduler.DeferOperation([&] { deferred_ran = true; });
+      complete_tick = scheduler.CurrentTick();
+      scheduler.Wait(complete_tick);
+      Require(name, "fixture completion",
+              complete_tick != 0 && scheduler.IsFree(complete_tick) &&
+                  !deferred_ran,
+              "fixture wait ran resource-maintenance callbacks");
+      const auto identity =
+          BufferCacheTestAccess::ResidentIdentity(cache, *owner);
+      const bool gpu_dirty = cache.HasGpuDirtyBytes(address, 128);
+      const bool cpu_modified = cache.IsRegionCpuModified(address, 128);
+      const bool gpu_modified = cache.IsRegionGpuModified(address, 128);
+      Require(name, "dirty fixture", gpu_dirty && gpu_modified,
+              "fixture must retain GPU-owned bytes before capture");
+      const auto Unchanged = [&] {
+        Require(name, "read-only cache state",
+                BufferCacheTestAccess::ResidentIdentity(cache, *owner) ==
+                        identity &&
+                    BufferCacheTestAccess::PageOwner(cache, address) == id &&
+                    BufferCacheTestAccess::IsBufferAllocated(cache, id) &&
+                    cache.HasGpuDirtyBytes(address, 128) == gpu_dirty &&
+                    cache.IsRegionCpuModified(address, 128) == cpu_modified &&
+                    cache.IsRegionGpuModified(address, 128) == gpu_modified &&
+                    !deferred_ran,
+                "diagnostic changed ownership/generation/LRU/dirty state or "
+                "popped callbacks");
+      };
+      const auto PayloadEqual = [&](const BdaResidentCapture &capture,
+                                    size_t bytes) {
+        Require(name, "exact resident payload",
+                capture.owner_copied &&
+                    capture.requested_source_bytes == 8 + bytes,
+                "capture source-byte accounting is not exact");
+        for (size_t byte = 0; byte < bytes; ++byte)
+          Require(name, "resident byte equality",
+                  capture.owner_bytes[byte] ==
+                      static_cast<uint8_t>(payload >> ((byte % 4) * 8)),
+                  "GPU-written resident bytes changed during capture");
+        for (size_t byte = bytes; byte < capture.owner_bytes.size(); ++byte)
+          Require(name, "unused payload", capture.owner_bytes[byte] == 0,
+                  "uncopied payload tail must not contain evidence");
+        uint64_t entry = 0;
+        for (size_t byte = 0; byte < 8; ++byte)
+          entry |= uint64_t{capture.table_bytes[byte]} << (byte * 8);
+        Require(name, "exact GPU table bytes", entry == capture.table_entry,
+                "decoded table entry differs from copied bytes");
+      };
+      for (const auto bytes : {64u, 128u}) {
+        const auto result =
+            cache.CaptureResidentBdaView(address, bytes, complete_tick);
+        Require(
+            name, "matching resident entry",
+            AssessBdaResidentCapture(result) ==
+                    BdaResidentAssessment::Matched &&
+                result.plan.status == BdaResidentPlanStatus::Ready &&
+                result.table_entry == expected_bda &&
+                result.owner_stable_after_wait && result.page_mapping_matches &&
+                result.plan.owner.index == id.index &&
+                result.plan.owner.generation == id.generation,
+            "exact GPU page entry did not match its existing resident owner");
+        PayloadEqual(result, bytes);
+        Unchanged();
+      }
+      for (const auto entry : {uint64_t{0}, expected_bda + 64}) {
+        BufferCacheTestAccess::WriteBdaEntry(cache, base, entry);
+        complete_tick = scheduler.CurrentTick();
+        scheduler.Wait(complete_tick);
+        const auto result =
+            cache.CaptureResidentBdaView(address, 128, complete_tick);
+        Require(name, "zero or mismatching GPU entry",
+                AssessBdaResidentCapture(result) ==
+                        (entry == 0 ? BdaResidentAssessment::GpuEntryZero
+                                    : BdaResidentAssessment::MappingMismatch) &&
+                    result.table_entry == entry &&
+                    !result.page_mapping_matches &&
+                    result.owner_stable_after_wait,
+                "GPU zero/mismatch was hidden by the CPU owner metadata");
+        PayloadEqual(result, 128);
+        Unchanged();
+      }
+      const auto missing_address = base + 128 * page + 0x100;
+      Require(name, "missing owner fixture",
+              !BufferCacheTestAccess::PageOwner(cache, missing_address),
+              "missing-owner fixture already has a cache allocation");
+      for (const auto entry : {uint64_t{0}, expected_bda}) {
+        BufferCacheTestAccess::WriteBdaEntry(cache, missing_address, entry);
+        complete_tick = scheduler.CurrentTick();
+        scheduler.Wait(complete_tick);
+        const auto result =
+            cache.CaptureResidentBdaView(missing_address, 64, complete_tick);
+        Require(name, "missing owner remains observable",
+                AssessBdaResidentCapture(result) ==
+                        BdaResidentAssessment::NoReadableOwner &&
+                    result.plan.status ==
+                        BdaResidentPlanStatus::TableOnlyMissingOwner &&
+                    result.table_copied && result.table_entry == entry &&
+                    result.requested_source_bytes == 8 &&
+                    !result.owner_copy_attempted && !result.owner_copied &&
+                    !BufferCacheTestAccess::PageOwner(cache, missing_address),
+                "missing owner was created or GPU table-only evidence was "
+                "discarded");
+        Unchanged();
+      }
+      for (const auto [query, bytes] :
+           {std::pair{address, uint64_t{132}},
+            std::pair{base + page - 32, uint64_t{64}},
+            std::pair{address + 1, uint64_t{64}},
+            std::pair{uint64_t{0}, uint64_t{64}}}) {
+        const auto result =
+            cache.CaptureResidentBdaView(query, bytes, complete_tick);
+        Require(name, "bounded query rejection",
+                !result.plan.table_copy_allowed &&
+                    !result.table_copy_attempted &&
+                    !result.owner_copy_attempted &&
+                    result.requested_source_bytes == 0,
+                "invalid bounded query performed a device read");
+        Unchanged();
+      }
+      for (const auto tick : {uint64_t{0}, scheduler.CurrentTick()}) {
+        const auto result = cache.CaptureResidentBdaView(address, 64, tick);
+        Require(name, "incomplete tick rejection",
+                !result.dispatch_tick_confirmed &&
+                    !result.table_copy_attempted &&
+                    result.requested_source_bytes == 0 && !result.error.empty(),
+                "uncompleted dispatch was admitted to readback");
+        Unchanged();
+      }
+      // Explicitly draining is a separate operation; the method itself never
+      // drains.
+      bool callback_rejected = false;
+      scheduler.DeferOperation([&] {
+        const auto result =
+            cache.CaptureResidentBdaView(address, 64, complete_tick);
+        callback_rejected = !result.table_copy_attempted &&
+                            result.requested_source_bytes == 0 &&
+                            !result.error.empty();
+      });
+      const auto deferred_tick = scheduler.CurrentTick();
+      scheduler.Wait(deferred_tick);
+      Require(name, "wait preserves normal callbacks",
+              !deferred_ran && !callback_rejected,
+              "normal callbacks executed inside Wait");
+      scheduler.PopPendingOperations();
+      Require(name, "explicit drain and callback guard",
+              deferred_ran && callback_rejected,
+              "completion callback guard did not reject nested capture");
+    });
+    const auto off_thread =
+        cache.CaptureResidentBdaView(address, 64, complete_tick);
+    Require(
+        name, "GPU-thread guard",
+        !off_thread.table_copy_attempted && !off_thread.owner_copy_attempted &&
+            off_thread.requested_source_bytes == 0 && !off_thread.error.empty(),
+        "off-thread capture performed a GPU read");
+    gpu.SendCommandSync([&] {
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    context.ShutdownGpu();
+    Require(name, "unmap backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "resident diagnostic mapping release failed");
+    Require(name, "release backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "resident diagnostic direct-memory release failed");
+    std::printf("[host]    %-32s "
+                "owner/table/payload/bounds/thread/tick/callback guards ok\n",
+                name);
   }
 
   void CheckStreamBufferRing() {
@@ -42950,6 +43181,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--external-before-bvh-probe-only") == 0) {
     VulkanHarness vulkan;
     CheckExternalBeforeBvhProbe(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-resident-capture-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckResidentBdaCapture();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--external-checked-call-only") == 0) {

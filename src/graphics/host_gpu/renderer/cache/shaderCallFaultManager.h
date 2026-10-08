@@ -33,6 +33,7 @@ private:
 	uint32_t m_area = 0;
 	bool m_used = false;
 	std::optional<std::array<uint32_t, ShaderRecompiler::Diagnostics::BvhDiagnosticWords>> m_pending_bvh;
+	uint64_t m_pending_bvh_tick = 0;
 };
 
 } // namespace Libs::Graphics

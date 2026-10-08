@@ -674,4 +674,125 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+BdaResidentCapture BufferCache::CaptureResidentBdaView(
+    uint64_t address, uint64_t bytes, uint64_t completed_dispatch_tick) {
+    BdaResidentCapture out;
+    out.dispatch_completed_tick = completed_dispatch_tick;
+    out.plan.guest_address = address;
+    out.plan.node_bytes = bytes;
+    if (!GuestGpu::IsGpuThread() || CommandScheduler::InDeferredOperation() ||
+        !m_scheduler.Active()) {
+        out.error = "capture requires active GPU command thread outside completion callbacks";
+        return out;
+    }
+    // The root caller must already have waited for its terminal probe dispatch and
+    // persisted event/ray/attempt metadata. This method must not pop resource callbacks.
+    // Recheck completed_dispatch_tick using IsFree, rejecting any not-yet-complete tick.
+    if (completed_dispatch_tick == 0 || !m_scheduler.IsFree(completed_dispatch_tick)) {
+        out.error = "terminal dispatch tick not complete";
+        return out;
+    }
+
+    out.dispatch_tick_confirmed = true;
+
+    BdaResidentOwner metadata;
+    const Buffer* resident = nullptr;
+    // Validate bounded query before even looking up an owner. A missing owner is
+    // deliberately observable; there is no FindBuffer/CreateBuffer/ObtainBuffer call.
+    const auto query = BuildBdaResidentPlan(address, bytes,
+        m_bda_pagetable_buffer.Size(), metadata);
+    if (!query.table_copy_allowed) {
+        out.plan = query;
+        out.error = "bounded one-page diagnostic query rejected";
+        return out;
+    }
+    const auto* owner_id = m_page_table.Find(query.guest_page);
+    if (owner_id != nullptr && *owner_id) {
+        metadata.found = true;
+        metadata.index = owner_id->index;
+        metadata.generation = owner_id->generation;
+        resident = m_slot_buffers.try_get(*owner_id);
+        metadata.allocated = resident != nullptr;
+        if (resident != nullptr) {
+            metadata.deleted = resident->is_deleted;
+            metadata.guest_base = resident->CpuAddress();
+            metadata.size = resident->Size();
+            // All non-null cache buffers are created with ShaderDeviceAddress.
+            // NULL_BUFFER_ID is not an admissible resident owner for a nonzero page.
+            if (*owner_id != NULL_BUFFER_ID && !resident->is_deleted)
+                metadata.device_base = resident->BufferDeviceAddress();
+        }
+    }
+    out.plan = BuildBdaResidentPlan(address, bytes,
+        m_bda_pagetable_buffer.Size(), metadata);
+    out.gpu_dirty_before = HasGpuDirtyBytes(address, bytes);
+    out.cpu_modified_before = IsRegionCpuModified(address, bytes);
+
+    // The only new resource is private diagnostic readback storage, NOT a guest owner.
+    // BDA values are copied as bytes and never converted into host/physical pointers.
+    Buffer download(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+        vk::BufferUsageFlagBits::eTransferDst, 144);
+    if (download.Mapped().size() < download.Size()) {
+        out.error = "private readback allocation not mapped";
+        return out;
+    }
+    // Offset16 keeps the two independent copy payloads naturally separated. Total
+    // requested source bytes are8+bytes<=136; no gap bytes enter evidence.
+    auto& command = m_scheduler.Current();
+    const auto before = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+    const auto after = before;
+    out.table_copy_attempted = true;
+    out.requested_source_bytes += 8;
+    download.CopyFrom(command, m_bda_pagetable_buffer, out.plan.table_offset, 0, 8,
+        before, {}, after, vk::AccessFlagBits::eHostRead);
+    if (out.plan.owner_copy_allowed) {
+        out.owner_copy_attempted = true;
+        out.requested_source_bytes += bytes;
+        download.CopyFrom(command, *resident, out.plan.owner_offset, 16, bytes,
+            before, {}, after, vk::AccessFlagBits::eHostRead);
+    }
+    out.copy_wait_tick = m_scheduler.CurrentTick();
+    m_scheduler.Wait(out.copy_wait_tick);
+    // Wait does not PopPendingOperations. Keep owner references stable; publish older
+    // priority backing writes before later CPU-view comparison without invoking normal
+    // callbacks that can create/merge/delete cache owners.
+    m_scheduler.WaitPriorityOperations(out.copy_wait_tick);
+    out.copy_wait_completed = true;
+    download.Invalidate(0, download.Size());
+    std::memcpy(out.table_bytes.data(), download.Mapped().data(), 8);
+    out.table_copied = true;
+    for (size_t byte = 0; byte < 8; ++byte)
+        out.table_entry |= uint64_t{out.table_bytes[byte]} << (byte * 8);
+    if (out.plan.owner_copy_allowed) {
+        std::memcpy(out.owner_bytes.data(), download.Mapped().data() + 16, bytes);
+        out.owner_copied = true;
+    }
+    // Re-query all outcomes, including table-only misses, without allocating a page.
+    // Compare full generation and metadata; never use FindBuffer here.
+    const auto* current_id = m_page_table.Find(out.plan.guest_page);
+    const auto* current = current_id != nullptr ? m_slot_buffers.try_get(*current_id) : nullptr;
+    if (current_id != nullptr && *current_id) {
+        out.owner_after.found = true;
+        out.owner_after.index = current_id->index;
+        out.owner_after.generation = current_id->generation;
+        out.owner_after.allocated = current != nullptr;
+        if (current != nullptr) {
+            out.owner_after.deleted = current->is_deleted;
+            out.owner_after.guest_base = current->CpuAddress();
+            out.owner_after.size = current->Size();
+            if (*current_id != NULL_BUFFER_ID && !current->is_deleted)
+                out.owner_after.device_base = current->BufferDeviceAddress();
+        }
+    }
+    out.owner_stable_after_wait = out.plan.owner_copy_allowed && current == resident &&
+        BdaResidentSameLiveOwner(metadata, out.owner_after);
+    out.page_mapping_matches = out.table_copied && out.owner_copied &&
+        out.owner_stable_after_wait &&
+        BdaResidentPageMappingMatches(out.plan, out.table_entry);
+    // Persist table bytes even for0/mismatch/no owner; owner bytes retain their own
+    // independently labelled provenance. This method never touches dirty trackers,
+    // CPU backing, existing owner contents or logical cache registration.
+    return out;
+}
+
 } // namespace Libs::Graphics

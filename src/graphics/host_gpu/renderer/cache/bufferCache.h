@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/bdaResidentCapture.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
@@ -41,6 +42,13 @@ public:
 		            : address - LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE) >>
 		       CACHING_PAGEBITS;
 	}
+	static_assert(CACHING_PAGEBITS == BdaResidentPageBits &&
+	              CACHING_PAGESIZE == BdaResidentPageBytes &&
+	              LOWER_ADDRESS_SIZE == BdaResidentLowerBytes &&
+	              LibKernel::Memory::kExtendedMemoryBase == BdaResidentExtendedBase &&
+	              LibKernel::Memory::kExtendedMemorySize == BdaResidentExtendedBytes &&
+	              BDA_PAGETABLE_SIZE == BdaResidentTableBytes);
+
 	static constexpr uint64_t GuestAddress(uint64_t offset) {
 		return offset < LOWER_ADDRESS_SIZE
 		           ? offset
@@ -71,6 +79,11 @@ public:
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+    // Diagnostic only: never creates, merges, synchronizes or registers a guest owner.
+    // Caller must persist the event/attempt before invoking; normal callbacks stay deferred.
+    [[nodiscard]] BdaResidentCapture CaptureResidentBdaView(
+        uint64_t address, uint64_t bytes, uint64_t completed_dispatch_tick);
+
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] Buffer* GetShaderCallFaultBuffer();
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);

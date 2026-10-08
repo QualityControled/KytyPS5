@@ -4,7 +4,9 @@
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BvhNodeCapture.h"
 #include "kernel/memory.h"
 
@@ -15,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <utility>
 #include <fmt/format.h>
 
 namespace Libs::Graphics {
@@ -42,6 +45,7 @@ void ShaderCallFaultManager::FinalizeBvhCapture() {
 	if (!m_pending_bvh) EXIT("No pending BVH diagnostic event\n");
 	const auto record = *m_pending_bvh;
 	m_pending_bvh.reset();
+	const auto completed_dispatch_tick = std::exchange(m_pending_bvh_tick, 0);
 	const auto sidecar_valid = Diagnostics::ValidBvhRaySidecar(record);
 	const auto width = !sidecar_valid ? BvhNodeCapture::NodeWidth::Unknown
 	    : record[Diagnostics::BvhNodeWidthWord] == 1u ? BvhNodeCapture::NodeWidth::Narrow32
@@ -62,6 +66,9 @@ void ShaderCallFaultManager::FinalizeBvhCapture() {
 	snapshot.view = BvhNodeCapture::View::SynchronizedBuffer;
 	snapshot.raw_event = event_words;
 	bool record_written = false, ray_written = false, manifest_written = false;
+	bool resident_attempt_written = false, resident_manifest_written = false;
+	bool table_written = false, owner_written = false;
+	std::optional<BdaResidentCapture> resident_capture;
 	std::filesystem::path folder;
 	std::string io_error;
 	if (Config::GraphicsDebugDumpEnabled() && GuestGpu::IsGpuThread()) {
@@ -88,12 +95,56 @@ void ShaderCallFaultManager::FinalizeBvhCapture() {
 			// Persist raw event/ray words before synchronization, which can itself fail.
 			// Process(true) has returned from deferred callbacks before this readback.
 			// No following PM4 consumer has executed; unrelated CPU writers remain live.
-			if (sidecar_valid && record_written && ray_written) {
-				snapshot = BvhNodeCapture::CaptureView(event, BvhNodeCapture::View::SynchronizedBuffer,
-				                                    {ReadBvhBufferView, nullptr});
+			if (sidecar_valid && event.may_read && record_written && ray_written) {
+				const auto attempt = fmt::format(
+				    "scope=post_dispatch_resident_view_before_cpu_backing_read\n"
+				    "event_time_mapping_proven=false no_physical_dereference=true\n"
+				    "guest_address=0x{:016x} node_bytes={} dispatch_completed_tick={}\n"
+				    "maximum_source_copy_bytes=136 maximum_private_download_bytes=144\n"
+				    "capture_not_yet_completed=true\n",
+				    event.address, event.block_count * BvhNodeCapture::NodeBlockBytes, completed_dispatch_tick);
+				resident_attempt_written = WriteBvhCaptureFile(folder / "resident-attempt.txt",
+				    attempt.data(), attempt.size());
+				if (resident_attempt_written) {
+					// Query/copy existing GPU resources before TryReadBufferBacking can discover
+					// or merge an owner. The capture API never resolves physical BDA pointers.
+					resident_capture = m_scheduler.Context().GetBufferCache().CaptureResidentBdaView(
+					    event.address, event.block_count * BvhNodeCapture::NodeBlockBytes, completed_dispatch_tick);
+					const auto& resident = *resident_capture;
+					if (resident.table_copied)
+						table_written = WriteBvhCaptureFile(folder / "gpu-table-entry.bin",
+						    resident.table_bytes.data(), resident.table_bytes.size());
+					if (resident.owner_copied && resident.plan.node_bytes > 0 &&
+					    resident.plan.node_bytes <= resident.owner_bytes.size())
+						owner_written = WriteBvhCaptureFile(folder / "node-existing-owner.bin",
+						    resident.owner_bytes.data(), static_cast<size_t>(resident.plan.node_bytes));
+					auto resident_manifest = Libs::Graphics::Describe(resident);
+					resident_manifest += fmt::format("table_payload_written={} owner_payload_written={}\n",
+					    table_written, owner_written);
+					resident_manifest_written = WriteBvhCaptureFile(folder / "resident-manifest.txt",
+					    resident_manifest.data(), resident_manifest.size());
+					std::printf("BVH resident BDA capture: plan=%s assessment=%s table_copied=%u "
+					            "owner_copied=%u owner_stable=%u mapping_matches=%u "
+					            "dispatch_tick=%" PRIu64 " copy_tick=%" PRIu64 "\n",
+					            BdaResidentPlanStatusName(resident.plan.status),
+					            BdaResidentAssessmentName(AssessBdaResidentCapture(resident)),
+					            resident.table_copied, resident.owner_copied, resident.owner_stable_after_wait,
+					            resident.page_mapping_matches, resident.dispatch_completed_tick, resident.copy_wait_tick);
+					std::fflush(stdout);
+				}
+				const bool persisted = resident_capture && resident_manifest_written &&
+				    (!resident_capture->table_copied || table_written) &&
+				    (!resident_capture->owner_copied || owner_written);
+				if (persisted && resident_capture->dispatch_tick_confirmed &&
+				    resident_capture->plan.table_copy_allowed && resident_capture->copy_wait_completed) {
+					snapshot = BvhNodeCapture::CaptureView(event, BvhNodeCapture::View::SynchronizedBuffer,
+					                                    {ReadBvhBufferView, nullptr});
+				} else {
+					snapshot.error = "resident query/wait/evidence incomplete; no CPU backing node read";
+				}
 			} else {
-				snapshot.error = !sidecar_valid ? "invalid ray sidecar; no node read"
-				                              : "raw event/ray could not be persisted; no node read";
+				snapshot.error = !sidecar_valid || !event.may_read ? "invalid ray/event; no node read"
+				    : "raw event/ray could not be persisted; no node read";
 			}
 			std::string manifest = "First-active BVH diagnostic snapshot\n"
 			    "record_schema=BVHR version=1 raw_record_bytes=128 ray_raw_dwords=10\n"
@@ -104,6 +155,10 @@ void ShaderCallFaultManager::FinalizeBvhCapture() {
 			manifest += fmt::format("sidecar_valid={} selected_native_wave_lane={} record_written={} ray_written={}\n",
 			    sidecar_valid, record[Diagnostics::BvhNativeLaneWord], record_written, ray_written);
 			manifest += BvhNodeCapture::Describe(event) + "\n" + BvhNodeCapture::Describe(snapshot) + "\n";
+			manifest += fmt::format("resident_attempt_written={} resident_manifest_written={} "
+			    "table_payload_written={} owner_payload_written={}\n",
+			    resident_attempt_written, resident_manifest_written, table_written, owner_written);
+			bool node_files_complete = snapshot.complete;
 			for (size_t block = 0; block < snapshot.blocks.size(); ++block) {
 				const auto& outcome = snapshot.blocks[block];
 				bool written = false;
@@ -111,7 +166,32 @@ void ShaderCallFaultManager::FinalizeBvhCapture() {
 					written = WriteBvhCaptureFile(folder / fmt::format("node{}-buffer-view.bin", block),
 					                             outcome.payload.data(), outcome.payload.size());
 				manifest += fmt::format("node_payload[{}]_written={}\n", block, written);
+				node_files_complete = node_files_complete && written;
 			}
+			bool views_comparable = resident_capture && owner_written && node_files_complete &&
+			    resident_capture->owner_copied && snapshot.complete &&
+			    resident_capture->plan.node_bytes == snapshot.succeeded_bytes;
+			bool views_equal = views_comparable;
+			size_t compared_bytes = 0;
+			if (views_comparable) {
+				for (const auto& block: snapshot.blocks) {
+					if (!block.succeeded || block.payload.size() != BvhNodeCapture::NodeBlockBytes ||
+					    compared_bytes > resident_capture->plan.node_bytes ||
+					    block.payload.size() > resident_capture->plan.node_bytes - compared_bytes) {
+						views_comparable = views_equal = false;
+						break;
+					}
+					views_equal = views_equal && std::equal(block.payload.begin(), block.payload.end(),
+					    resident_capture->owner_bytes.begin() + compared_bytes);
+					compared_bytes += block.payload.size();
+				}
+				views_comparable = views_comparable && compared_bytes == resident_capture->plan.node_bytes;
+				views_equal = views_equal && views_comparable;
+			}
+			manifest += fmt::format("existing_owner_vs_backing_comparable={} "
+			    "existing_owner_vs_backing_bytes_equal={} event_time_atomicity_proven=false\n",
+			    views_comparable, views_equal);
+			if (resident_capture) manifest += Libs::Graphics::Describe(*resident_capture);
 			manifest_written = WriteBvhCaptureFile(folder / "manifest.txt", manifest.data(), manifest.size());
 		}
 	} else {
@@ -167,7 +247,8 @@ void ShaderCallFaultManager::Process(bool wait_for_completion) {
 	                           vk::AccessFlagBits::eHostRead,
 	                           vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
 	                           vk::AccessFlagBits::eHostRead);
-	m_scheduler.DeferOperation([this, offset, area, wait_for_completion] {
+	const auto scheduled_tick = m_scheduler.CurrentTick();
+	m_scheduler.DeferOperation([this, offset, area, wait_for_completion, scheduled_tick] {
 		m_download_buffer.Invalidate(offset, RecordSize);
 		std::array<uint32_t, ShaderRecompiler::Diagnostics::BvhDiagnosticWords> record {};
 		std::memcpy(record.data(), m_download_buffer.Mapped().data() + offset, RecordSize);
@@ -206,6 +287,7 @@ void ShaderCallFaultManager::Process(bool wait_for_completion) {
 		if (record[1] == 7u) {
 			if (!wait_for_completion) EXIT("BVH snapshot requires synchronous fault inspection; no node read\n");
 			m_pending_bvh = record;
+			m_pending_bvh_tick = scheduled_tick;
 			return;
 		}
 		if (record[1] == 1u && record[15] == 32u && record[14] == 0u) {
@@ -221,8 +303,7 @@ void ShaderCallFaultManager::Process(bool wait_for_completion) {
 		     " guest_pc=0x%016" PRIx64 " shader=0x%016" PRIx64 "\n",
 		     record[1], target, pc, hash);
 	});
-	m_ticks[m_area] = m_scheduler.CurrentTick();
-	const auto scheduled_tick = m_ticks[m_area];
+	m_ticks[m_area] = scheduled_tick;
 	m_area = (m_area + 1u) % MaxPending;
 	if (wait_for_completion) {
 		// Checked external calls may return early at a diagnostic fault. Finish their dispatch

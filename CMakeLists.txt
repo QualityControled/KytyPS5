@@ -486,6 +486,14 @@ if(KYTY_CLANG_CL)
 	target_compile_options(bvh_node_capture_tests PRIVATE /EHsc)
 endif()
 
+add_executable(bda_resident_capture_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BdaResidentCaptureTests.cpp"
+)
+target_include_directories(bda_resident_capture_tests PRIVATE ${inc_headers})
+if(KYTY_CLANG_CL)
+	target_compile_options(bda_resident_capture_tests PRIVATE /EHsc)
+endif()
+
 add_executable(external_library_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ExternalLibraryTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ExternalLibrary.cpp"
@@ -661,7 +669,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests shader_call_capture_tests external_library_tests external_program_tests ir_use_tests bvh_node_capture_tests)
+			virtual_memory_allocation_tests shader_call_capture_tests external_library_tests external_program_tests ir_use_tests bvh_node_capture_tests bda_resident_capture_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 endif()
@@ -692,6 +700,8 @@ if(BUILD_TESTING)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME shader_call_capture COMMAND $<TARGET_FILE:shader_call_capture_tests>)
 	add_test(NAME bvh_node_capture COMMAND $<TARGET_FILE:bvh_node_capture_tests>)
+	add_test(NAME bda_resident_capture COMMAND $<TARGET_FILE:bda_resident_capture_tests>)
+	add_test(NAME shader_bda_resident_capture COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bda-resident-capture-only)
 	add_test(NAME external_library COMMAND $<TARGET_FILE:external_library_tests>)
 	add_test(NAME captured_compute_manifest COMMAND $<TARGET_FILE:captured_compute_manifest_tests>)
 	add_test(NAME ir_use COMMAND $<TARGET_FILE:ir_use_tests>)
@@ -782,6 +792,7 @@ if(BUILD_TESTING)
 		resource_materialization_tests
 		shader_call_capture_tests
 		bvh_node_capture_tests
+		bda_resident_capture_tests
 		external_library_tests
 		captured_compute_manifest_tests
 		ir_use_tests
