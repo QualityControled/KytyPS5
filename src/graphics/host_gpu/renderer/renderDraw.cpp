@@ -9,6 +9,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/MenuPerformanceDiagnostic.h"
+#include "graphics/shader/recompiler/CompareOperationWitness.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -1099,6 +1100,51 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 }
 
 
+
+static void LogCompareOperationBindings(CommandBuffer& buffer, const DrawRenderState& state,
+                                        const PreparedBindings* prepared) {
+    namespace CW = CompareOperationWitness;
+    if (!CW::Enabled() || !state.ps_active || prepared == nullptr || prepared->runtime == nullptr ||
+        !*prepared->runtime || !CW::Selected(2, prepared->runtime->program->shader_hash)) return;
+    const auto module = CW::State().Lookup(state.programs.pixel.id);
+    if (module.id == 0 || module.pairs.empty()) return;
+    const auto& program = *prepared->runtime->program;
+    const auto& snapshot = *prepared->runtime->resources;
+    std::string text = fmt::format("CompareDraw stage=2 shader=0x{:016x} module_id={} spirv_xxh3=0x{:016x} association=after_rebind_buffers_attachments_and_commit_before_draw gpu_execution_not_proved=1 contents=unknown\n",
+        module.shader, module.id, module.spirv_hash);
+    for (const auto& pair: module.pairs) {
+        if (pair.image >= prepared->images.size() || pair.image >= program.info.images.size()) {
+            text += fmt::format("CompareBoundUnknown word={} image_resource={} dynamic_or_unresolved=1\n", pair.operation.word, pair.image);
+            continue;
+        }
+        const auto& binding = prepared->images[pair.image];
+        // Existing bounded, nonmutating metadata snapshot; never GetImage/FindTexture.
+        const auto copy = buffer.GetContext().GetTextureCache().InspectCarImageDiagnostic(binding.image_id, binding.image_view);
+        uint32_t guest_format = CW::Unknown, cmp = CW::Unknown, unnormalized = CW::Unknown;
+        if (pair.image < snapshot.images.size() && snapshot.images[pair.image].dword_count == 8)
+            guest_format = (snapshot.images[pair.image].dwords[1] >> 20u) & 0x1ffu;
+        if (pair.sampler < program.info.samplers.size()) {
+            const auto index = program.info.samplers[pair.sampler].snapshot_index;
+            if (index < snapshot.samplers.size() && snapshot.samplers[index].dword_count == sizeof(ShaderSamplerResource)/4) {
+                ShaderSamplerResource descriptor {};
+                std::memcpy(&descriptor,snapshot.samplers[index].dwords.data(),sizeof(descriptor));
+                cmp = descriptor.DepthCompareFunc();
+                unnormalized = descriptor.ForceUnormCoords();
+            }
+        }
+        text += fmt::format("CompareBoundImage word={} opcode={} resource={} sampler_resource={} unique_ir_pc=0x{:08x} image_id={} image_generation={} owner_exists={} native_image=0x{:016x} native_view=0x{:016x} actual_view_known={} host_backing_format={} requested_view_format={} actual_view_format={} actual_view_aspect={} base_mip={} mip_count={} base_layer={} layer_count={} type={} guest_format={} sampler_descriptor_cmp={} sampler_force_unnormalized={} native_sampler_create_info_unqueried=1 dynamic_mip_views={} base_view_is_selected_mip_unproved={} initial_contents=unknown\n",
+            pair.operation.word, pair.operation.opcode, pair.image, pair.sampler, pair.pc,
+            binding.image_id.index, binding.image_id.generation, copy.exists, copy.native_image,
+            copy.native_view, copy.view_known, copy.owner.backing_format, static_cast<int>(binding.desc.view_info.format),
+            static_cast<int>(copy.actual_view.format), static_cast<uint32_t>(static_cast<VkImageAspectFlags>(copy.actual_view.aspect)),
+            copy.actual_view.base_level, copy.actual_view.level_count, copy.actual_view.base_layer,
+            copy.actual_view.layer_count, static_cast<int>(copy.actual_view.type), guest_format,
+            cmp, unnormalized, binding.mip_views.size(), !binding.mip_views.empty());
+        if (text.size() > CW::Registry::MaxRecordBytes) break;
+    }
+    CW::Publish(text);
+}
+
 static void LogCarRenderDiagnostic(CommandBuffer& buffer, uint64_t submit_id,
                                    const DrawCallInfo& draw, const DrawRenderState& state,
                                    const RenderState& rendering,
@@ -1376,6 +1422,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	LogCompareOperationBindings(buffer, state, bindings.pixel ? &*bindings.pixel : nullptr);
 	LogCarRenderDiagnostic(buffer, submit_id, draw, state, rendering, stages);
 	if (mesh_active) {
 		const uint32_t draw_data[] {draw.index_count,

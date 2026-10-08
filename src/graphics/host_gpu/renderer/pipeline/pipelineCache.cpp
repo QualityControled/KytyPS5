@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/MenuPerformanceDiagnostic.h"
+#include "graphics/shader/recompiler/CompareOperationWitness.h"
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/BvhResultHostPolicy.h"
@@ -778,7 +779,8 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	                               uint32_t push_data_start_dword,
+	                               const ShaderRecompiler::IR::ResourceSnapshot& witness_snapshot) {
 		const auto external_begin = std::chrono::steady_clock::now();
 		if (options.external_library != nullptr) {
 			std::printf("External shader phase begin hash=0x%016" PRIx64 " compile-and-emit\n",
@@ -866,6 +868,64 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
+
+        // Diagnostic-only: the emitted words were validated and passed unchanged
+        // to vkCreateShaderModule. The IR below is the final post-DCE program.
+        namespace CW = CompareOperationWitness;
+        if (CW::Selected(static_cast<uint32_t>(options.stage), options.shader_hash)) {
+            const auto analysis = CW::Analyze(result.spirv);
+            if (analysis.dref_count != 0 || !analysis.valid) {
+                std::vector<CW::Site> sites;
+                bool sites_complete = true;
+                for (const auto* block: result.program.blocks)
+                    for (const auto& inst: *block) {
+                        const auto op = inst.GetOpcode();
+                        if (op != ShaderRecompiler::IR::ValueOpcode::ImageSampleRaw &&
+                            op != ShaderRecompiler::IR::ValueOpcode::ImageGatherRaw) continue;
+                        const auto flags = inst.Flags<ShaderRecompiler::IR::MemoryFlags>();
+                        if (flags.index >= result.program.memory_info.size()) {sites_complete = false; continue;}
+                        const auto& memory = result.program.memory_info[flags.index];
+                        if (!(memory.image_sample_flags & ShaderRecompiler::Decoder::ImageSampleFlagCompare)) continue;
+                        if (memory.resource >= result.program.info.images.size() ||
+                            memory.sampler >= result.program.info.samplers.size() || sites.size() == CW::MaxOperations) {
+                            sites_complete = false; continue;
+                        }
+                        const auto& image = result.program.info.images[memory.resource];
+                        const auto& sampler = result.program.info.samplers[memory.sampler];
+                        sites.push_back({flags.pc, memory.resource, memory.sampler,
+                            image.binding_alias == UINT32_MAX ? memory.resource : image.binding_alias,
+                            sampler.binding_alias == UINT32_MAX ? memory.sampler : sampler.binding_alias});
+                    }
+                std::vector<CW::Binding> layouts;
+                for (const auto& binding: result.program.bindings.descriptors)
+                    layouts.push_back({0, ShaderRecompiler::IR::NativeBinding(options.stage, binding.kind), binding.resources});
+                CW::Module witness {options.shader_hash,
+                    XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t)), next_shader_id + 1};
+                std::string text = fmt::format("CompareModule stage=2 shader=0x{:016x} module_id={} spirv_xxh3=0x{:016x} words={} module_created=1 post_spv_optimizer=none valid_parse={} definitions_complete={} operations_complete={} dref_instructions={} post_dce_sites={} sites_complete={} native_pc_to_spv_order_assumed=0\n",
+                    witness.shader, witness.id, witness.spirv_hash, result.spirv.size(), analysis.valid,
+                    analysis.definitions_complete, analysis.operations_complete, analysis.dref_count, sites.size(), sites_complete);
+                for (const auto& site: sites)
+                    text += fmt::format("CompareIR pc=0x{:08x} image={} sampler={} canonical_image={} canonical_sampler={} post_dce=1 emitted_identity_matched_by_pair_only=1\n",
+                        site.pc, site.resource, site.sampler, site.canonical_image, site.canonical_sampler);
+                for (const auto& op: analysis.operations) {
+                    const auto image = CW::Resource(op.image, layouts);
+                    const auto sampler = CW::Resource(op.sampler, layouts);
+                    const auto pc = sites_complete ? CW::UniquePc(image, sampler, sites) : CW::Unknown;
+                    uint32_t guest_format = CW::Unknown;
+                    if (image < witness_snapshot.images.size() && witness_snapshot.images[image].dword_count == 8)
+                        guest_format = (witness_snapshot.images[image].dwords[1] >> 20u) & 0x1ffu;
+                    witness.pairs.push_back({op,image,sampler,pc});
+                    text += fmt::format("CompareSPV word={} opcode={} result_id={} sampled_id={} image_variable={} image_set={} image_binding={} image_element={} image_known={} image_resource={} guest_format_at_compile={} sampler_variable={} sampler_set={} sampler_binding={} sampler_element={} sampler_known={} sampler_resource={} unique_ir_pc=0x{:08x} pc_unknown_value=0xffffffff native_bound_view_deferred=1 dynamic_or_ambiguous_identity_unknown=1\n",
+                        op.word, op.opcode, op.result, op.sampled, op.image.variable, op.image.set,
+                        op.image.binding, op.image.element, op.image.known, image, guest_format,
+                        op.sampler.variable, op.sampler.set, op.sampler.binding, op.sampler.element,
+                        op.sampler.known, sampler, pc);
+                }
+                CW::State().Remember(std::move(witness));
+                CW::Publish(text);
+            }
+        }
+
 		auto compiled_info = std::move(result.program).TakeCompiledInfo();
 		compiled_info.pixel_sample_sensitivity = pixel_sample_sensitivity;
 		return {
@@ -1225,7 +1285,8 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
+		    entry->second.resources));
 		MenuPerformanceDiagnostic::CompiledPermutation();
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
