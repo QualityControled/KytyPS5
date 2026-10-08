@@ -1349,6 +1349,8 @@ struct TestCase {
   bool has_user_data = false;
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool compile_only = false;
+  bool owned_software_color_dref = false;
+  bool owned_r8_native_comparison_supported = false;
   size_t storage_buffer_range_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
@@ -1673,6 +1675,14 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           ShaderRecompiler::IR::MaterializeResources(
               resource_plan, runtime, resources, specialization),
           "translated resources could not be materialized");
+  #ifndef OWNED_R8_BASELINE
+  if (test.owned_software_color_dref) {
+    Require(test.name, "owned post-materialization production classifier",
+      ShaderRecompiler::IR::ConfigureSoftwareColorComparison(resource_plan, resources,
+        specialization, true, test.owned_r8_native_comparison_supported),
+      "R8 comparison tuple rejected by the production narrow classifier");
+  }
+  #endif
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
   for (const auto &[text, expected] : test.decoded_counts) {
@@ -2007,9 +2017,32 @@ public:
     u32 layers = 1;
     u32 mip_levels = 1;
     u32 dwords_per_pixel = 0;
+    vk::ImageAspectFlags owned_aspect = vk::ImageAspectFlagBits::eColor;
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
+  [[nodiscard]] bool OwnedR8NativeComparisonSupported() const {
+    vk::FormatProperties3 p3{};
+    vk::FormatProperties2 p2{};
+    p2.pNext=&p3;
+    m_physical_device.getFormatProperties2(vk::Format::eR8Unorm,&p2);
+    return static_cast<bool>(p3.optimalTilingFeatures & vk::FormatFeatureFlagBits2::eSampledImageDepthComparison);
+  }
+  vk::Sampler OwnedColorComparisonSampler(const char* name, bool linear, bool native,
+                                          u32 cmp, bool border, bool white, bool repeat=false) {
+    vk::SamplerCreateInfo info{};
+    info.magFilter=info.minFilter=linear?vk::Filter::eLinear:vk::Filter::eNearest;
+    info.mipmapMode=vk::SamplerMipmapMode::eNearest;
+    info.addressModeU=info.addressModeV=info.addressModeW=repeat?vk::SamplerAddressMode::eRepeat:border?vk::SamplerAddressMode::eClampToBorder:vk::SamplerAddressMode::eClampToEdge;
+    info.minLod=info.maxLod=0.0f;
+    info.compareEnable=native;
+    info.compareOp=static_cast<vk::CompareOp>(cmp);
+    info.borderColor=white?vk::BorderColor::eFloatOpaqueWhite:vk::BorderColor::eFloatTransparentBlack;
+    vk::Sampler result{};
+    RequireVk(name,"owned sampler",m_device.createSampler(&info,nullptr,&result),"vkCreateSampler");
+    return result;
+  }
+
   [[nodiscard]] u32 SubgroupSize() const {
     vk::PhysicalDeviceSubgroupProperties subgroup{};
     vk::PhysicalDeviceProperties2 properties{};
@@ -15097,9 +15130,11 @@ public:
                         u32 view_layers = 0,
                         vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1,
                         vk::Format view_format = vk::Format::eUndefined,
-                        u32 view_base_mip = 0) {
+                        u32 view_base_mip = 0,
+                        vk::ImageAspectFlags owned_aspect = vk::ImageAspectFlagBits::eColor) {
     Image ret;
     ret.format = format;
+    ret.owned_aspect = owned_aspect;
     ret.width = width;
     ret.height = height;
     ret.layers = layers;
@@ -15155,7 +15190,7 @@ public:
     view_info.image = ret.image;
     view_info.viewType = view_type;
     view_info.format = view_format == vk::Format::eUndefined ? format : view_format;
-    view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    view_info.subresourceRange.aspectMask = owned_aspect;
     Require(shader_name, "dispatch", view_base_mip < ret.mip_levels,
             "image view base mip is out of bounds");
     view_info.subresourceRange.baseMipLevel = view_base_mip;
@@ -18777,7 +18812,8 @@ private:
                        vk::PipelineStageFlags src_stage,
                        vk::PipelineStageFlags dst_stage,
                        vk::AccessFlags src_access, vk::AccessFlags dst_access,
-                       u32 mip_levels = 1, u32 layers = 1) {
+                       u32 mip_levels = 1, u32 layers = 1,
+                       vk::ImageAspectFlags owned_aspect = vk::ImageAspectFlagBits::eColor) {
     vk::ImageMemoryBarrier barrier{};
     barrier.sType = vk::StructureType::eImageMemoryBarrier;
     barrier.srcAccessMask = src_access;
@@ -18787,7 +18823,7 @@ private:
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
-    barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    barrier.subresourceRange.aspectMask = owned_aspect;
     barrier.subresourceRange.baseMipLevel = 0;
     barrier.subresourceRange.levelCount = mip_levels;
     barrier.subresourceRange.baseArrayLayer = 0;
@@ -18804,7 +18840,7 @@ private:
     vk::CommandBuffer cmd = BeginCommands(shader_name, "dispatch");
     AddImageBarrier(cmd, image->image, image->layout, new_layout, src_stage,
                     dst_stage, src_access, dst_access, image->mip_levels,
-                    image->layers);
+                    image->layers, image->owned_aspect);
     EndSubmitAndFree(shader_name, "dispatch", cmd);
     image->layout = new_layout;
   }
@@ -18822,14 +18858,14 @@ private:
                     vk::PipelineStageFlagBits::eTopOfPipe,
                     vk::PipelineStageFlagBits::eTransfer, {},
                     vk::AccessFlagBits::eTransferWrite, image->mip_levels,
-                    image->layers);
+                    image->layers, image->owned_aspect);
     std::vector<vk::BufferImageCopy> copies;
     copies.reserve(image->mip_levels);
     vk::DeviceSize offset = 0;
     for (u32 level = 0; level < image->mip_levels; level++) {
       vk::BufferImageCopy copy{};
       copy.bufferOffset = offset;
-      copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+      copy.imageSubresource.aspectMask = image->owned_aspect;
       copy.imageSubresource.mipLevel = level;
       copy.imageSubresource.baseArrayLayer = 0;
       copy.imageSubresource.layerCount = image->layers;
@@ -18850,7 +18886,7 @@ private:
                     vk::PipelineStageFlagBits::eComputeShader,
                     vk::AccessFlagBits::eTransferWrite,
                     AccessForLayout(final_layout), image->mip_levels,
-                    image->layers);
+                    image->layers, image->owned_aspect);
     EndSubmitAndFree(shader_name, "dispatch", cmd);
     image->layout = final_layout;
   }
@@ -43746,10 +43782,30 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+#include "OwnedR8ComparisonFixtures.inc"
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc>1 && std::strcmp(argv[1],"--owned-r8-identity-only")==0) {
+    if(argc!=3)return 2;
+    EnsureConfigInitialized(false);DumpOwnedR8Identity(argv[2]);return 0;
+  }
+  #ifndef OWNED_R8_BASELINE
+  if (argc>1 && std::string_view(argv[1]).starts_with("--owned-r8-compare")) {
+    const bool prepare=std::strcmp(argv[1],"--owned-r8-compare-prepare-only")==0;
+    const bool gpu=std::strcmp(argv[1],"--owned-r8-compare-only")==0;
+    if (argc!=2 || (!prepare && !gpu)) {
+      std::fputs("OwnedR8Comparison: exact recognized flag only; malformed requests never initialize memory or Vulkan\n",stderr);
+      return 2;
+    }
+    EnsureConfigInitialized(false);
+    if (prepare) {CheckOwnedR8Comparison(nullptr);return 0;}
+    VulkanHarness vulkan;CheckOwnedR8Comparison(&vulkan);return 0;
+  }
+  #endif
+
   const bool captured_actual_inputs =
       argc == 5 &&
       std::strcmp(argv[1], "--captured-external-translate-only") == 0;

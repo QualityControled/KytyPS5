@@ -67,6 +67,8 @@ struct MemoryInfo {
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
+	// Native status metadata only; software color comparison never admits TFE/LWE.
+	bool                    image_sample_status                                   = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
@@ -126,6 +128,7 @@ struct BufferResource {
 };
 
 enum class ImageMipMode { None, Dynamic };
+enum class ImageComparisonMode : uint8_t { Native, SoftwarePointR8, SoftwareLinearR8 };
 
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
@@ -146,6 +149,10 @@ struct ImageResource {
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
 	bool                          depth_compare     = false;
+	ImageComparisonMode           comparison_mode   = ImageComparisonMode::Native;
+	// Derived only from surviving image operations by ExtractResourcePlan.
+	bool                          software_comparison_seen = false;
+	bool                          software_comparison_eligible = false;
 	bool                          cube              = false;
 	bool                          r128              = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
@@ -379,7 +386,8 @@ DescriptorBindingForImage(const ImageResource& image) {
 		sampled = true;
 		switch (image.numeric_class) {
 			case Prospero::TextureNumericClass::Float:
-				base = image.depth_compare ? FirstComparisonImageBinding : SampledFloatBinding;
+				base = image.depth_compare && image.comparison_mode == ImageComparisonMode::Native
+				           ? FirstComparisonImageBinding : SampledFloatBinding;
 				break;
 			case Prospero::TextureNumericClass::Uint: base = SampledUintBinding; break;
 			case Prospero::TextureNumericClass::Sint: base = SampledSintBinding; break;

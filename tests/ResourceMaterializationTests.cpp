@@ -1037,6 +1037,8 @@ void TestLiveOutOfRangeImageMemoryStillRejects() {
   Check(false,"out-of-range executable image metadata was ignored or clamped");
 }
 
+#include "SoftwareColorComparisonMaterializationTests.inc"
+
 } // namespace
 
 namespace Common {
@@ -1054,6 +1056,9 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main(int argc, char **argv) {
+  if(argc==2 && std::strcmp(argv[1],"--software-color-comparison-only")==0) {
+    TestSoftwareColorComparisonMaterialization();return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--dead-image-metadata-only") == 0) {
     TestDeadImageMemoryMetadataDoesNotRemap();
     std::puts("ResourceMaterializationTests: dead/planning/live image metadata passed");

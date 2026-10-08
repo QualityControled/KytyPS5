@@ -294,6 +294,98 @@ uint32_t SampledComponentZero(EmitterState& state, Prospero::TextureNumericClass
 	EXIT("invalid sampled image numeric class");
 }
 
+uint32_t SoftwareColorCompareTap(ValueEmitContext& ctx, const IR::Inst& inst,
+                                 uint32_t texel, uint32_t reference) {
+	auto& state = ctx.state;
+	const auto* handle = inst.Arg(1).Resolve().TryInstruction();
+	if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetSamplerResource ||
+	    handle->NumArgs() != 4u) {
+		ctx.Fail(inst, "software color comparison has no original raw sampler");
+		return 0u;
+	}
+	const auto function = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), ctx.Arg(*handle, 0u),
+	           ConstantU32(state, 12u)), ConstantU32(state, 7u));
+	const auto zero = ConstantF32(state, 0u), one = ConstantF32(state, 0x3f800000u);
+	// Ordered selects clamp finite/infinite UNORM refs and preserve a NaN reference.
+	reference = Select(state, TypeF32(state),
+	    Binary(state, spv::OpFOrdLessThan, TypeBool(state), reference, zero), zero, reference);
+	reference = Select(state, TypeF32(state),
+	    Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), reference, one), one, reference);
+	constexpr spv::Op operations[] = {spv::OpNop, spv::OpFOrdLessThan, spv::OpFOrdEqual,
+	    spv::OpFOrdLessThanEqual, spv::OpFOrdGreaterThan, spv::OpFUnordNotEqual,
+	    spv::OpFOrdGreaterThanEqual, spv::OpNop};
+	auto result = zero;
+	for (uint32_t index = 1u; index < 8u; ++index) {
+		const auto value = index == 7u ? one : Select(state, TypeF32(state),
+		    Binary(state, operations[index], TypeBool(state), reference, texel), one, zero);
+		result = Select(state, TypeF32(state),
+		    Binary(state, spv::OpIEqual, TypeBool(state), function, ConstantU32(state, index)), value, result);
+	}
+	return result;
+}
+
+uint32_t SoftwareColorComparison(ValueEmitContext& ctx, const IR::Inst& inst,
+                                 const IR::MemoryInfo& mem, uint32_t sample, uint32_t reference,
+                                 const IR::Inst& address, const ImageSampleLayout& layout) {
+	auto& state = ctx.state;
+	const auto& image = state.program.info.images[mem.resource];
+	const auto zero = ConstantF32(state, 0u), one = ConstantF32(state, 0x3f800000u);
+	const auto extract = [&](uint32_t vector, uint32_t component, uint32_t type) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, type, result, vector, component);
+		return result;
+	};
+	auto result = zero;
+	if (image.comparison_mode == IR::ImageComparisonMode::SoftwareLinearR8) {
+		state.builder.RequireCapability(spv::CapabilityImageQuery);
+		const auto descriptor = LoadImageDescriptor(state, mem.resource);
+		const auto size = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32Vector(state, 2u), size,
+		                          descriptor, ConstantU32(state, 0u));
+		uint32_t fraction[2];
+		for (uint32_t axis = 0; axis < 2u; ++axis) {
+			const auto extent = Unary(state, spv::OpConvertUToF, TypeF32(state),
+			    extract(size, axis, TypeU32(state)));
+			const auto position = Binary(state, spv::OpFSub, TypeF32(state),
+			    Binary(state, spv::OpFMul, TypeF32(state),
+			           AddressF32(ctx, mem, address, layout.coord + axis), extent),
+			    ConstantF32(state, 0x3f000000u));
+			const auto floor = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floor, GlslStd450(state),
+			                          GLSLstd450Floor, position);
+			fraction[axis] = Binary(state, spv::OpFSub, TypeF32(state), position, floor);
+		}
+		const auto fx = fraction[0], fy = fraction[1];
+		const auto nx = Binary(state, spv::OpFSub, TypeF32(state), one, fx);
+		const auto ny = Binary(state, spv::OpFSub, TypeF32(state), one, fy);
+		uint32_t compare[4];
+		for (uint32_t index = 0; index < 4u; ++index)
+			compare[index] = SoftwareColorCompareTap(ctx, inst,
+			    extract(sample, index, TypeF32(state)), reference);
+		// Vulkan gather order: i0j1, i1j1, i1j0, i0j0. Compare before interpolation.
+		const auto row0 = Binary(state, spv::OpFAdd, TypeF32(state),
+		    Binary(state, spv::OpFMul, TypeF32(state), compare[3], nx),
+		    Binary(state, spv::OpFMul, TypeF32(state), compare[2], fx));
+		const auto row1 = Binary(state, spv::OpFAdd, TypeF32(state),
+		    Binary(state, spv::OpFMul, TypeF32(state), compare[0], nx),
+		    Binary(state, spv::OpFMul, TypeF32(state), compare[1], fx));
+		result = Binary(state, spv::OpFAdd, TypeF32(state),
+		    Binary(state, spv::OpFMul, TypeF32(state), row0, ny),
+		    Binary(state, spv::OpFMul, TypeF32(state), row1, fy));
+	} else {
+		result = SoftwareColorCompareTap(ctx, inst, extract(sample, 0u, TypeF32(state)), reference);
+	}
+	// Declared color policy: project {comparison,0,0,1} by the guest red selector.
+	// Native AMD color-Dref swizzle/clamp equivalence remains unproved.
+	switch (image.shader_swizzle & 7u) {
+		case 0u: case 5u: case 6u: return zero;
+		case 1u: case 7u: return one;
+		case 4u: return result;
+		default: ctx.Fail(inst, "software color comparison has an invalid red selector"); return 0u;
+	}
+}
+
 uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
                       Prospero::TextureNumericClass numeric_class, bool dref,
                       const IR::MemoryInfo& mem, bool gather = false) {
@@ -957,6 +1049,20 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto  layout         = Layout(mem);
 		const auto  numeric_class  = image.numeric_class;
 		const bool  dref           = HasFlag(mem, Decoder::ImageSampleFlagCompare);
+
+		const bool software_dref = dref && image.comparison_mode != IR::ImageComparisonMode::Native;
+		const bool software_linear = software_dref && image.comparison_mode == IR::ImageComparisonMode::SoftwareLinearR8;
+		if (software_dref && (op != IR::ValueOpcode::ImageSampleRaw || mem.data_bits != 32u ||
+		    mem.image_sample_status || dimension != ImageDimension::Dim2D || image.mip_count != 1u ||
+		    image.indirect_root != IR::ImageResource::NoIndirectImage ||
+		    state.program.info.samplers.at(mem.sampler).depth_compare ||
+		    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
+		    HasFlag(mem, Decoder::ImageSampleFlagLodClamp) ||
+		    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal))) {
+			ctx.Fail(inst, "software color comparison is outside the supported experimental R8 scope");
+			return;
+		}
+
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
 			ctx.Fail(inst, "uses depth comparison with a converted image");
@@ -1033,14 +1139,14 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          state.program.stage != ShaderType::Pixel;
 		auto       opcode       = spv::OpImageSampleImplicitLod;
 		if (explicit_lod) {
-			opcode = dref ? spv::OpImageSampleDrefExplicitLod : spv::OpImageSampleExplicitLod;
-		} else if (dref) {
+			opcode = dref && !software_dref ? spv::OpImageSampleDrefExplicitLod : spv::OpImageSampleExplicitLod;
+		} else if (dref && !software_dref) {
 			opcode = spv::OpImageSampleDrefImplicitLod;
 		}
 		uint32_t result_type = ImageVectorType(state, numeric_class, 4);
 		uint32_t dref_value  = 0;
 		if (dref) {
-			result_type = TypeF32(state);
+			if (!software_dref) result_type = TypeF32(state);
 			dref_value  = ZeroF32(state);
 			if (layout.dref != NoImageComponent) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
@@ -1076,19 +1182,23 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    MakeContextSampledImage(ctx, mem, resource, sampler_id, 0u, array_index);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};
-			if (dref) {
+			if (dref && !software_dref) {
 				sample_operands.push_back(dref_value);
 			}
 			if (operand_mask != 0u) {
 				sample_operands.push_back(operand_mask);
 				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
 			}
-			state.builder.AddFunction(opcode, sample_operands);
+			if (software_linear) {
+				state.builder.AddFunction(spv::OpImageGather, result_type, sample, sampled, coord, ConstantU32(state, 0u));
+			} else {
+				state.builder.AddFunction(opcode, sample_operands);
+			}
 			return sample;
 		};
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
-			auto       result = sample;
+			auto       result = software_dref ? SoftwareColorComparison(ctx, inst, mem, sample, dref_value, *address, layout) : sample;
 			if (!dref) {
 				result = UnpackImageTexel(ctx, mem, sample);
 			}

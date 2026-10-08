@@ -160,7 +160,9 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 	const auto  scalar_type =
 	    image.atomic64 ? TypeU64(state) : ImageScalarType(state, image.numeric_class);
 	return state.builder.Type(spv::OpTypeImage, scalar_type,
-	                          info.spirv_dimension, image.depth_compare ? 1u : 0u, info.arrayed,
+	                          info.spirv_dimension,
+	                          image.depth_compare && image.comparison_mode == IR::ImageComparisonMode::Native ? 1u : 0u,
+	                          info.arrayed,
 	                          info.multisampled, sampled, format);
 }
 

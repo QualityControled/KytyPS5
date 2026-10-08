@@ -3,6 +3,8 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/SoftwareColorComparison.h"
+#include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -143,9 +145,12 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	                                                      : Prospero::BufferFormat::kInvalid;
 }
 
-enum class SamplerClass : uint8_t { Float, Integer, PointInteger };
+enum class SamplerClass : uint8_t { Float, Integer, PointInteger, FloatComparison };
 
-SamplerClass ClassifySampler(const ImageResource& image) {
+SamplerClass ClassifySampler(const ImageResource& image, bool separate_compare = false) {
+	if (separate_compare && image.numeric_class == Prospero::TextureNumericClass::Float &&
+	    image.depth_compare && image.comparison_mode == ImageComparisonMode::Native)
+		return SamplerClass::FloatComparison;
 	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	    (image.numeric_class == Prospero::TextureNumericClass::Uint &&
 	     image.conversion_format != Prospero::BufferFormat::kInvalid)) {
@@ -629,9 +634,10 @@ struct SamplerPlan {
 		uint32_t     source;
 		SamplerClass type;
 	};
-	std::vector<std::array<uint32_t, 3>>                      mapping;
+	std::vector<std::array<uint32_t, 4>>                      mapping;
 	std::vector<Binding>                                      bindings;
 	uint32_t                                                  sampler_count = 0;
+	bool                                                      separate_compare = false;
 };
 
 static bool BuildBindingAliases(const ResourcePlan& program, const ResourceSnapshot& snapshot,
@@ -847,7 +853,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 	return true;
 }
 
-bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan, bool external_contexts) {
+bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan, bool external_contexts, bool separate_compare = false) {
+	plan.separate_compare = separate_compare;
 	if (!external_contexts && base.samplers.size() > ShaderInfo::MaxSamplers) return false;
 	plan.mapping.resize(base.samplers.size());
 	plan.bindings.resize(base.samplers.size());
@@ -857,7 +864,7 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan, bool external_c
 		if (pair.image >= base.images.size() || pair.sampler >= base.samplers.size()) {
 			return false;
 		}
-		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(base.images[pair.image]));
+		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(base.images[pair.image], separate_compare));
 	}
 	for (uint32_t index = 0; index < base.samplers.size(); ++index) {
 		const auto root = base.samplers[index].indirect_root;
@@ -893,7 +900,9 @@ static void ApplySamplerVariants(ShaderInfo& info, const SamplerPlan& plan) {
 		auto& sampler                 = samplers[index];
 		sampler.snapshot_index        = binding.source;
 		sampler.force_point_filtering = binding.type == SamplerClass::PointInteger;
-		sampler.integer_border        = binding.type != SamplerClass::Float;
+		sampler.integer_border        = binding.type == SamplerClass::Integer ||
+		                                binding.type == SamplerClass::PointInteger;
+		if (plan.separate_compare) sampler.depth_compare = binding.type == SamplerClass::FloatComparison;
 	}
 	for (uint32_t index = 0; index < plan.sampler_count; ++index) {
 		auto& sampler = samplers[index];
@@ -907,10 +916,11 @@ static void ApplySamplerVariants(ShaderInfo& info, const SamplerPlan& plan) {
 		}
 	}
 	for (auto& pair: info.sampled_pairs) {
-		const auto type = static_cast<uint32_t>(ClassifySampler(info.images[pair.image]));
+		const auto type = static_cast<uint32_t>(ClassifySampler(info.images[pair.image], plan.separate_compare));
 		pair.sampler    = plan.mapping[pair.sampler][type];
 		EXIT_IF(pair.sampler == UINT32_MAX);
-		samplers[pair.sampler].depth_compare |= info.images[pair.image].depth_compare;
+		if (!plan.separate_compare)
+			samplers[pair.sampler].depth_compare |= info.images[pair.image].depth_compare;
 	}
 	for (auto& sampler: samplers) {
 		if (sampler.indirect_root != SamplerResource::NoIndirectSampler)
@@ -938,6 +948,7 @@ static bool BuildBindingAliases(const ResourcePlan& program, const ResourceSnaps
 		image.mip_count         = source.mip_count;
 		image.conversion_format = source.conversion_format;
 		image.shader_swizzle    = source.shader_swizzle;
+		image.comparison_mode   = source.comparison_mode;
 		image.cube              = source.cube;
 	}
 	const auto native_sampler_count = prospective.samplers.size();
@@ -959,7 +970,7 @@ static bool BuildBindingAliases(const ResourcePlan& program, const ResourceSnaps
 		}
 	}
 	SamplerPlan plan;
-	if (!BuildSamplerPlan(prospective, plan, true)) return false;
+	if (!BuildSamplerPlan(prospective, plan, true, specialization.software_color_dref_enabled)) return false;
 	ApplySamplerVariants(prospective, plan);
 
 	// Exact descriptor payload and view/class metadata determine binding equivalence. The
@@ -988,7 +999,7 @@ static bool BuildBindingAliases(const ResourcePlan& program, const ResourceSnaps
 		            static_cast<uint32_t>(image.dimension), static_cast<uint32_t>(image.mip_mode),
 		            image.mip_count, static_cast<uint32_t>(image.conversion_format),
 		            image.shader_swizzle, image.read, image.written, image.atomic, image.atomic64,
-		            image.depth_compare, image.cube, image.r128});
+		            image.depth_compare, image.cube, image.r128, static_cast<uint32_t>(image.comparison_mode)});
 		const auto [it, inserted] = images.emplace(std::move(key), index);
 		if (!inserted) specialization.images[index].binding_alias = it->second;
 	}
@@ -1263,6 +1274,35 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 
+	// Only executable consumers count. Dead raw MemoryInfo rows can retain untracked IDs.
+	std::vector<bool> seen(plan.info.images.size(), false);
+	std::vector<bool> eligible(plan.info.images.size(), true);
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None) continue;
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= program.memory_info.size()) continue; // Existing specialization still checks invalid live metadata.
+			const auto& memory = program.memory_info[index];
+			if (memory.resource >= eligible.size()) continue;
+			seen[memory.resource] = true;
+			constexpr uint32_t allowed = Decoder::ImageSampleFlagCompare |
+			                            Decoder::ImageSampleFlagLevelZero |
+			                            Decoder::ImageSampleFlagLod |
+			                            Decoder::ImageSampleFlagBias |
+			                            Decoder::ImageSampleFlagDerivative;
+			eligible[memory.resource] = eligible[memory.resource] &&
+			    inst.GetOpcode() == ValueOpcode::ImageSampleRaw && memory.data_bits == 32u &&
+			    memory.dmask != 0u && memory.dmask <= 15u && !memory.image_sample_status &&
+			    (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u &&
+			    (memory.image_sample_flags & ~allowed) == 0u;
+		}
+	}
+	for (size_t index = 0; index < eligible.size(); ++index) {
+		plan.info.images[index].software_comparison_seen = seen[index];
+		plan.info.images[index].software_comparison_eligible = seen[index] && eligible[index];
+	}
+
+
 	std::unordered_map<const Inst*, Inst*> cloned;
 	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
 		value              = value.Resolve();
@@ -1403,6 +1443,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	// Clear per-pass policy state even when this materialization fails before alias construction.
+	specialization.software_color_dref_enabled = false;
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
@@ -1603,6 +1645,67 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
+
+bool ConfigureSoftwareColorComparison(const ResourcePlan& plan, const ResourceSnapshot& snapshot,
+                                      ResourceSpecialization& specialization, bool enabled,
+                                      bool r8_native_comparison_supported) {
+	if (!enabled || r8_native_comparison_supported) return true;
+	if (snapshot.images.size() != specialization.images.size()) return false;
+	bool any = false;
+	for (uint32_t index = 0; index < plan.info.images.size(); ++index) {
+		const auto& image = plan.info.images[index];
+		if (!image.depth_compare || !image.software_comparison_seen) continue;
+		if (index >= snapshot.images.size() || snapshot.images[index].dword_count != 8u) return false;
+		ShaderTextureResource descriptor;
+		std::copy_n(snapshot.images[index].dwords.begin(), 8u, descriptor.fields);
+		if (descriptor.Format() != Prospero::BufferFormat::k8UNorm) continue;
+		if (descriptor.IsNull() || descriptor.BaseLevel() != 0u || descriptor.LastLevel() != 0u ||
+		    descriptor.MaxMip() != 0u || descriptor.MinLod() != 0u || descriptor.BaseArray5() != 0u ||
+		    descriptor.PrtDefColor() || descriptor.CornerSample() || descriptor.MsaaDepth() ||
+		    descriptor.MetaCompress() || !image.software_comparison_eligible) return false;
+		for (uint32_t channel = 0; channel < 4u; ++channel) {
+			const auto selector = (descriptor.DstSelXYZW() >> (channel * 3u)) & 7u;
+			if (selector == 2u || selector == 3u) return false;
+		}
+		SoftwareColorComparison::Scope scope;
+		scope.enabled = scope.capability_known = scope.comparison = true;
+		scope.host_format = 9u; // k8UNorm maps exactly to VK_FORMAT_R8_UNORM.
+		scope.dimensions = specialization.images[index].dimension == Decoder::ImageDimension::Dim2D ? 2u : 0u;
+		scope.samples = 1u;
+		scope.mip_levels = specialization.images[index].mip_count;
+		scope.direct = image.indirect_root == ImageResource::NoIndirectImage;
+		scope.sampled = image.resource_class == ImageResourceClass::Sampled;
+		scope.read_only = image.read && !image.written && !image.atomic;
+		scope.converted = specialization.images[index].conversion_format != Prospero::BufferFormat::kInvalid;
+		scope.width = descriptor.Width5() + 1u;
+		scope.height = descriptor.Height5() + 1u;
+		bool paired = false;
+		std::optional<SoftwareColorComparison::Mode> selected_mode;
+		for (const auto& pair: plan.info.sampled_pairs) {
+			if (pair.image != index) continue;
+			if (pair.sampler >= plan.info.samplers.size() || pair.sampler >= snapshot.samplers.size() ||
+			    plan.info.samplers[pair.sampler].indirect_root != SamplerResource::NoIndirectSampler ||
+			    snapshot.samplers[pair.sampler].dword_count != 4u) return false;
+			std::copy_n(snapshot.samplers[pair.sampler].dwords.begin(), 4u, scope.sampler.begin());
+			const auto decision = SoftwareColorComparison::Classify(scope);
+			if (decision.mode != SoftwareColorComparison::Mode::SoftwarePointR8 &&
+			    decision.mode != SoftwareColorComparison::Mode::SoftwareLinearR8) return false;
+			if (selected_mode && *selected_mode != decision.mode) return false;
+			selected_mode = decision.mode;
+			paired = true;
+		}
+		if (!paired) return false;
+		auto& specialized = specialization.images[index];
+		specialized.comparison_mode = *selected_mode == SoftwareColorComparison::Mode::SoftwareLinearR8
+		    ? ImageComparisonMode::SoftwareLinearR8 : ImageComparisonMode::SoftwarePointR8;
+		specialized.shader_swizzle = descriptor.DstSelXYZW();
+		any = true;
+	}
+	if (!any) return true;
+	specialization.software_color_dref_enabled = true;
+	return BuildBindingAliases(plan, snapshot, specialization);
+}
+
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);
@@ -1650,6 +1753,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.mip_count                  = source.mip_count;
 		image.conversion_format          = source.conversion_format;
 		image.shader_swizzle             = source.shader_swizzle;
+		image.comparison_mode            = source.comparison_mode;
 		image.indirect_root              = source.indirect_root;
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
@@ -1691,7 +1795,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	}
 	SamplerPlan sampler_plan;
 	EXIT_IF(
-	    !BuildSamplerPlan(program.info, sampler_plan, !program.external_context_bindings.empty()));
+	    !BuildSamplerPlan(program.info, sampler_plan, !program.external_context_bindings.empty(),
+	                      specialization.software_color_dref_enabled));
 	const auto original_sampler_count = samplers.size();
 	ApplySamplerVariants(program.info, sampler_plan);
 	if (!specialization.sampler_binding_aliases.empty()) {
@@ -1784,7 +1889,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 			if (image_opcode.needs_sampler &&
 			    memory.sampler < original_sampler_count) {
-				const auto type = static_cast<uint32_t>(ClassifySampler(image));
+				const auto type = static_cast<uint32_t>(ClassifySampler(image, sampler_plan.separate_compare));
 				memory.sampler = sampler_plan.mapping[memory.sampler][type];
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}

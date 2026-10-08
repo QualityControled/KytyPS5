@@ -31,6 +31,35 @@ inline bool GeometryEnabled() {
     return enabled;
 }
 
+// Optional exact prepared-PS identity filter. It narrows diagnostics only.
+struct PixelHashFilter {
+    bool requested = false, valid = true;
+    uint64_t hash = 0;
+    static PixelHashFilter Parse(const char* value) {
+        if (value == nullptr) return {};
+        PixelHashFilter result {true, false, 0};
+        for (uint32_t i = 0; i < 16; ++i) {
+            const auto c = value[i];
+            uint32_t digit = 0;
+            if (c >= '0' && c <= '9') digit = c - '0';
+            else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+            else return result; // Also rejects a short NUL-terminated string before further reads.
+            result.hash = (result.hash << 4) | digit;
+        }
+        result.valid = value[16] == 0;
+        return result;
+    }
+    bool Accept(uint64_t prepared_ps_hash) const {
+        return valid && (!requested || prepared_ps_hash == hash);
+    }
+};
+
+inline const PixelHashFilter& ProcessPixelHashFilter() {
+    static const auto filter = PixelHashFilter::Parse(std::getenv("KYTY_CAR_RENDER_DIAGNOSTIC_PS_HASH"));
+    return filter;
+}
+
 inline bool EligibleDraw(uint32_t source_count, bool depth_test) {
     // DrawIndex supplies guest index_count; DrawIndexAuto supplies guest vertex_count.
     // No instance multiplication or inference that this draw represents a vehicle.

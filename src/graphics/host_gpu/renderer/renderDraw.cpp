@@ -1151,6 +1151,13 @@ static void LogCarRenderDiagnostic(CommandBuffer& buffer, uint64_t submit_id,
                                    std::span<PreparedBindings* const> stages) {
     namespace CD = CarRenderDiagnostic;
     if (!CD::Ready() || !state.ps_active) return;
+    const auto& ps_filter = CD::ProcessPixelHashFilter();
+    if (!ps_filter.valid) EXIT("KYTY_CAR_RENDER_DIAGNOSTIC_PS_HASH requires exactly16 hexadecimal characters\n");
+    if (ps_filter.requested) {
+        const auto* program = state.ps_input_info.stage.program;
+        if (program == nullptr) return; // Requested identity is unknown; never spend the budget.
+        if (!ps_filter.Accept(program->shader_hash)) return;
+    }
     if (!CD::EligibleDraw(draw.index_count, state.depth_info.depth_test_enable)) return;
     static CD::SignatureBudget budget(CD::GeometryEnabled() ? CD::SignatureBudget::GeometryMaxRecordBytes :
                                                            CD::SignatureBudget::MaxRecordBytes);
@@ -1161,6 +1168,9 @@ static void LogCarRenderDiagnostic(CommandBuffer& buffer, uint64_t submit_id,
                     CD::ProcessStartGate().HasStartFile(), budget.RecordBytes());
         if (CD::GeometryEnabled()) {
             std::printf("CarRenderDiagnostic geometry_filter=1 count_source=DrawCallInfo.index_count indexed=guest_indices auto=guest_vertices min_count=128 depth_test_alternative=1 candidate_only=1 vehicle_identity=unknown\n");
+        }
+        if (ps_filter.requested) {
+            std::printf("CarRenderDiagnostic ps_hash_filter=0x%016" PRIx64 " after_start_token=1 matched_prepared_ps=1 vehicle_identity=unknown gpu_election_not_proved=1\n", ps_filter.hash);
         }
         std::fflush(stdout);
         active_reported = true;

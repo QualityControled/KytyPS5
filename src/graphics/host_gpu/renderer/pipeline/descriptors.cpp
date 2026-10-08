@@ -448,7 +448,8 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
-	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
+	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid ||
+	            resource.comparison_mode != ShaderRecompiler::IR::ImageComparisonMode::Native
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
 	switch (resource.dimension) {

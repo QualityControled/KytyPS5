@@ -124,6 +124,8 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_has_mip = decoded.opcode == Decoder::Opcode::IMAGE_LOAD_MIP ||
 	                       decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP;
 	memory.image_r128    = decoded.image_r128;
+	memory.image_sample_status = decoded.family == Decoder::Family::MIMG &&
+	                             (decoded.raw[0] & ((1u << 16u) | (1u << 17u))) != 0u;
 	memory.idxen         = decoded.idxen;
 	memory.offen         = decoded.offen;
 	// Vector loads use GLC/DLC to bypass L0/GL1; atomics use GLC only to return data.

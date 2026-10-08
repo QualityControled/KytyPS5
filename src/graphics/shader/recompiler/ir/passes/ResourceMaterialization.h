@@ -25,6 +25,7 @@ struct ResourceSpecialization {
 		uint32_t                      mip_count     = 1;
 		Prospero::BufferFormat        conversion_format          = Prospero::BufferFormat::kInvalid;
 		uint32_t                      shader_swizzle             = ShaderImageIdentitySwizzle;
+		ImageComparisonMode           comparison_mode            = ImageComparisonMode::Native;
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
 		uint32_t                      indirect_mapping_offset    = 0;
 		uint32_t                      indirect_search_iterations = 0;
@@ -41,6 +42,8 @@ struct ResourceSpecialization {
 		bool     operator==(const Sampler&) const = default;
 	};
 
+	// Enable separate native-comparison/noncomparison sampler variants only for this mode.
+	bool software_color_dref_enabled = false;
 	std::vector<Buffer> buffers;
 	std::vector<Image>  images;
 	std::vector<Sampler> samplers;
@@ -58,6 +61,12 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+
+// Pure post-materialization configuration. No additional guest reads or descriptor mutation.
+// Capability must come from the physical device optimal-tiling FormatProperties3 query.
+bool ConfigureSoftwareColorComparison(const ResourcePlan& plan, const ResourceSnapshot& snapshot,
+                                      ResourceSpecialization& specialization, bool enabled,
+                                      bool r8_native_comparison_supported);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

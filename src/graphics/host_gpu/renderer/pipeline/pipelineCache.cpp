@@ -58,6 +58,17 @@ namespace Libs::Graphics {
 
 namespace {
 
+bool SoftwareColorDrefRequested() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_EXPERIMENTAL_SOFTWARE_COLOR_DREF");
+		if (value == nullptr) return false;
+		if (std::strcmp(value, "1") != 0)
+			EXIT("KYTY_EXPERIMENTAL_SOFTWARE_COLOR_DREF requires exact value 1\n");
+		return true;
+	}();
+	return enabled;
+}
+
 bool ExternalProbeRequested() {
 	const auto* value = std::getenv("KYTY_PROBE_EXTERNAL_CALL_TARGET");
 	return value != nullptr && std::strcmp(value, "1") == 0;
@@ -673,6 +684,7 @@ struct PipelineCache::ProgramCache {
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
 		bool                  external_call_probe = false;
+		bool                  software_color_dref = false;
 		bool                  external_probe_before_bvh = false;
 		bool                  external_probe_structured = false;
 		bool                  external_probe_after_bvh = false;
@@ -684,6 +696,7 @@ struct PipelineCache::ProgramCache {
 			if (stage != other.stage || hash != other.hash || user_data_count != other.user_data_count ||
 			    code_size != other.code_size || static_state != other.static_state ||
 			    external_call_probe != other.external_call_probe ||
+			    software_color_dref != other.software_color_dref ||
 			    external_probe_before_bvh != other.external_probe_before_bvh ||
 			    external_probe_structured != other.external_probe_structured ||
 			    external_probe_after_bvh != other.external_probe_after_bvh ||
@@ -725,6 +738,7 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.external_call_probe);
+			if (key.software_color_dref) PipelineKeyHash::Mix(hash, 0x53434401u);
 			PipelineKeyHash::Mix(hash, key.external_probe_before_bvh);
 			PipelineKeyHash::Mix(hash, key.external_probe_structured);
 			PipelineKeyHash::Mix(hash,key.external_probe_after_bvh);
@@ -962,6 +976,7 @@ struct PipelineCache::ProgramCache {
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		lookup_key.external_library.reset();
 		lookup_key.external_call_probe = false;
+		lookup_key.software_color_dref = SoftwareColorDrefRequested();
 		lookup_key.external_probe_before_bvh = false;
 		lookup_key.external_probe_structured = false;
 		lookup_key.external_probe_after_bvh = false;
@@ -1177,7 +1192,8 @@ struct PipelineCache::ProgramCache {
 				     "files_written=%d; stopped before external shader compilation or GPU execution\n",
 				     succeeded, resource_capture->Complete(), saved);
 			}
-			return succeeded;
+			return succeeded && ShaderRecompiler::IR::ConfigureSoftwareColorComparison(
+			    plan, resources, specialization, lookup_key.software_color_dref, r8_native_comparison_supported);
 		};
 		if (entry != programs.end()) {
 			{
@@ -1308,8 +1324,16 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device, const vk::PhysicalDeviceLimits& limits)
+	explicit ProgramCache(vk::Device device, const vk::PhysicalDeviceLimits& limits, vk::PhysicalDevice physical)
 	    : device(device), limits(limits) {
+		if (SoftwareColorDrefRequested()) {
+			vk::FormatProperties3 flags3;
+			vk::FormatProperties2 flags2;
+			flags2.pNext = &flags3;
+			physical.getFormatProperties2(vk::Format::eR8Unorm, &flags2);
+			r8_native_comparison_supported = static_cast<bool>(flags3.optimalTilingFeatures &
+			    vk::FormatFeatureFlagBits2::eSampledImageDepthComparison);
+		}
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -1327,11 +1351,12 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	vk::PhysicalDeviceLimits                                    limits;
 	uint64_t                                                    next_shader_id = 0;
+	bool                                                        r8_native_comparison_supported = false;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(
-          graphics.device, graphics.physical_device_properties.limits)) {
+          graphics.device, graphics.physical_device_properties.limits, graphics.physical_device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }
@@ -1391,6 +1416,10 @@ void PipelineCache::InitializeDriverCache() {
 		cache_suffix.resize(cache_suffix.size() - std::string_view(".bin").size());
 		cache_suffix += ShaderRecompiler::Diagnostics::EqaaReduced2xResolveRequested()
 		    ? "-experimental-eqaa2x-v4-resolve.bin" : "-experimental-eqaa2x-v3-depth-absence.bin";
+	}
+	if (SoftwareColorDrefRequested()) {
+		cache_suffix.resize(cache_suffix.size() - std::string_view(".bin").size());
+		cache_suffix += "-software-color-dref-r8-v1.bin";
 	}
 	m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + cache_suffix);
 	const auto path         = Common::PathToString(m_driver_cache_path);
