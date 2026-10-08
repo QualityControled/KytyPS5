@@ -2,7 +2,7 @@
 
 This fork develops Gran Turismo 7 rendering and shader compatibility on Windows x64. It is based on [KytyPS5](https://github.com/KytyPS5/KytyPS5) and remains experimental.
 
-**[Windows download and release notes: r30](https://github.com/QualityControled/KytyPS5/releases/tag/gt7-experimental-2026.10.08-r30)** | **[Changelog](CHANGELOG.md)** | **[Matching source](https://github.com/QualityControled/KytyPS5/tree/90d58d1c8d0c303423359e5bd9b7ecd4f1fb5fc8)**
+**[Windows download and release notes: r31](https://github.com/QualityControled/KytyPS5/releases/tag/gt7-experimental-2026.10.08-r31)** | **[Changelog](CHANGELOG.md)** | **[Matching source](https://github.com/QualityControled/KytyPS5/tree/cf9ce5a5ffc5c0a479cee961c63ffcbff5bec82e)**
 
 ## Current GT7 result
 
@@ -14,7 +14,7 @@ The GT7 launcher enables a declared lower-AA approximation and fixed-function re
 
 ## Download and start on Windows
 
-1. Open the [r30 release](https://github.com/QualityControled/KytyPS5/releases/tag/gt7-experimental-2026.10.08-r30) and download `KytyPS5-GT7-Experimental-r30-90d58d1-Windows-x64.zip`. Download the checksum file as well if you want to verify the archive.
+1. Open the [r31 release](https://github.com/QualityControled/KytyPS5/releases/tag/gt7-experimental-2026.10.08-r31) and download `KytyPS5-GT7-Experimental-r31-cf9ce5a-Windows-x64.zip`. Download the checksum file as well if you want to verify the archive.
 2. Extract the whole ZIP into a writable folder. Keep the DLLs, plugin folders and license files together with the executable; do not run it inside the ZIP.
 3. Double-click `Start-GT7-Experimental.cmd`. Choose your GT7 game folder containing `eboot.bin`.
 4. Keep the console open. Initial shader compilation can pause visible progress. A deliberate external-call stop or another unsupported operation may end the session.
@@ -35,10 +35,10 @@ Use 64-bit Windows and a Vulkan 1.3-capable GPU with current drivers. The extrac
 
 ## Changes in this fork
 
-Recent changes cover indirect image writes, external-call provenance and bounded diagnostics, image metadata remapping, mapped blend semantics, sample-state retention, an opt-in lower-AA profile, and fixed-function 2-sample-to-1-sample resolves. r30 adds an optional bounded final-binding trace for diagnosing vehicle materials; it does not repair lighting by itself. See [CHANGELOG.md](CHANGELOG.md) for changes and the limits of their validation.
+Recent changes cover indirect image writes, external-call provenance and bounded diagnostics, image metadata remapping, mapped blend semantics, sample-state retention, an opt-in lower-AA profile, and fixed-function 2-sample-to-1-sample resolves. r30 added an optional bounded final-binding trace for diagnosing vehicle materials. r31 adds default-off, failure-only metadata for invalid shader/vertex buffer ranges while retaining the existing stop. These diagnostics do not repair lighting or the crash by themselves. See [CHANGELOG.md](CHANGELOG.md) for changes and the limits of their validation.
 
 ## Source and license
 
-r30 corresponds to [`90d58d1c8d0c303423359e5bd9b7ecd4f1fb5fc8`](https://github.com/QualityControled/KytyPS5/tree/90d58d1c8d0c303423359e5bd9b7ecd4f1fb5fc8). [Download the corresponding source ZIP](https://github.com/QualityControled/KytyPS5/archive/90d58d1c8d0c303423359e5bd9b7ecd4f1fb5fc8.zip). For a complete build checkout, clone the pinned revision with submodules; GitHub source ZIPs do not include submodule contents. Build instructions remain in the [upstream project](https://github.com/KytyPS5/KytyPS5#developer-information).
+r31 corresponds to [`cf9ce5a5ffc5c0a479cee961c63ffcbff5bec82e`](https://github.com/QualityControled/KytyPS5/tree/cf9ce5a5ffc5c0a479cee961c63ffcbff5bec82e). [Download the corresponding source ZIP](https://github.com/QualityControled/KytyPS5/archive/cf9ce5a5ffc5c0a479cee961c63ffcbff5bec82e.zip). For a complete build checkout, clone the pinned revision with submodules; GitHub source ZIPs do not include submodule contents. Build instructions remain in the [upstream project](https://github.com/KytyPS5/KytyPS5#developer-information).
 
 KytyPS5 remains licensed under [GPL version 2](LICENSE). Original Kyty and third-party notices are retained in the source and the Windows package's `licenses` directory. This fork is not affiliated with Sony Interactive Entertainment or Polyphony Digital.

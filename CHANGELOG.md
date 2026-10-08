@@ -2,6 +2,12 @@
 
 This list covers emulator changes after `KytyPS5-2026-10-07-d2413fc`. Experimental settings are opt-in. Owned fixtures and captured CPU validation are separate from actual game observations.
 
+## r31 - 2026-10-08 - cf9ce5a
+
+- Add opt-in metadata at the existing invalid-buffer-range failure guard, associating the requested range with current shader buffers or merged vertex-buffer slots. Records are bounded to 32 KiB, and the original range query and fatal rejection remain unchanged.
+- The diagnostic is disabled by default, including in the portable GT7 starter. CPU gate/query/callback fixtures and three production translation-unit syntax checks passed; the coherent emulator and compute-test build completed. No new game/GPU validation is claimed for this update.
+- The selected replay/movie guard failure is not fixed. Its responsible stage/resource and the remaining material, lighting and shadow faults are still unresolved. No FPS improvement is claimed.
+
 ## r30 - 2026-10-08 - 90d58d1
 
 - Add a default-off vehicle draw trace that associates final shaders, image/view/sampler bindings and attachments. The trace is bounded and can be activated at a chosen scene boundary.
