@@ -43,23 +43,47 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
-		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
+		const auto selection = m_file_backing.OpenConfigured(m_size);
+		if (selection == Detail::WindowsDirectMemoryFile::Selection::Rejected) {
+			std::printf("direct-memory file backing rejected: stage=%s win32_error=0x%08" PRIx32
+			            "\n",
+			            m_file_backing.Stage(), static_cast<uint32_t>(m_file_backing.Error()));
+			std::fflush(stdout);
+			return;
+		}
+		if (selection == Detail::WindowsDirectMemoryFile::Selection::PagefileDefault) {
+			m_handle = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr,
+			                              PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+			                              static_cast<DWORD>(m_size >> 32u),
+			                              static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
+		} else {
+			m_handle = CreateFileMappingW(m_file_backing.Handle(), nullptr, PAGE_EXECUTE_READWRITE,
+			                              static_cast<DWORD>(m_size >> 32u),
+			                              static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
+		}
 		if (m_handle == nullptr) {
-			LOGF_COLOR(Log::Color::Red,
-			           "\t direct-memory backing: CreateFileMapping failed: 0x%08" PRIx32 "\n",
-			           static_cast<uint32_t>(GetLastError()));
+			const auto error = static_cast<uint32_t>(GetLastError());
+			std::printf("direct-memory backing failed: backend=%s stage=create-mapping "
+			            "win32_error=0x%08" PRIx32 "\n",
+			            m_file_backing.Requested() ? "private-file" : "pagefile", error);
+			std::fflush(stdout);
 			return;
 		}
 		m_backing_base = static_cast<uint8_t*>(
 		    MapViewOfFile(m_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, m_size));
 		if (m_backing_base == nullptr) {
-			LOGF_COLOR(Log::Color::Red,
-			           "\t direct-memory backing: writable alias failed: 0x%08" PRIx32 "\n",
-			           static_cast<uint32_t>(GetLastError()));
+			const auto error = static_cast<uint32_t>(GetLastError());
+			std::printf("direct-memory backing failed: backend=%s stage=writable-view "
+			            "win32_error=0x%08" PRIx32 "\n",
+			            m_file_backing.Requested() ? "private-file" : "pagefile", error);
+			std::fflush(stdout);
 			CloseHandle(m_handle);
 			m_handle = nullptr;
+		} else if (m_file_backing.Requested()) {
+			std::printf("direct-memory backend=private-ntfs-sparse-file logical_bytes=%" PRIu64
+			            " default_pagefile_backend=0\n",
+			            m_size);
+			std::fflush(stdout);
 		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #if defined(__APPLE__)
@@ -156,6 +180,9 @@ public:
 	}
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	[[nodiscard]] bool FileBackingRequested() const { return m_file_backing.Requested(); }
+#endif
 
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
@@ -609,6 +636,7 @@ private:
 		return UnmapViewOfFile2(GetCurrentProcess(), vaddr, MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
+	Detail::WindowsDirectMemoryFile m_file_backing;
 	HANDLE m_handle = nullptr;
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	[[nodiscard]] static uint64_t GetMappableTestSize() { return 0x4000; }
@@ -672,6 +700,10 @@ public:
 		m_backing = new GuestBackingStore(backing_size);
 		if (!m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (m_backing->FileBackingRequested()) {
+				EXIT("could not initialize %" PRIu64 " MB opt-in file-backed guest direct memory; see backend stage/error above\n",
+				     backing_size / (1024U * 1024U));
+			}
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
 			     "this up front, so the paging file is usually what needs to be larger.\n",
 			     backing_size / (1024U * 1024U));

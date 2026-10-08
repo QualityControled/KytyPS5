@@ -4177,7 +4177,51 @@ void TestSmallFiberStacksAndMigration() {
 } // namespace
 
 int main(int argc, char** argv) {
+	bool file_backed_memory_only = false;
+	if (argc >= 2 &&
+	    std::strncmp(argv[1], "--file-backed-memory", sizeof("--file-backed-memory") - 1) == 0) {
+		if (argc != 2 || std::strcmp(argv[1], "--file-backed-memory-only") != 0) {
+			std::fprintf(
+			    stderr,
+			    "VirtualMemoryAllocationTests: expected exactly --file-backed-memory-only\n");
+			return 2;
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		std::array<wchar_t, 2048> directory {};
+		const auto count = GetEnvironmentVariableW(L"KYTY_DIRECT_MEMORY_BACKING_DIR",
+		                                           directory.data(), directory.size());
+		if (count == 0 || count >= directory.size()) {
+			std::fprintf(stderr, "VirtualMemoryAllocationTests: --file-backed-memory-only requires "
+			                     "nonempty KYTY_DIRECT_MEMORY_BACKING_DIR\n");
+			return 2;
+		}
+		file_backed_memory_only = true;
+#else
+		std::fprintf(stderr,
+		             "VirtualMemoryAllocationTests: --file-backed-memory-only requires Windows\n");
+		return 2;
+#endif
+	}
 	InitSubsystems();
+	if (file_backed_memory_only) {
+		RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
+		RunTest(TestFlexibleMemoryCapacityIsBootFixed);
+		RunTest(TestFlexibleMemoryUsesSharedBacking);
+		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+		RunTest(TestFragmentedBackingUnmapRollback);
+		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
+		RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
+		RunTest(TestDirectMapValidationBeforeOwnerMutation);
+		RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
+		RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
+		RunTest(TestDirectMapAcrossContiguousAllocations);
+		RunTest(TestDirectMemoryContentPersistsAcrossRemap);
+		RunTest(TestDirectMapUnmapReusesHostAddress);
+		std::printf(
+		    "VirtualMemoryAllocationTests: file-backed memory %d failure(s), 13 selected cases\n",
+		    g_failed_tests);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 #if defined(__linux__)
 	if (argc == 2 && std::strcmp(argv[1], "--fixed-direct-replacement-only") == 0) {
 		RunTest(TestFixedDirectReplacementPreservesAccess);
