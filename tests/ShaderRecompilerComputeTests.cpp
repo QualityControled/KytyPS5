@@ -20,6 +20,9 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/eqaaDepthState.h"
+#include "graphics/shader/recompiler/EqaaReduced2xPolicy.h"
+#include "graphics/shader/recompiler/PixelSampleSensitivity.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -550,8 +553,10 @@ struct RenderExecutorTestAccess {
 
   static void ResolveRenderColorTarget(RenderExecutor &executor,
                                        CommandBuffer &buffer,
-                                       RenderColorInfo &color, uint32_t slot) {
-    executor.ResolveRenderColorTarget(buffer, color, 0, slot);
+                                       RenderColorInfo &color, uint32_t slot,
+                                       const ShaderPixelInputInfo *pixel = nullptr) {
+    executor.ResolveRenderColorTarget(buffer, color, 0, slot, false, false, pixel,
+                                      pixel ? "OwnedEqaaDraw" : nullptr);
   }
 
   static void BindRenderTarget(RenderExecutor &executor, ImageId id) {
@@ -1786,7 +1791,8 @@ std::string StorageUint2DImageBindingName(bool atomic) {
   return "image_" + std::to_string(static_cast<uint32_t>(*binding));
 }
 
-CompiledShader CompileFragmentCase(const GraphicsCase &test) {
+CompiledShader CompileFragmentCase(const GraphicsCase &test,
+                                   ShaderRecompiler::IR::PixelSampleSensitivity *original = nullptr) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
@@ -1831,6 +1837,23 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           ShaderRecompiler::IR::MaterializeResources(
               resource_plan, runtime, resources, specialization),
           "translated resources could not be materialized");
+  if (original != nullptr) {
+    *original = ShaderRecompiler::Diagnostics::CollectPixelSampleSensitivity(
+        options.stage, ShaderRecompiler::Diagnostics::CollectEqaaPixelFacts(),
+        translated.program.info, translated.program.memory_info, specialization);
+    for (const auto *block : translated.program.blocks) for (const auto &inst : *block) {
+      ShaderRecompiler::Diagnostics::ObservePixelSampleOpcode(*original, inst.GetOpcode());
+      if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::GetBuiltin) {
+        const auto &kind = inst.Arg(0);
+        const bool known = kind.IsImmediate() && kind.GetType() == ShaderRecompiler::IR::Type::U32;
+        ShaderRecompiler::Diagnostics::ObservePixelSampleBuiltin(*original, known, known ? kind.U32() : UINT32_MAX);
+      } else if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::SetAttribute) {
+        const auto index = inst.Flags<ShaderRecompiler::IR::ExportFlags>().index;
+        ShaderRecompiler::Diagnostics::ObservePixelSampleExport(*original,
+            index < translated.program.export_info.size() ? &translated.program.export_info[index] : nullptr);
+      }
+    }
+  }
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
@@ -15864,8 +15887,10 @@ public:
 
   void CheckRasterization(
       bool depth_feedback,
-      Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float) {
-    const char *name = depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
+      Prospero::BufferFormat color_format = Prospero::BufferFormat::k32_32_32_32Float,
+      bool color_only_eqaa = false) {
+    const char *name = color_only_eqaa ? "EqaaColorOnlyNative2x" :
+                       depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization";
     uint32_t packed_color = 0;
     std::array<float, 4> packed_expected{};
     switch (color_format) {
@@ -15884,12 +15909,13 @@ public:
     const bool packed_vertex_color = color_format != Prospero::BufferFormat::k32_32_32_32Float;
     const uint32_t extent = depth_feedback ? 8 : 32;
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
-    constexpr uint64_t allocation_size = 0x40000;
+    const uint64_t allocation_size = color_only_eqaa ? 0x100000 : 0x40000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
+    registers.Reset();
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     registers.SetRenderTargetMask(0xf);
@@ -15983,7 +16009,8 @@ public:
     test.fragment_code.push_back(packed_vertex_color ? EncodeExp1(0, 1, 2, 3)
                                                     : EncodeExp1(0, 0, 0, 0));
     AppendEnd(&test.fragment_code);
-    auto fragment = CompileFragmentCase(test);
+    ShaderRecompiler::IR::PixelSampleSensitivity original_pixel;
+    auto fragment = CompileFragmentCase(test, color_only_eqaa ? &original_pixel : nullptr);
     const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
     ShaderProgram vertex_shader{1, CreateShaderModule(name, vertex_spirv)};
     ShaderProgram pixel_shader{2, CreateShaderModule(name, fragment.spirv)};
@@ -15995,6 +16022,7 @@ public:
     pixel_program.stage = ShaderType::Pixel;
     pixel_program.info = fragment.program.info;
     pixel_program.bindings = fragment.program.bindings;
+    pixel_program.pixel_sample_sensitivity = original_pixel;
     ShaderVertexInputInfo vertex{};
     ShaderRecompiler::IR::ResourceSnapshot vertex_snapshot;
     vertex.stage.program = &vertex_program;
@@ -16026,6 +16054,45 @@ public:
     color.desc.view_info.format = color.desc.info.pixel_format;
     color.desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
     color.image_id = cache.FindImage(color.desc);
+    ImageId eqaa_resolved{};
+    if (color_only_eqaa) {
+      Require(name, "opt-in profile", ShaderRecompiler::Diagnostics::EqaaReduced2xRequested(),
+              "owned EQAA fixture requires a separate opt-in test process");
+      Require(name, "native pixel summary", pixel_program.pixel_sample_sensitivity.captured &&
+                  pixel_program.pixel_sample_sensitivity.complete,
+              "actual native fragment did not retain its original sensitivity summary");
+      registers.SetColorBase(0, {.addr = depth_address + 0x40000});
+      registers.SetColorInfo(0, {.format = Prospero::ChannelLayout::k32_32_32_32,
+                                 .channel_type = Prospero::ChannelType::kFloat,
+                                 .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib(0, {.num_samples = 2, .num_fragments = 1});
+      registers.SetColorAttrib2(0, {.height = extent - 1, .width = extent - 1});
+      registers.SetColorAttrib3(0, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                    .dimension = 1, .metadata_pipe_aligned = true});
+      registers.SetColorControl({.mode = 1});
+      // Exact values are observed owned-test writes. Reset AA masks retain their
+      // reset_default origin rather than being fabricated observed writes.
+      for (size_t i = 0; i < static_cast<size_t>(HW::SampleRegister::Count); ++i) {
+        const auto reg = static_cast<HW::SampleRegister>(i);
+        if (reg != HW::SampleRegister::AaMaskX0Y0X1Y0 &&
+            reg != HW::SampleRegister::AaMaskX0Y1X1Y1) {
+          registers.RecordSampleRegister(reg, reg == HW::SampleRegister::Color0Attrib ? 0xa000u : 0u);
+        }
+      }
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color, 0, &pixel);
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      Require(name, "actual native discovery", color.experimental_reduced_eqaa_2x &&
+                  color.desc.info.samples == 2 && cache.GetImage(color.image_id).backing.samples == 2 &&
+                  !depth.image_id && ShaderRecompiler::Diagnostics::IsReducedEqaaDepthAbsent(registers),
+              "native two-sample color discovery manufactured depth or changed storage samples");
+      auto resolved = color.desc;
+      resolved.info.data = {depth_address + 0x80000, extent * extent * 16};
+      resolved.info.samples = 1;
+      resolved.info.tile_mode = Prospero::TileMode::kLinear;
+      resolved.info.pitch = extent;
+      resolved.info.mip_layout[0] = {0, resolved.info.data.size, extent, extent};
+      eqaa_resolved = cache.FindImage(resolved);
+    }
     std::array<float, 18> vertices{
         -0.75f, -0.75f, 1, 1, 1, 1, 0.75f, -0.75f, 0.5f, 1, 1, 1,
         0.0f, 0.75f, 0.25f, 1, 1, 1};
@@ -16130,11 +16197,20 @@ public:
       RenderExecutorTestAccess::ResetBindings(executor);
     };
     const auto read_color = [&] {
-      return ReadCachedTexel(name, context, color.image_id, {}, {extent, extent, 1});
+      if (color_only_eqaa) {
+        cache.GetImage(eqaa_resolved).Resolve(cache.GetImage(color.image_id), {0, 1, 0, 1}, {0, 1, 0, 1});
+      }
+      return ReadCachedTexel(name, context, color_only_eqaa ? eqaa_resolved : color.image_id,
+                             {}, {extent, extent, 1});
     };
     draw(filled);
     const auto solid_pixels = read_color();
-    if (packed_vertex_color) {
+    if (color_only_eqaa) {
+      const auto center = 4 * ((extent / 2) * extent + extent / 2);
+      Require(name, "native 2x draw and resolve", solid_pixels[center] == 0x3f800000u &&
+                  solid_pixels[0] == 0 && pipeline(true, 2, 2).pipeline == filled.pipeline,
+              "color-only native two-sample draw, clear, resolve or pipeline reuse failed");
+    } else if (packed_vertex_color) {
       const auto center = 4 * ((extent / 2) * extent + extent / 2);
       for (uint32_t component = 0; component < packed_expected.size(); component++) {
         Require(name, "packed vertex fetch and coverage",
@@ -43248,6 +43324,50 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
               processor.GetCtx().GetRenderTargetMask() == 0x0badc0de,
           "CLEAR_STATE discarded the pushed Cx state");
 
+  if (ShaderRecompiler::Diagnostics::RetainEqaaRawRegisters(Config::GraphicsDebugDumpEnabled())) {
+    const auto low = HW::SampleRegister::AaMaskX0Y0X1Y0;
+    const auto high = HW::SampleRegister::AaMaskX0Y1X1Y1;
+    const auto mask_word = [&](HW::SampleRegister r) -> const HW::SampleRegisterWord & {
+      return processor.GetCtx().GetSampleRegisterSnapshot().words[static_cast<size_t>(r)];
+    };
+    HW::Context uninitialized{};
+    Require("Pm4ContextState", "constructor provenance",
+            !uninitialized.GetSampleRegisterSnapshot().words[static_cast<size_t>(low)].valid,
+            "constructor invented a Reset event");
+    processor.GetCtx().Reset();
+    Require("Pm4ContextState", "Reset AA masks",
+            mask_word(low).valid && mask_word(high).valid && mask_word(low).reset_default &&
+                mask_word(high).reset_default && mask_word(low).value == UINT32_MAX &&
+                mask_word(high).value == UINT32_MAX && mask_word(low).sequence == 0 &&
+                processor.GetCtx().GetSampleRegisterSnapshot().sequence == 0,
+            "Reset lost programmed clear-state masks or mislabeled them as writes");
+    Require("Pm4ContextState", "Reset other words unknown",
+            !processor.GetCtx().GetSampleRegisterSnapshot().words[
+                static_cast<size_t>(HW::SampleRegister::SampleExclusionMask)].valid,
+            "Reset fabricated unrelated native register knowledge");
+    const std::array<uint32_t, 3> explicit_low{KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+                                             Pm4::PA_SC_AA_MASK_X0Y0_X1Y0, 0};
+    Pm4Execution write_execution;
+    Require("Pm4ContextState", "direct zero mask",
+            processor.Process(write_execution, explicit_low) == Pm4ProcessResult::Complete &&
+                mask_word(low).valid && !mask_word(low).reset_default && mask_word(low).value == 0 &&
+                mask_word(low).sequence == 1 && mask_word(high).reset_default,
+            "accepted zero mask was replaced with a guessed default");
+    Require("Pm4ContextState", "push provenance", invoke(ContextStateOperation::Push) == Pm4ProcessResult::Complete,
+            "could not save mask provenance");
+    g_hw_ctx_indirect_func[Pm4::PA_SC_AA_MASK_X0Y1_X1Y1](processor, Pm4::PA_SC_AA_MASK_X0Y1_X1Y1, 0x00ffffffu);
+    Require("Pm4ContextState", "indirect partial mask", !mask_word(high).reset_default &&
+                mask_word(high).value == 0x00ffffffu && mask_word(high).sequence == 2,
+            "indirect partial mask lost observed-write provenance");
+    Require("Pm4ContextState", "pop provenance", invoke(ContextStateOperation::Pop) == Pm4ProcessResult::Complete &&
+                !mask_word(low).reset_default && mask_word(low).value == 0 &&
+                mask_word(low).sequence == 1 && mask_word(high).reset_default && mask_word(high).sequence == 0,
+            "Pop did not restore saved values and distinct origins");
+    Require("Pm4ContextState", "Clear provenance", invoke(ContextStateOperation::Clear) == Pm4ProcessResult::Complete &&
+                mask_word(low).reset_default && mask_word(high).reset_default && mask_word(low).value == UINT32_MAX,
+            "Clear failed to restore mask reset contract");
+  }
+
   // CLEAR_STATE restores the viewport, scissor, and guard-band register defaults.
   processor.GetCtx().SetScreenScissor(1, 2, 3, 4);
   processor.GetCtx().SetGuardBands(2.0f, 3.0f, 4.0f, 5.0f);
@@ -44306,6 +44426,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--rewind-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--eqaa-color-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
+    vulkan.CheckRasterization(false, Prospero::BufferFormat::k32_32_32_32Float, true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {

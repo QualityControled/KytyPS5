@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/eqaaDepthState.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -94,8 +95,9 @@ static void PrintUnsupportedColorSamples(const CommandBuffer& buffer, uint32_t s
 	for (size_t i = 0; i < raw.words.size(); ++i) {
 		const auto& word = raw.words[i];
 		std::printf("SampleRegister name=%s value=0x%08x valid=%u last_selected_write=%" PRIu64
-		            "\n",
-		            raw_names[i], word.value, static_cast<unsigned>(word.valid), word.sequence);
+		            " origin=%s\n",
+		            raw_names[i], word.value, static_cast<unsigned>(word.valid), word.sequence,
+		            !word.valid ? "unobserved" : word.reset_default ? "reset_default" : "observed_write");
 	}
 	std::printf("ColorSampleDiagnostic draw_debug_tuple=private_unavailable\n");
 	for (uint32_t i = 0; i < 8; ++i) {
@@ -411,6 +413,7 @@ DecideReducedEqaa2xForDraw(const CommandBuffer& buffer, uint32_t slot,
 	in.encoded_coverage_samples  = hw.GetRenderTarget(slot).attrib.num_samples;
 	in.encoded_color_fragments   = hw.GetRenderTarget(slot).attrib.num_fragments;
 	in.encoded_depth_samples     = hw.GetDepthRenderTarget().z_info.num_samples;
+	in.depth_attachment_absent   = IsReducedEqaaDepthAbsent(hw);
 	in.aa_mask_low  = raw.words[static_cast<size_t>(HW::SampleRegister::AaMaskX0Y0X1Y0)].value;
 	in.aa_mask_high = raw.words[static_cast<size_t>(HW::SampleRegister::AaMaskX0Y1X1Y1)].value;
 	in.sample_exclusion =
@@ -487,9 +490,10 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		r.experimental_reduced_eqaa_2x = true;
 		if (print_snapshot) {
 			std::printf("ExperimentalEqaa2x admitted slot=%u requested_coverage=4 native_color=2 "
-			            "native_depth=2 raster_samples=2 approximation=1 initial_contents=unknown "
+			            "native_depth=%u depth_absent=%u raster_samples=2 approximation=1 initial_contents=unknown "
 			            "guest_metadata_unchanged=1 stencil_blend_preserved=1\n",
-			            rt_slot);
+			            rt_slot, IsReducedEqaaDepthAbsent(hw) ? 0u : 2u,
+			            static_cast<unsigned>(IsReducedEqaaDepthAbsent(hw)));
 			std::fflush(stdout);
 		}
 	}

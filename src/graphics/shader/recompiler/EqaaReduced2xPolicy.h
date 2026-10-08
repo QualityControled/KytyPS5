@@ -18,6 +18,8 @@ struct ReducedEqaa2xInputs {
 	uint32_t encoded_coverage_samples = UINT32_MAX;
 	uint32_t encoded_color_fragments = UINT32_MAX;
 	uint32_t encoded_depth_samples = UINT32_MAX;
+	// Set only after verifying exact inactive AND unbound native depth/stencil state.
+	bool depth_attachment_absent = false;
 	uint32_t aa_mask_low = 0;
 	uint32_t aa_mask_high = 0;
 	uint32_t sample_exclusion = UINT32_MAX;
@@ -37,7 +39,7 @@ enum class ReducedEqaa2xDecision {
 inline const char* ReducedEqaa2xDecisionName(ReducedEqaa2xDecision value) {
 	switch (value) {
 	case ReducedEqaa2xDecision::Disabled: return "disabled";
-	case ReducedEqaa2xDecision::WrongCounts: return "profile_requires_4coverage_2color_2depth";
+	case ReducedEqaa2xDecision::WrongCounts: return "profile_requires_4coverage_2color_and_2depth_or_exact_absence";
 	case ReducedEqaa2xDecision::MissingRawState: return "raw_sample_state_incomplete";
 	case ReducedEqaa2xDecision::NonFullMask: return "sample_mask_or_exclusion_sensitive";
 	case ReducedEqaa2xDecision::AlphaToCoverage: return "alpha_to_coverage_enabled";
@@ -51,12 +53,15 @@ inline const char* ReducedEqaa2xDecisionName(ReducedEqaa2xDecision value) {
 
 // This is a bounded visual-quality approximation, not a native EQAA mapping.
 // It deliberately does not infer initialized physical samples from metadata.
-// The caller must retain native 2-sample color/depth/stencil layouts and operations,
+// The caller must retain native 2-sample color and any bound depth/stencil layouts and operations,
 // guest metadata, all ordinary format/view guards, and separate pipeline/cache identity.
 inline ReducedEqaa2xDecision ClassifyReducedEqaa2x(const ReducedEqaa2xInputs& in) {
 	if (!in.requested) return ReducedEqaa2xDecision::Disabled;
+	const bool depth_count_valid =
+	    (!in.depth_attachment_absent && in.encoded_depth_samples == 1) ||
+	    (in.depth_attachment_absent && in.encoded_depth_samples == 0);
 	if (in.encoded_coverage_samples != 2 || in.encoded_color_fragments != 1 ||
-	    in.encoded_depth_samples != 1) return ReducedEqaa2xDecision::WrongCounts;
+	    !depth_count_valid) return ReducedEqaa2xDecision::WrongCounts;
 	if (!in.raw_sample_state_complete) return ReducedEqaa2xDecision::MissingRawState;
 	if (in.aa_mask_low != UINT32_MAX || in.aa_mask_high != UINT32_MAX || in.sample_exclusion != 0)
 		return ReducedEqaa2xDecision::NonFullMask;

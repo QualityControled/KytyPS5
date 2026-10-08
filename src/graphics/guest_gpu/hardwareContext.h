@@ -629,9 +629,10 @@ struct GeUserVgprEn {
 	bool vgpr3 = false;
 };
 
-// Diagnostic state only. These are selected accepted register writes observed
-// while graphics debug dumping is enabled, not GPU timestamps or all-register
-// chronology. Context copies/restores preserve this snapshot; Reset clears it.
+// Selected accepted sample-register writes are retained by the diagnostic/EQAA
+// profiles. Reset seeds only the two AA masks from the programmed AMD GFX10
+// clear-state contract; these defaults have distinct provenance and sequence zero.
+// This is not GPU timing or all-register chronology. Copy/restore preserves origin.
 enum class SampleRegister : uint8_t {
 	DepthZInfo,
 	Eqaa,
@@ -657,11 +658,19 @@ struct SampleRegisterWord {
 	uint32_t value    = 0;
 	uint64_t sequence = 0;
 	bool     valid    = false;
+	bool     reset_default = false;
 };
 
 struct SampleRegisterSnapshot {
 	uint64_t                                                                   sequence = 0;
 	std::array<SampleRegisterWord, static_cast<size_t>(SampleRegister::Count)> words {};
+
+	void SeedResetDefaults() {
+		// Architecture-derived programmed clear state, not an observed guest write.
+		// Do not seed other registers or retroactively relabel an existing snapshot.
+		words[static_cast<size_t>(SampleRegister::AaMaskX0Y0X1Y0)] = {UINT32_MAX, 0, true, true};
+		words[static_cast<size_t>(SampleRegister::AaMaskX0Y1X1Y1)] = {UINT32_MAX, 0, true, true};
+	}
 
 	void Record(SampleRegister reg, uint32_t value) {
 		const auto index = static_cast<size_t>(reg);
@@ -673,7 +682,7 @@ struct SampleRegisterSnapshot {
 		if (sequence != UINT64_MAX) {
 			++sequence;
 		}
-		words[index] = {value, sequence, true};
+		words[index] = {value, sequence, true, false};
 	}
 };
 
@@ -684,7 +693,10 @@ public:
 
 	KYTY_CLASS_DEFAULT_COPY(Context);
 
-	void Reset() { *this = Context(); }
+	void Reset() {
+		*this = Context();
+		m_sample_register_snapshot.SeedResetDefaults();
+	}
 
 	void RecordSampleRegister(SampleRegister reg, uint32_t value) {
 		m_sample_register_snapshot.Record(reg, value);

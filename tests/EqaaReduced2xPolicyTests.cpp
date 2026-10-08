@@ -32,6 +32,16 @@ int main() {
 			in = base; in.*field = 3;
 			Check(D::ClassifyReducedEqaa2x(in) == Decision::WrongCounts, "other sample profile admitted");
 		}
+		in = base; in.encoded_depth_samples = 0;
+		Check(D::ClassifyReducedEqaa2x(in) == Decision::WrongCounts, "unproven absent depth admitted");
+		in.depth_attachment_absent = true;
+		Check(D::ClassifyReducedEqaa2x(in) == Decision::AdmitApproximation, "exact color-only profile refused");
+		in.encoded_depth_samples = 1;
+		Check(D::ClassifyReducedEqaa2x(in) == Decision::WrongCounts, "absence mixed with bound depth admitted");
+		in.encoded_depth_samples = 0; in.raw_sample_state_complete = false;
+		Check(D::ClassifyReducedEqaa2x(in) == Decision::MissingRawState, "color-only missing raw state admitted");
+		in = base; in.encoded_depth_samples = 0; in.depth_attachment_absent = true; in.aa_mask_low = 0;
+		Check(D::ClassifyReducedEqaa2x(in) == Decision::NonFullMask, "color-only partial mask admitted");
 		in = base; in.raw_sample_state_complete = false;
 		Check(D::ClassifyReducedEqaa2x(in) == Decision::MissingRawState, "missing raw state admitted");
 		for (uint32_t D::ReducedEqaa2xInputs::* field : {&D::ReducedEqaa2xInputs::aa_mask_low,
@@ -76,7 +86,7 @@ int main() {
 		}
 		Check(plain == IR::PixelSampleSensitivity {.captured = true, .complete = true},
 		      "admission modified original sensitivity metadata");
-		std::puts("PASS 31 reduced-2x classifier checks (declared approximation, no Vulkan/GPU)");
+		std::puts("PASS 36 reduced-2x classifier checks (declared approximation, no Vulkan/GPU)");
 		return 0;
 	} catch (const std::exception& e) {
 		std::fprintf(stderr, "FAIL: %s\n", e.what());

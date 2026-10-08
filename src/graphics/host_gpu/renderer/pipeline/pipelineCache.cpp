@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/SelectedCalleeCapture.h"
 #include "graphics/shader/recompiler/PixelSampleSensitivity.h"
 #include "graphics/shader/recompiler/EqaaReduced2xPolicy.h"
+#include "graphics/host_gpu/renderer/eqaaDepthState.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/SrtReadCapture.h"
@@ -1326,7 +1327,7 @@ void PipelineCache::InitializeDriverCache() {
 	        fmt::format("-external-vgpr{}.bin", checked_vgpr) : std::string(".bin");
 	if (ShaderRecompiler::Diagnostics::EqaaReduced2xRequested()) {
 		cache_suffix.resize(cache_suffix.size() - std::string_view(".bin").size());
-		cache_suffix += "-experimental-eqaa2x-v2-facts.bin";
+		cache_suffix += "-experimental-eqaa2x-v3-depth-absence.bin";
 	}
 	m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + cache_suffix);
 	const auto path         = Common::PathToString(m_driver_cache_path);
@@ -1615,7 +1616,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto slot = colors[i].target_slot;
-		if (colors[i].experimental_reduced_eqaa_2x) key.experimental_eqaa_policy = 1;
+		if (colors[i].experimental_reduced_eqaa_2x) key.experimental_eqaa_policy = 2;
 		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
 		rendering.color_count = std::max(rendering.color_count, slot + 1);
 		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
@@ -1711,7 +1712,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	if (key.experimental_eqaa_policy != 0) {
 		EXIT_IF(!ShaderRecompiler::Diagnostics::EqaaReduced2xRequested() ||
-		        attachment_samples != 2 || !with_depth || depth.desc.info.samples != 2 ||
+		        attachment_samples != 2 ||
+		        (with_depth ? depth.desc.info.samples != 2
+		                    : !ShaderRecompiler::Diagnostics::IsReducedEqaaDepthAbsent(ctx)) ||
 		        !ps_active || ps_input_info == nullptr || ps_input_info->ps_sample_shading);
 	}
 
