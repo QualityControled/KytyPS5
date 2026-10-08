@@ -1349,6 +1349,7 @@ struct TestCase {
   uint64_t shader_hash = 0;
   bool external_call_probe = false;
   bool external_probe_before_bvh = false;
+  bool external_probe_structured = false;
   uint32_t external_unwritten_vgpr = UINT32_MAX;
 };
 
@@ -1627,6 +1628,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   options.shader_hash = test.shader_hash;
   options.external_call_probe = test.external_call_probe;
   options.external_probe_before_bvh = test.external_probe_before_bvh;
+  options.external_probe_structured = test.external_probe_structured;
   options.external_unwritten_vgpr = test.external_unwritten_vgpr;
 
   if (test.has_compute_info) {
@@ -34496,7 +34498,7 @@ void CheckExternalDispatcherWordBounds() {
   }
 }
 
-void CheckExternalCallProbe(VulkanHarness &vulkan, bool incomplete_workgroup = false) {
+void CheckExternalCallProbe(VulkanHarness &vulkan, bool incomplete_workgroup = false, bool structured = false) {
   using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
   constexpr uint64_t caller_address = 0x234abc8000ull;
   constexpr uint64_t address_a = 0x1300100000ull;
@@ -34517,6 +34519,7 @@ void CheckExternalCallProbe(VulkanHarness &vulkan, bool incomplete_workgroup = f
                     : distinct_return ? "ExternalProbeDistinctReturn" : "ExternalProbeAliasedReturn";
         test.has_user_data = true;
         test.external_call_probe = true;
+        test.external_probe_structured = structured;
         test.user_data = MakeNativeUserData(nullptr);
         test.initial.assign(128u, untouched);
         test.user_data[2] = static_cast<u32>(test.initial.size() * sizeof(u32));
@@ -34601,6 +34604,8 @@ void CheckExternalCallProbe(VulkanHarness &vulkan, bool incomplete_workgroup = f
         library.call_sites.push_back(std::move(site));
         test.external_library = &library;
         auto compiled = CompileCase(test, vulkan.SubgroupSize());
+        Require(test.name, "native probe requested lowering", compiled.program.dispatcher_fallback != structured,
+                "native probe did not use its requested dispatcher/structured path");
         Require(test.name, "dedicated probe variant",
                 compiled.program.info.uses_external_call_probe && compiled.program.info.uses_external_call_fault &&
                 ShaderRecompiler::IR::FindBinding(compiled.program.bindings, Kind::ShaderCallFaultBuffer) != nullptr,
@@ -34618,8 +34623,8 @@ void CheckExternalCallProbe(VulkanHarness &vulkan, bool incomplete_workgroup = f
           RuntimeWord(11, zero_exec ? 0u : 0x55aa55aau, wave_size == 64u);
           RuntimeWord(12, no_call ? 0u : 1u);
           const std::vector<u32> event_initial = prior_event
-              ? std::vector<u32>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-              : std::vector<u32>(16u, 0u);
+              ? std::vector<u32>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
+              : std::vector<u32>(32u, 0u);
           auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
           auto event = vulkan.CreateStorageBuffer(test.name, event_initial, event_initial.size());
           vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, &event);
@@ -34627,7 +34632,7 @@ void CheckExternalCallProbe(VulkanHarness &vulkan, bool incomplete_workgroup = f
           if (no_call) for (u32 lane = 0; lane < wave_size; ++lane) expected_output[lane] = lane + 7u;
           CompareWords(test, "selected call stops; no-call path remains exact", expected_output,
                        vulkan.ReadBuffer(test.name, output, expected_output.size()));
-          std::vector<u32> expected_event(16u, 0u);
+          std::vector<u32> expected_event(32u, 0u);
           if (prior_event) expected_event = event_initial;
           else if (!no_call) {
             const auto target = record == 0u ? address_a : address_b;
@@ -34641,7 +34646,8 @@ void CheckExternalCallProbe(VulkanHarness &vulkan, bool incomplete_workgroup = f
                 static_cast<u32>(auxiliary), static_cast<u32>(auxiliary >> 32u),
                 0u, 32u};
           }
-          const auto actual_event = vulkan.ReadBuffer(test.name, event, 16u);
+          expected_event.resize(32u, 0u);
+          const auto actual_event = vulkan.ReadBuffer(test.name, event, 32u);
           std::printf("ExternalProbeGPU: wave=%u distinct_return=%u record=%u exec_zero=%u no_call=%u prior=%u mismatch=%u kind=%u\n",
                       wave_size, distinct_return, record, zero_exec, no_call, prior_event,
                       actual_event[14], actual_event[1]);
@@ -34666,14 +34672,14 @@ void CheckExternalCallProbe(VulkanHarness &vulkan, bool incomplete_workgroup = f
                         ShaderRecompiler::IR::FindBinding(static_compiled.program.bindings, Kind::ShaderCallFaultBuffer) != nullptr,
                     "statically pruned call removed the entry diagnostic guard channel");
             auto output = vulkan.CreateStorageBuffer(static_test.name, static_test.initial, static_test.initial.size());
-            auto event = vulkan.CreateStorageBuffer(static_test.name, std::vector<u32>(16u, 0u), 16u);
+            auto event = vulkan.CreateStorageBuffer(static_test.name, std::vector<u32>(32u, 0u), 32u);
             vulkan.Dispatch(static_test, static_compiled, output, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, &event);
             auto expected = static_test.initial;
             for (u32 lane = 0; lane < wave_size; ++lane) expected[lane] = lane + 7u;
             CompareWords(static_test, "statically no-call output", expected,
                          vulkan.ReadBuffer(static_test.name, output, expected.size()));
-            CompareWords(static_test, "statically no-call has no selected event", std::vector<u32>(16u, 0u),
-                         vulkan.ReadBuffer(static_test.name, event, 16u));
+            CompareWords(static_test, "statically no-call has no selected event", std::vector<u32>(32u, 0u),
+                         vulkan.ReadBuffer(static_test.name, event, 32u));
             vulkan.DestroyBuffer(&output);
             vulkan.DestroyBuffer(&event);
             ++cases;
@@ -34729,16 +34735,17 @@ void CheckExternalProbeMismatch(VulkanHarness &vulkan) {
     compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &test.compute_info});
     ValidateSpirv(test.name, compiled.spirv);
     auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
-    auto fault = vulkan.CreateStorageBuffer(test.name, std::vector<u32>(16u, 0u), 16u);
+    auto fault = vulkan.CreateStorageBuffer(test.name, std::vector<u32>(32u, 0u), 32u);
     vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, &fault);
     CompareWords(test, "synthetic mismatch performs no guest writes", test.initial,
                  vulkan.ReadBuffer(test.name, output, test.initial.size()));
-    const auto event = vulkan.ReadBuffer(test.name, fault, 16u);
+    const auto event = vulkan.ReadBuffer(test.name, fault, 32u);
     const u32 winner = event[8];
     Require(test.name, "CAS winner ordinal", wave == 64u ? winner == 0u : winner < 32u,
             "diagnostic winner did not come from a valid physical lane");
-    const std::vector<u32> expected {1u,3u,0x00100000u,0x13u,0x4abc8024u,0x23u,
+    std::vector<u32> expected {1u,3u,0x00100000u,0x13u,0x4abc8024u,0x23u,
         0x76543210u,0xfedcba98u,winner,11u,0u,0u,0x200300u,0x12u+winner,1u,32u};
+    expected.resize(32u, 0u);
     CompareWords(test, "physical scalar or virtual-half mismatch reported", expected, event);
     vulkan.DestroyBuffer(&output);
     vulkan.DestroyBuffer(&fault);
@@ -34859,6 +34866,276 @@ void CheckExternalBeforeBvhProbe(VulkanHarness &vulkan) {
     }
   }
   std::printf("BeforeBvhProbe: %zu GPU cases passed (32word same-winner raw ray/width/schema, active winner/full EXEC, narrow/wide raw nodes, unmapped node memory, visible suffix, CAS)\n",cases);
+}
+
+// Work-only native/frontend coverage. Never reads any captured/live guest page.
+// All device output/fault buffers are owned by the existing bounded harness.
+struct NativeStructuredBvhFixture {
+  TestCase test;
+  ShaderRecompiler::ExternalLibraryPlan library;
+  u32 bvh_pc = 0;
+  u32 call_pc = 0;
+  u32 node_words = 1;
+};
+
+void CheckStructuredMetadataIsolation() {
+  namespace CFG=ShaderRecompiler::CFG;
+  namespace Decoder=ShaderRecompiler::Decoder;
+  const std::vector<u32> words{EncodeSopc(0x06u,8u,InlineU32(0u)),EncodeSopp(0x04u,2u),
+      EncodeSMovB32(20u,InlineU32(4u)),EncodeSopp(0x02u,1u),EncodeSMovB32(20u,InlineU32(9u)),0xbf810000u};
+  Decoder::Program decoded; Decoder::DecodeProgram(words,decoded);
+  auto normal=CFG::BuildGraph(decoded);
+  auto linked_metadata=normal;
+  linked_metadata.external_library=true; // Public Graph field, no probe tag.
+  const auto expected=CFG::Structurize(normal);
+  const auto actual=CFG::Structurize(linked_metadata);
+  Require("StructuredMetadataIsolation","nonprobe external metadata",
+      !actual.unsupported && !actual.external_library &&
+          CFG::GraphToString(actual)==CFG::GraphToString(expected),
+      "candidate changed the ordinary nonprobe Structurize analysis path");
+  for (const auto &target:actual.blocks) for (const auto &dominator:actual.blocks) {
+    bool reaches=false;
+    std::vector<u32> work{actual.entry_block}; std::set<u32> visited;
+    while (!work.empty()) {
+      const auto id=work.back(); work.pop_back();
+      if (id==dominator.id || !visited.insert(id).second) continue;
+      if (id==target.id) { reaches=true; break; }
+      const auto *block=actual.FindBlock(id);
+      if (block) work.insert(work.end(),block->successors.begin(),block->successors.end());
+    }
+    Require("StructuredMetadataIsolation","independent path-removal dominance",
+        actual.Dominates(dominator.id,target.id)==!reaches,
+        "retained ordinary dominance differs from independent graph reachability");
+  }
+  std::printf("StructuredMetadataIsolation PASS: nonprobe graph bytes/analysis unchanged; %zu blocks independent dominance\n",actual.blocks.size());
+}
+
+NativeStructuredBvhFixture MakeNativeStructuredBvh(u32 wave, u32 node_words,
+                                                   bool structured) {
+  constexpr uint64_t Caller = 0x334abc0000ull;
+  constexpr uint64_t Target = 0x1300100000ull;
+  constexpr uint64_t Auxiliary = 0x1200200300ull;
+  NativeStructuredBvhFixture fixture;
+  auto &test = fixture.test;
+  test.name = structured ? "NativeStructuredBeforeBvh" : "NativeDispatcherBeforeBvh";
+  test.has_user_data = true;
+  test.user_data = MakeNativeUserData(nullptr);
+  test.initial.assign(0x4000u / sizeof(u32), 0xdedededeu);
+  test.user_data[2] = u32(test.initial.size() * sizeof(u32));
+  // AppendBufferStoreDword uses s48..s51, not s0..s3. Keep its authored
+  // descriptor extent equal to the bounded owned page rather than the legacy
+  // harness default1MiB range.
+  test.user_data[50] = u32(test.initial.size() * sizeof(u32));
+  test.user_data[4] = 0x80u;
+  test.user_data[5] = 16u << 16u;
+  test.user_data[6] = 1u;
+  test.user_data[7] = 0u;
+  test.user_data[8] = 0u;
+  test.user_data[10] = wave == 32u ? 0x80000000u : 0u;
+  test.user_data[11] = wave == 64u ? 0x80000000u : 0u;
+  test.user_data[12] = 1u;
+  // Harness requires one explicit BDA backing: this unrelated owned page never
+  // covers the synthetic BVH descriptor address or any captured guest address.
+  test.bda_mappings = {{0x00400000ull, 0u}};
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.host_subgroup_size = 32u;
+  test.compute_info.threads_num[0] = wave;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1u;
+  test.compute_info.lds_size_dwords = test.compute_info.scratch_size_dwords = 0u;
+  test.shader_hash = 0xfedcba9876543210ull;
+  test.external_call_probe = true;
+  test.external_probe_before_bvh = true;
+  test.external_probe_structured = structured;
+  test.required_spirv = {"bvh_intersect"};
+  test.initial[0x80u / 4u] = u32(Target);
+  test.initial[0x80u / 4u + 1u] = u32(Target >> 32u);
+  test.initial[0x80u / 4u + 2u] = u32(Auxiliary);
+  test.initial[0x80u / 4u + 3u] = u32(Auxiliary >> 32u);
+  auto &code = test.code;
+  // A bounded native scalar loop is live on both call/no-call paths. Its exact
+  // trip count is observed by the no-call suffix, independent of probe results.
+  code.push_back(EncodeSMovB32(24u, InlineU32(0u)));
+  const u32 loop = u32(code.size());
+  code.push_back(EncodeSop2(0x00u, 24u, 24u, InlineU32(1u)));
+  code.push_back(EncodeSopc(0x0au, 24u, InlineU32(3u)));
+  code.push_back(EncodeSopp(0x05u, u32(loop - u32(code.size()) - 1u)));
+  // The descriptor deliberately names an unmapped synthetic address. A valid
+  // active probe must return before the retained ordinary BVH helper reads it.
+  AppendSMovLiteral(&code, 40u, 0x530000u);
+  AppendSMovLiteral(&code, 41u, 0x80000012u);
+  AppendSMovLiteral(&code, 42u, 0x5678u);
+  AppendSMovLiteral(&code, 43u, 0x81000000u);
+  AppendVMovLiteral(&code, 4u, 0x21u);
+  code.push_back(EncodeVop2(0x25u, 4u, Vgpr(0u), 4u));
+  const u32 ray_start = node_words == 1u ? 5u : 6u;
+  if (node_words == 2u) AppendVMovLiteral(&code, 5u, 1u);
+  for (u32 word = 0; word < 10u; ++word) {
+    AppendVMovLiteral(&code, ray_start + word, 0x3f800000u + word * 0x10000u);
+    code.push_back(EncodeVop2(0x25u, ray_start + word, Vgpr(0u), ray_start + word));
+  }
+  code.push_back(EncodeSMovB32(126u, 10u));
+  code.push_back(EncodeSMovB32(127u, 11u));
+  fixture.bvh_pc = u32(code.size() * 4u);
+  code.push_back(EncodeMimg0(node_words == 1u ? 0xe6u : 0xe7u, 15u, 0u, false, 0u, true));
+  code.push_back(EncodeMimg1(20u, 4u, 10u)); // sharp s40..43; output v20..23.
+  // Keep the ordinary helper and consumer genuinely live after the trap. With
+  // EXEC0 this store is predicated off; with an active lane the probe must stop
+  // before both the unmapped helper access and any output change.
+  AppendStoreVgprAtLaneDwordOffset(&code, 20u, 0u, 64u);
+  code.push_back(EncodeSopc(0x06u, 12u, InlineU32(0u)));
+  const u32 skip_call = u32(code.size());
+  code.push_back(0u);
+  const u32 load_pc = u32(code.size() * 4u);
+  code.push_back(EncodeSmem0(0x0au, 14u, 2u));
+  code.push_back(EncodeSmem1(0u, 8u));
+  fixture.call_pc = u32(code.size() * 4u);
+  code.push_back(EncodeSop1(0x21u, 14u, 14u)); // Real alias target/link pair.
+  // A continuation is deliberately visible and must never execute after the
+  // selected call, including EXEC0. This is separate from the no-call suffix.
+  code.push_back(EncodeSop1(0x04u, 126u, 193u));
+  AppendVMovLiteral(&code, 30u, 0xdeadbeefu);
+  AppendStoreVgprAtLaneDwordOffset(&code, 30u, 0u, 0u);
+  AppendEnd(&code);
+  const u32 suffix = u32(code.size());
+  code[skip_call] = EncodeSopp(0x05u, suffix - skip_call - 1u);
+  code.push_back(EncodeSop1(0x04u, 126u, 193u));
+  code.push_back(EncodeVop2(0x25u, 30u, 24u, 0u)); // scalar loop counter + v0.
+  AppendStoreVgprAtLaneDwordOffset(&code, 30u, 0u, 0u);
+  AppendEnd(&code);
+  fixture.node_words = node_words;
+  fixture.library.complete = true;
+  fixture.library.caller_address = Caller;
+  ShaderRecompiler::ExternalCallSite site;
+  site.caller_pc = fixture.call_pc;
+  site.target_sgpr = site.return_sgpr = site.record_sgpr = 14u;
+  site.record_load_pc = load_pc;
+  site.auxiliary_sgpr = 16u;
+  site.context_domain = 11u;
+  site.table_base = 0x80u;
+  site.table_bytes = 16u;
+  site.candidate_addresses = {Target};
+  site.records.push_back({0u, 0u, Target, Auxiliary});
+  site.context_records.push_back({0u, 0u, {u32(Target), u32(Target >> 32u),
+                                                u32(Auxiliary), u32(Auxiliary >> 32u)}});
+  fixture.library.call_sites.push_back(std::move(site));
+  return fixture;
+}
+
+void CheckNativeStructuredBvh(VulkanHarness *vulkan, bool structured) {
+  using namespace ShaderRecompiler::Diagnostics;
+  size_t cases = 0;
+  for (u32 wave : {32u, 64u}) for (u32 width : {1u, 2u}) {
+    auto fixture = MakeNativeStructuredBvh(wave, width, structured);
+    auto &test = fixture.test;
+    test.external_library = &fixture.library;
+    auto compiled = CompileCase(test, 32u);
+    const auto *buffers=ShaderRecompiler::IR::FindBinding(compiled.program.bindings,
+        ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
+    Require(test.name,"actual materialized buffer roots",buffers && buffers->resources.size()==2u,
+            "native fixture lost an output/table descriptor root");
+    std::set<u32> authored_offsets;
+    for (u32 slot=0;slot<buffers->resources.size();++slot) {
+      const auto resource=buffers->resources[slot];
+      Require(test.name,"materialized buffer index",resource<compiled.resources.buffers.size(),
+              "native buffer binding refers to an absent snapshot root");
+      const auto &descriptor=compiled.resources.buffers.at(resource);
+      const u32 offset=descriptor.dwords[0];
+      const uint64_t stride=(descriptor.dwords[1]>>16u)&0x3fffu;
+      const uint64_t bytes=uint64_t{descriptor.dwords[2]}*(stride==0u?1u:stride);
+      std::printf("NativeBufferRoot: slot=%u resource=%u count=%u words=%08x,%08x,%08x,%08x bytes=%llu backing=%zu\n",
+          slot,resource,descriptor.dword_count,descriptor.dwords[0],descriptor.dwords[1],descriptor.dwords[2],descriptor.dwords[3],
+          static_cast<unsigned long long>(bytes),test.initial.size()*sizeof(u32));
+      Require(test.name,"materialized descriptor offset",descriptor.dword_count==4u &&
+          (offset==0u || offset==0x80u) && (descriptor.dwords[1]&0xffffu)==0u &&
+          bytes>0u && uint64_t{offset}+bytes<=test.initial.size()*sizeof(u32) &&
+          authored_offsets.insert(offset).second,
+          "native buffer root does not name the authored output/table base");
+      auto &packed=compiled.packed_user_data[compiled.program.bindings.memory_offset_dword+slot/4u];
+      const u32 shift=(slot%4u)*8u;
+      packed=(packed&~(0xffu<<shift))|(offset<<shift);
+    }
+    Require(test.name,"unique exact owned buffer roots",authored_offsets==std::set<u32>{0u,0x80u},
+            "native output/table roots are missing or duplicated");
+    Require(test.name, "selected native lowering", compiled.program.dispatcher_fallback != structured,
+            "native fixture did not use its requested CFG lowering");
+    size_t bvh_tags = 0u, call_tags = 0u;
+    for (const auto *block : compiled.program.blocks) for (const auto &inst : block->Instructions()) {
+      if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::ExternalBvhProbe) {
+        ++bvh_tags;
+        Require(test.name, "true native BVH PC", inst.Flags<uint64_t>() == fixture.library.caller_address + fixture.bvh_pc,
+                "before-BVH tag moved away from its actual native instruction");
+      }
+      if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::ExternalCallProbe) {
+        ++call_tags;
+        Require(test.name, "true native call PC", inst.Flags<uint64_t>() == fixture.library.caller_address + fixture.call_pc,
+                "terminal call tag moved away from its actual native instruction");
+      }
+    }
+    Require(test.name, "retained native probe tags", bvh_tags == 1u && call_tags == 1u,
+            "native frontend dropped/duplicated a real BVH or call probe");
+    std::printf("NativeBeforeBvhPrepared: structured=%u wave=%u nodewords=%u words=%zu idbound=%u loop_trip_count=3\n",
+                structured, wave, width, compiled.spirv.size(), compiled.spirv[3]);
+    if (vulkan == nullptr) continue;
+    auto RuntimeWord = [&](u32 reg, u32 value) {
+      const auto found = std::ranges::find(compiled.program.bindings.user_data_registers, reg);
+      Require(test.name, "live native control", found != compiled.program.bindings.user_data_registers.end(),
+              "native control was replaced with a host constant");
+      compiled.packed_user_data[found - compiled.program.bindings.user_data_registers.begin()] = value;
+    };
+    for (u32 variant = 0; variant < 4u; ++variant) {
+      const bool active = variant == 0u || variant == 3u;
+      const bool no_call = variant == 2u;
+      const bool prior_event = variant == 3u;
+      RuntimeWord(10u, active && wave == 32u ? 0x80000000u : 0u);
+      if (wave == 64u) RuntimeWord(11u, active ? 0x80000000u : 0u);
+      RuntimeWord(12u, no_call ? 0u : 1u);
+      std::vector<u32> prior(BvhDiagnosticWords, 0u);
+      if (prior_event) for (u32 i=0;i<BvhDiagnosticWords;++i) prior[i] = i+1u;
+      auto output = vulkan->CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+      auto fault = vulkan->CreateStorageBuffer(test.name, prior, prior.size());
+      vulkan->Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, &fault);
+      auto expected_output = test.initial;
+      if (no_call) for (u32 lane=0;lane<wave;++lane) expected_output[lane]=lane+3u;
+      CompareWords(test, "native BVH/call stops; bounded-loop no-call suffix exact", expected_output,
+                   vulkan->ReadBuffer(test.name, output, expected_output.size()));
+      const auto event = vulkan->ReadBuffer(test.name, fault, BvhDiagnosticWords);
+      std::vector<u32> expected(BvhDiagnosticWords, 0u);
+      if (prior_event) expected = prior;
+      else if (active) {
+        const u32 lane = wave-1u;
+        const uint64_t node = uint64_t{0x21u+lane} | (width==2u ? uint64_t{1}<<32u : 0u);
+        const uint64_t address = ((uint64_t{0x12u}<<32u) | 0x530000u)*256u + (node>>3u)*64u;
+        const uint64_t pc = fixture.library.caller_address+fixture.bvh_pc;
+        expected = {1u,7u,u32(address),u32(address>>32u),u32(pc),u32(pc>>32u),
+                    0x76543210u,0xfedcba98u,0x530000u,0x80000012u,0x5678u,0x81000000u,
+                    0x21u+lane,width==2u?1u:0u,wave==32u?0x80000000u:0u,wave==64u?0x80000000u:0u};
+        for (u32 word=0;word<10u;++word) expected.push_back(0x3f800000u+word*0x10000u+lane);
+        expected.insert(expected.end(),{width,lane,BvhSchemaMagic,BvhSchemaVersion,0u,0u});
+        Require(test.name,"same native active sidecar winner",ValidBvhRaySidecar(event),"invalid native ray sidecar");
+      } else if (!no_call) {
+        const uint64_t pc=fixture.library.caller_address+fixture.call_pc;
+        const std::array<u32,16> first{1u,3u,0x00100000u,0x13u,u32(pc),u32(pc>>32u),
+            0x76543210u,0xfedcba98u,0u,11u,0u,0u,0x00200300u,0x12u,0u,32u};
+        std::copy(first.begin(),first.end(),expected.begin());
+      }
+      CompareWords(test,"native frontend exact 32word fault/CAS/EXEC tuple",expected,event);
+      vulkan->DestroyBuffer(&output); vulkan->DestroyBuffer(&fault); ++cases;
+      std::printf("NativeBeforeBvhGPU: structured=%u wave=%u width=%u active=%u no_call=%u prior=%u kind=%u PASS\n",
+                  structured,wave,width,active,no_call,prior_event,event[1]);
+    }
+  }
+  if (vulkan) std::printf("NativeBeforeBvh: %zu GPU cases passed structured=%u (native loop, EXEC0/highhalf, BVH-before-call, alias, no-call, full32 CAS)\n",cases,structured);
+}
+
+void CheckStructuredProbeOrdinary(VulkanHarness &vulkan) {
+  RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32u,32u));
+  RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64u,64u));
+  RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32u,4u));
+  RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64u,4u));
+  RunCase(&vulkan, SimpleLoop());
+  std::puts("StructuredProbeOrdinary: 5 GPU cases passed (normal full/partial wave scalar EXEC restoration and bounded loop)");
 }
 
 void CheckCheckedCallScalarInputs(VulkanHarness &vulkan) {
@@ -43164,7 +43441,31 @@ int main(int argc, char **argv) {
                "capture-folder and function-limit; malformed captured requests never start the GPU suite\n", stderr);
     return 2;
   }
-  EnsureConfigInitialized(!captured_translation_only && !dispatcher_determinism);
+  const bool structured_prepare=argc==2 && std::strcmp(argv[1],"--structured-probe-prepare-only")==0;
+  const bool structured_without_probe=argc==2 && std::strcmp(argv[1],"--reject-structured-without-probe")==0;
+  const bool structured_barrier=argc==2 && std::strcmp(argv[1],"--reject-structured-with-barrier")==0;
+  EnsureConfigInitialized(!captured_translation_only && !dispatcher_determinism &&
+                          !structured_prepare && !structured_without_probe && !structured_barrier);
+  if (structured_prepare) {
+    CheckStructuredMetadataIsolation();
+    CheckNativeStructuredBvh(nullptr,false);
+    CheckNativeStructuredBvh(nullptr,true);
+    std::puts("Structured probe native both-route default-SPIRV preparation PASS; no GPU execution");
+    return 0;
+  }
+  if (structured_without_probe) {
+    auto test=SimpleLoop();test.external_probe_structured=true;
+    (void)CompileCase(test,32u);
+    Fail(test.name,"structured option precondition","structured option accepted a normal shader");
+  }
+  if (structured_barrier) {
+    auto fixture=MakeNativeStructuredBvh(64u,1u,true);
+    fixture.test.code.insert(fixture.test.code.begin(),EncodeSopp(0x0au,0u));
+    auto &site=fixture.library.call_sites.front();site.caller_pc+=4u;site.record_load_pc+=4u;
+    fixture.test.external_library=&fixture.library;
+    (void)CompileCase(fixture.test,32u);
+    Fail(fixture.test.name,"native barrier precondition","probe accepted a native workgroup barrier");
+  }
   if (dispatcher_determinism) {
     CheckDispatcherDeterministicBytes();
     return 0;
@@ -43178,6 +43479,21 @@ int main(int argc, char **argv) {
     return 0;
   }
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc==2 && std::strcmp(argv[1],"--structured-call-probe-only")==0) {
+    VulkanHarness vulkan;
+    CheckExternalCallProbe(vulkan,false,true);
+    CheckExternalProbeMismatch(vulkan); // Direct-IR emitter cases, separate from native route coverage.
+    return 0;
+  }
+  if (argc==2 && (std::strcmp(argv[1],"--native-before-bvh-dispatcher-only")==0 ||
+                 std::strcmp(argv[1],"--native-before-bvh-structured-only")==0)) {
+    VulkanHarness vulkan;
+    CheckNativeStructuredBvh(&vulkan,std::strcmp(argv[1],"--native-before-bvh-structured-only")==0);
+    return 0;
+  }
+  if (argc==2 && std::strcmp(argv[1],"--structured-probe-ordinary-controls-only")==0) {
+    VulkanHarness vulkan;CheckStructuredProbeOrdinary(vulkan);return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--external-before-bvh-probe-only") == 0) {
     VulkanHarness vulkan;
     CheckExternalBeforeBvhProbe(vulkan);

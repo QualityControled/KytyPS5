@@ -64,6 +64,19 @@ bool ExternalBvhProbeRequested() {
 	return true;
 }
 
+bool ExternalStructuredProbeRequested() {
+	const auto* value = std::getenv("KYTY_PROBE_EXTERNAL_STRUCTURED");
+	if (value == nullptr) return false;
+	if (std::strcmp(value, "1") != 0 || !ExternalProbeRequested()) {
+		EXIT("KYTY_PROBE_EXTERNAL_STRUCTURED requires value 1 and the external-call probe\n");
+	}
+	const auto* capture = std::getenv("KYTY_CAPTURE_EXTERNAL_RESOURCE_READS");
+	if (capture != nullptr && std::strcmp(capture, "1") == 0) {
+		EXIT("Structured external probe and resource-read-only capture require separate runs\n");
+	}
+	return true;
+}
+
 uint32_t ExternalUnwrittenVgprRequested() {
 	const auto* value = std::getenv("KYTY_EXTERNAL_UNWRITTEN_VGPR");
 	if (value == nullptr) return std::numeric_limits<uint32_t>::max();
@@ -595,6 +608,7 @@ struct PipelineCache::ProgramCache {
 		uint32_t              code_size       = 0;
 		bool                  external_call_probe = false;
 		bool                  external_probe_before_bvh = false;
+		bool                  external_probe_structured = false;
 		uint32_t              external_unwritten_vgpr = std::numeric_limits<uint32_t>::max();
 		std::vector<uint32_t> static_state;
 		std::shared_ptr<const ShaderRecompiler::ExternalLibraryPlan> external_library;
@@ -604,6 +618,7 @@ struct PipelineCache::ProgramCache {
 			    code_size != other.code_size || static_state != other.static_state ||
 			    external_call_probe != other.external_call_probe ||
 			    external_probe_before_bvh != other.external_probe_before_bvh ||
+			    external_probe_structured != other.external_probe_structured ||
 			    external_unwritten_vgpr != other.external_unwritten_vgpr) return false;
 			if (external_library == other.external_library) return true;
 			if (!external_library || !other.external_library) return false;
@@ -643,6 +658,7 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.external_call_probe);
 			PipelineKeyHash::Mix(hash, key.external_probe_before_bvh);
+			PipelineKeyHash::Mix(hash, key.external_probe_structured);
 			PipelineKeyHash::Mix(hash, key.external_unwritten_vgpr);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
 			if (key.external_library) {
@@ -781,6 +797,7 @@ struct PipelineCache::ProgramCache {
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		const bool requested_bvh_probe = ExternalBvhProbeRequested();
+		const bool requested_structured_probe = ExternalStructuredProbeRequested();
 		const bool requested_resource_capture = ExternalResourceReadCaptureRequested();
 		const auto requested_checked_vgpr = ExternalUnwrittenVgprRequested();
 		lookup_key.stage           = stage;
@@ -791,6 +808,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.external_library.reset();
 		lookup_key.external_call_probe = false;
 		lookup_key.external_probe_before_bvh = false;
+		lookup_key.external_probe_structured = false;
 		lookup_key.external_unwritten_vgpr = std::numeric_limits<uint32_t>::max();
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			const bool could_call = std::ranges::any_of(params.code, [](uint32_t word) {
@@ -824,6 +842,7 @@ struct PipelineCache::ProgramCache {
 			if (could_call) lookup_key.external_library = LoadLibrary(params, user_data);
 			lookup_key.external_call_probe = lookup_key.external_library && ExternalProbeRequested();
 			lookup_key.external_probe_before_bvh = lookup_key.external_call_probe && requested_bvh_probe;
+			lookup_key.external_probe_structured = lookup_key.external_call_probe && requested_structured_probe;
 			if (lookup_key.external_library) {
 				lookup_key.external_unwritten_vgpr = requested_checked_vgpr;
 			}
@@ -963,6 +982,7 @@ struct PipelineCache::ProgramCache {
 		options.external_library = lookup_key.external_library.get();
 		options.external_call_probe = lookup_key.external_call_probe;
 		options.external_probe_before_bvh = lookup_key.external_probe_before_bvh;
+		options.external_probe_structured = lookup_key.external_probe_structured;
 		options.external_unwritten_vgpr = lookup_key.external_unwritten_vgpr;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -1079,6 +1099,7 @@ PipelineCache::~PipelineCache() {
 void PipelineCache::InitializeDriverCache() {
 	const auto checked_vgpr = ExternalUnwrittenVgprRequested();
 	const bool requested_bvh_probe = ExternalBvhProbeRequested();
+	const bool requested_structured_probe = ExternalStructuredProbeRequested();
 	const auto title_id = PipelineCacheTitleId();
 	if (title_id.empty()) {
 		return;
@@ -1098,7 +1119,10 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 
-	const auto cache_suffix = requested_bvh_probe ? std::string("-external-probe-bvh.bin") :
+	const auto cache_suffix = requested_structured_probe ?
+	    (requested_bvh_probe ? std::string("-external-probe-structured-bvh.bin") :
+	                           std::string("-external-probe-structured.bin")) :
+	    requested_bvh_probe ? std::string("-external-probe-bvh.bin") :
 	    ExternalProbeRequested() ? std::string("-external-probe.bin") :
 	    checked_vgpr != std::numeric_limits<uint32_t>::max() ?
 	        fmt::format("-external-vgpr{}.bin", checked_vgpr) : std::string(".bin");

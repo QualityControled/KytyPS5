@@ -31,6 +31,9 @@ struct CompileOptions {
 	// Diagnostic probe: capture the first active native BVH input and return
 	// before the intersection helper accesses guest memory.
 	bool                        external_probe_before_bvh = false;
+	// Opt-in caller-only probe lowering; retain dispatcher fallback on any CFG
+	// or exact call-metadata validation failure. Ordinary shaders are unchanged.
+	bool                        external_probe_structured = false;
 	// Strict coverage variant: only link leaf bodies proved not to write this
 	// VGPR. Every other target faults and ends its wave; the host must inspect
 	// the fault channel before any dispatch consumer is submitted.

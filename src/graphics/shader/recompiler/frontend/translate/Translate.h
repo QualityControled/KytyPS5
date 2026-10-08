@@ -33,6 +33,7 @@ struct TranslateOptions {
 	std::span<const ExternalFunctionEntry> external_entries;
 	bool external_call_probe = false;
 	bool external_probe_before_bvh = false;
+	bool external_probe_structured = false;
 	uint64_t external_caller_address = 0;
 	bool checked_external_calls = false;
 };

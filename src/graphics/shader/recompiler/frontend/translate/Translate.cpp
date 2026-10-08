@@ -1063,7 +1063,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			break;
 		default: break; // ValidateTranslateOptions rejects unsupported stages.
 	}
-	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported || options.external_call_probe;
+	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported ||
+	    (options.external_call_probe && !options.external_probe_structured);
 	result.cfg_failure_kind    = cfg.failure_kind;
 	result.fallback_reason     = cfg.unsupported_reason;
 	result.info.uses_external_call_fault = options.external_call_probe || std::ranges::any_of(cfg.blocks, [](const auto& block) {

@@ -1030,6 +1030,12 @@ public:
 	explicit GotoStructurizer(const Graph& source): m_source(source) {
 		m_graph.expressions = {{ExprOp::Constant, 0}, {ExprOp::Constant, 1}};
 		m_graph.code_table_load_pcs = source.code_table_load_pcs;
+		// Keep ordinary Structurize callers on their existing analysis path.
+		// Only the explicit terminal-probe graph needs external dominance here.
+		m_graph.external_library = source.external_library &&
+		    std::ranges::any_of(source.blocks, [](const BasicBlock& block) {
+			    return block.terminator.external_call_probe;
+		    });
 		m_root = New(Kind::Root);
 		std::vector<Node*> labels;
 		for (const auto& block: source.blocks) {
@@ -1393,6 +1399,17 @@ private:
 					}
 					block.end_pc = source.end_pc;
 					block.inst_end = source.inst_end;
+					if (source.terminator.external_call_probe) {
+						if (source.terminator.kind != TerminatorKind::Return ||
+						    !source.successors.empty()) {
+							Fail("external probe does not end at its exact native call boundary");
+							return UINT32_MAX;
+						}
+						// Code nodes retain their actual register/record/PC metadata.
+						// Kind::Return will keep this block terminal; no synthetic
+						// continuation is introduced for the diagnostic call.
+						block.terminator = source.terminator;
+					}
 					if (source.terminator.kind == TerminatorKind::ConditionalBranch) {
 						block.assignments.push_back({CaptureVariable(source.id),
 						    Expression(ExprOp::Native, static_cast<uint32_t>(source.terminator.condition))});
@@ -1790,7 +1807,71 @@ Graph Structurize(const Graph& graph) {
 		SetFailure(failed, graph.failure_kind, graph.failure_block, graph.unsupported_reason);
 		return failed;
 	}
-	return GotoStructurizer(graph).Run();
+	auto structured = GotoStructurizer(graph).Run();
+	if (structured.unsupported) return structured;
+	const auto reject_probe = [](uint32_t block, const char* reason) {
+		Graph failed;
+		SetFailure(failed, FailureKind::StructuredControlFlow, block, reason);
+		return failed;
+	};
+	const auto probe_count = [](const Graph& value) {
+		return std::ranges::count_if(value.blocks, [](const BasicBlock& block) {
+			return block.terminator.external_call_probe;
+		});
+	};
+	if (probe_count(graph) != probe_count(structured))
+		return reject_probe(UINT32_MAX, "structurization lost or duplicated an external probe tag");
+	for (const auto& source: graph.blocks) {
+		if (!source.terminator.external_call_probe) continue;
+		if (source.inst_begin == source.inst_end)
+			return reject_probe(source.id, "external probe has no native call instruction");
+		const auto call_index = source.inst_end - 1u;
+		if (std::ranges::count_if(structured.blocks, [call_index](const BasicBlock& block) {
+			return block.inst_begin <= call_index && call_index < block.inst_end;
+		}) != 1)
+			return reject_probe(source.id, "structured probe lost or duplicated its native call span");
+		const auto call = std::ranges::find_if(structured.blocks, [call_index](const BasicBlock& block) {
+			return block.inst_begin <= call_index && call_index < block.inst_end;
+		});
+		if (call == structured.blocks.end() || call->inst_end != source.inst_end ||
+		    call->terminator.kind != TerminatorKind::Return || !call->successors.empty())
+			return reject_probe(source.id, "structured probe moved beyond its exact native call boundary");
+		const auto& before = source.terminator;
+		const auto& after = call->terminator;
+		if (!after.external_call_probe || !after.external_transfer || !after.external_call ||
+		    after.external_checked_call ||
+		    after.external_guest_pc != before.external_guest_pc ||
+		    after.indirect_pc_sgpr != before.indirect_pc_sgpr ||
+		    after.external_return_sgpr != before.external_return_sgpr ||
+		    after.external_record_load_pc != before.external_record_load_pc ||
+		    after.external_auxiliary_sgpr != before.external_auxiliary_sgpr ||
+		    after.external_context_domain != before.external_context_domain ||
+		    after.external_link_address != before.external_link_address ||
+		    !after.indirect_guest_addresses.empty() || !after.indirect_target_pcs.empty() ||
+		    !after.indirect_targets.empty())
+			return reject_probe(source.id, "structured probe changed native call metadata");
+		const auto source_load = std::ranges::find_if(graph.blocks, [&before](const BasicBlock& block) {
+			return block.start_pc <= before.external_record_load_pc &&
+			       before.external_record_load_pc < block.end_pc;
+		});
+		if (source_load == graph.blocks.end() || source_load->inst_begin == source_load->inst_end)
+			return reject_probe(source.id, "structured probe lost the original record load");
+		if (std::ranges::count_if(structured.blocks, [&source_load](const BasicBlock& block) {
+			return block.inst_begin <= source_load->inst_begin &&
+			       block.inst_end >= source_load->inst_end;
+		}) != 1)
+			return reject_probe(source.id, "structured probe lost or duplicated its native record-load span");
+		const auto load = std::ranges::find_if(structured.blocks, [&source_load](const BasicBlock& block) {
+			return block.inst_begin <= source_load->inst_begin &&
+			       block.inst_end >= source_load->inst_end;
+		});
+		// Frontend emits blocks in this order and must have the load-time ordinal
+		// available before translating the call. Dominance is checked again after
+		// synthetic route blocks are built; lexical order alone is not a proof.
+		if (load == structured.blocks.end() || load > call || !structured.Dominates(load->id, call->id))
+			return reject_probe(source.id, "structured record load no longer dominates the actual probe");
+	}
+	return structured;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

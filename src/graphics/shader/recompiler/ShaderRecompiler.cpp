@@ -503,6 +503,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		EXIT("external call probe requires an explicit compute external-library plan");
 	if (options.external_probe_before_bvh && !options.external_call_probe)
 		EXIT("before-BVH diagnostic requires the explicit external call probe variant");
+	if (options.external_probe_structured && !options.external_call_probe)
+		EXIT("structured external probe requires the explicit caller-only diagnostic variant");
 	const bool checked_external = options.external_unwritten_vgpr != UINT32_MAX;
 	if (checked_external &&
 	    (options.external_library == nullptr || options.stage != ShaderType::Compute ||
@@ -606,9 +608,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     static_cast<uint64_t>(native_cfg.blocks.size()),
 	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
 	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
-	if (options.external_call_probe || checked_external) {
-		// Structurization may replace Return terminators with a common exit.
-		// Keep the exact native call boundary and use the existing dispatcher.
+	const bool structured_probe_eligible = options.external_probe_structured &&
+	    std::ranges::none_of(native_cfg.blocks, [](const CFG::BasicBlock& block) {
+		    return block.terminator.condition == CFG::BranchCondition::ScalarInstruction;
+	    });
+	if ((options.external_call_probe && !structured_probe_eligible) || checked_external) {
+		// Scalar subvector branches are outside this first structured-probe
+		// convergence proof. Retain the existing diagnostic dispatcher.
 		LogExternalPhase(options, "checked-cfg", phase_ms(), options.external_call_probe
 		    ? "caller-only diagnostic dispatcher" : "strict VGPR coverage dispatcher");
 	} else if (native_cfg.irreducible) {
@@ -658,6 +664,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .external_entries = external_program.entries,
 	    .external_call_probe = options.external_call_probe,
 	    .external_probe_before_bvh = options.external_probe_before_bvh,
+	    .external_probe_structured = structured_probe_eligible,
 	    .external_caller_address = options.external_library != nullptr
 	        ? options.external_library->caller_address : 0u,
 	    .checked_external_calls = checked_external,
