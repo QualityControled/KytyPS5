@@ -202,7 +202,10 @@ void RecordShaderCallFault(ValueEmitContext& ctx, uint32_t kind, uint32_t low, u
 	    ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash >> 32u))};
 	for (uint32_t i = 0; i < details.size(); ++i)
 		state.builder.AddFunction(spv::OpStore, pointer(i + 1u), details[i]);
-	if (extra.size() > 8u) Fail("external diagnostic exceeds the 64-byte record");
+	// The extended BVH probe adds a full ray tuple after the existing header.
+	// Other events retain their original eight extra DWORDs and write range.
+	if (extra.size() > 24u || (kind != 7u && extra.size() > 8u))
+		Fail("external diagnostic exceeds its record payload");
 	for (uint32_t i = 0; i < extra.size(); ++i)
 		state.builder.AddFunction(spv::OpStore, pointer(i + 8u), extra[i]);
 	state.builder.AddFunction(spv::OpBranch, merge_label);
@@ -1038,8 +1041,15 @@ void EmitProgram(EmitterState& state) {
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		if (state.lane_count == 2) {
-			for (const auto& [inst, id]: dispatch.spills[0]) {
-				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
+			// Pointer-keyed map iteration varies with IR allocation addresses. Use
+			// the same stable program order as the variable declarations so identical
+			// shaders retain identical IDs and bytes across fresh compilations.
+			for (const auto* block: program.blocks) {
+				for (const auto& inst: *block) {
+					if (dispatch.spills[0].contains(&inst)) {
+						dispatch.spills[1].emplace(&inst, state.builder.AllocateId());
+					}
+				}
 			}
 			high.dispatcher_spills = &dispatch.spills[1];
 		}

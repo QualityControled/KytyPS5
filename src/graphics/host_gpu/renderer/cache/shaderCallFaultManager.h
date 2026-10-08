@@ -3,8 +3,10 @@
 
 #include "common/abi.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/shader/recompiler/BvhDiagnosticRecord.h"
 
 #include <array>
+#include <optional>
 
 namespace Libs::Graphics {
 
@@ -19,7 +21,9 @@ public:
 private:
 	// First eight DWORDs retain the ordinary fault ABI; the probe adds ordinal,
 	// domain, full EXEC, auxiliary pointer, half agreement and subgroup width.
-	static constexpr uint64_t RecordSize = 16u * sizeof(uint32_t);
+	// Kind7 also preserves the winning ray tuple, native pointer width and wave lane.
+	static constexpr uint64_t RecordSize = ShaderRecompiler::Diagnostics::BvhDiagnosticWords * sizeof(uint32_t);
+	void FinalizeBvhCapture();
 	static constexpr size_t MaxPending = 8;
 	CommandScheduler& m_scheduler;
 	Buffer m_fault_buffer;
@@ -28,6 +32,7 @@ private:
 	std::array<uint64_t, MaxPending> m_ticks {};
 	uint32_t m_area = 0;
 	bool m_used = false;
+	std::optional<std::array<uint32_t, ShaderRecompiler::Diagnostics::BvhDiagnosticWords>> m_pending_bvh;
 };
 
 } // namespace Libs::Graphics

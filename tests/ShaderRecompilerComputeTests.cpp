@@ -37,6 +37,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ExternalLibrary.h"
+#include "graphics/shader/recompiler/BvhDiagnosticRecord.h"
 #include "CapturedExternalLibraryFixture.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
@@ -15214,7 +15215,8 @@ public:
             "external-call shaders require their dedicated fault channel");
     if (shader_call_fault != nullptr) {
       Require(test.name, "external call fault binding",
-              shader_call_fault->size == 16u * sizeof(u32) ||
+              shader_call_fault->size == 32u * sizeof(u32) ||
+                  (!compiled.program.info.uses_external_probe_before_bvh && shader_call_fault->size == 16u * sizeof(u32)) ||
                   (!compiled.program.info.uses_external_call_probe && shader_call_fault->size == 8u * sizeof(u32)),
               "dedicated fault channel size does not match the normal/probe shader variant");
       shader_call_fault_info = {shader_call_fault->buffer, 0, shader_call_fault->size};
@@ -34064,6 +34066,139 @@ void CheckCapturedExternalTranslation(const char *caller_path,
             "proof");
 }
 
+void CheckDispatcherDeterministicBytes() {
+  using namespace ShaderRecompiler::IR;
+  constexpr const char *name = "DispatcherDeterministicBytes";
+  constexpr size_t variants = 8;
+  constexpr size_t lanes_of_values = 16;
+  // Retain earlier IRs and heap blockers so fresh equivalent programs cannot
+  // obtain the same instruction addresses just by allocator reuse.
+  std::vector<std::unique_ptr<Program>> retained;
+  std::vector<std::unique_ptr<Block>> heap_blockers;
+  size_t validated = 0;
+  for (u32 wave : {32u, 64u}) {
+    std::vector<u32> expected;
+    std::set<uintptr_t> phi_addresses;
+    for (size_t variant = 0; variant < variants; ++variant) {
+      for (size_t blocker = 0; blocker < variant + 1; ++blocker) {
+        auto padding = std::make_unique<Block>();
+        for (size_t inst = 0; inst < (variant * 19 + blocker * 7) % 47 + 1; ++inst)
+          padding->AppendNewInst(ValueOpcode::IAdd32, {Value(u32(inst)),Value(0x55u)});
+        heap_blockers.push_back(std::move(padding));
+      }
+      auto owned = std::make_unique<Program>();
+      auto &program = *owned;
+      program.stage = ShaderType::Compute;
+      program.wave_size = wave;
+      program.shader_hash = 0x5e71d32a4c090118ull;
+      program.dispatcher_fallback = true;
+      program.srt_plan_complete = program.resource_tracking_complete = program.shader_info_complete = true;
+      std::array<Block*,6> blocks{};
+      std::array<std::unique_ptr<Block>,6> logical_storage;
+      const std::array<std::array<u32,6>,3> allocation_orders{{
+          {0,1,2,3,4,5},{5,3,1,4,2,0},{2,4,0,5,1,3}}};
+      for (auto id : allocation_orders[variant % allocation_orders.size()]) {
+        auto block = std::make_unique<Block>();
+        blocks[id] = block.get();
+        logical_storage[id] = std::move(block);
+      }
+      for (u32 id = 0; id < blocks.size(); ++id) {
+        program.block_storage.push_back(std::move(logical_storage[id]));
+        program.blocks.push_back(blocks[id]);
+        BlockInfo info;
+        info.id = id; info.start_pc = id * 4; info.end_pc = (id + 1) * 4;
+        info.terminator.kind = id == 0 ? ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch
+            : id == 5 ? ShaderRecompiler::CFG::TerminatorKind::Return
+                      : ShaderRecompiler::CFG::TerminatorKind::Branch;
+        info.terminator.true_block = id == 5 ? UINT32_MAX : id <= 2 ? 3 : id + 1;
+        if (id == 0) {
+          info.terminator.true_block = 1;
+          info.terminator.false_block = 2;
+          info.terminator.condition = ShaderRecompiler::CFG::BranchCondition::Expression;
+        }
+        program.block_info.push_back(info);
+      }
+      blocks[0]->AddBranch(blocks[1]); blocks[0]->AddBranch(blocks[2]);
+      blocks[1]->AddBranch(blocks[3]); blocks[2]->AddBranch(blocks[3]);
+      blocks[3]->AddBranch(blocks[4]); blocks[4]->AddBranch(blocks[5]);
+      auto &lane = blocks[0]->AppendNewInst(ValueOpcode::LaneId);
+      auto &condition = blocks[0]->AppendNewInst(ValueOpcode::ULessThan32, {Value(&lane),Value(16u)});
+      program.block_info[0].condition = Value(&condition);
+      auto &handle = blocks[0]->AppendNewInst(ValueOpcode::GetBufferResource,
+          {Value(0u),Value(0u),Value(0u),Value(0u)});
+      handle.SetFlags<u32>(0u);
+      auto &offset = blocks[0]->AppendNewInst(ValueOpcode::IMul32,{Value(&lane),Value(4u)});
+      std::array<std::array<std::array<Inst*,5>,lanes_of_values>,2> roots{};
+      // Physical creation order varies. Logical instruction order in every
+      // block, values, flags, edges and binding metadata remain identical.
+      for (u32 side_index = 0; side_index < 2; ++side_index) {
+        const u32 side = variant % 2 ? 1u-side_index : side_index;
+        auto *block = blocks[side+1];
+        for (size_t item = 0; item < lanes_of_values; ++item) {
+          auto &scalar = block->AppendNewInst(ValueOpcode::IAdd32,
+              {Value(&lane),Value(0x10000u + side*0x100u + u32(item))});
+          auto &wide = block->AppendNewInst(ValueOpcode::CompositeConstructU64,
+              {Value(&scalar),Value(0x10u+u32(item))});
+          auto &floating = block->AppendNewInst(ValueOpcode::BitCastF32U32,{Value(&scalar)});
+          auto &boolean = block->AppendNewInst(ValueOpcode::IEqual32,{Value(&scalar),Value(u32(item))});
+          auto &vector = block->AppendNewInst(ValueOpcode::CompositeConstructU32x4,
+              {Value(&scalar),Value(&scalar),Value(&scalar),Value(&scalar)});
+          roots[side][item] = {&scalar,&wide,&floating,&boolean,&vector};
+        }
+      }
+      constexpr std::array<Type,5> types{Type::U32,Type::U64,Type::F32,Type::U1,Type::U32x4};
+      std::array<std::array<Inst*,5>,lanes_of_values> phis{};
+      for (size_t item=0;item<lanes_of_values;++item) for (size_t type=0;type<types.size();++type) {
+        auto &phi = blocks[3]->AppendNewInst(ValueOpcode::Phi,{},static_cast<uint64_t>(types[type]));
+        phi.AddPhiOperand(blocks[1],Value(roots[0][item][type]));
+        phi.AddPhiOperand(blocks[2],Value(roots[1][item][type]));
+        phis[item][type] = &phi;
+      }
+      phi_addresses.insert(reinterpret_cast<uintptr_t>(phis[0][0]));
+      std::vector<Inst*> converted;
+      for (size_t item=0;item<lanes_of_values;++item) {
+        converted.push_back(&blocks[4]->AppendNewInst(ValueOpcode::IAdd32,{Value(phis[item][0]),Value(1u)}));
+        converted.push_back(&blocks[4]->AppendNewInst(ValueOpcode::CompositeExtractU64,{Value(phis[item][1]),Value(1u)}));
+        converted.push_back(&blocks[4]->AppendNewInst(ValueOpcode::BitCastU32F32,{Value(phis[item][2])}));
+        converted.push_back(&blocks[4]->AppendNewInst(ValueOpcode::SelectU32,{Value(phis[item][3]),Value(0x21u),Value(0x43u)}));
+        converted.push_back(&blocks[4]->AppendNewInst(ValueOpcode::CompositeExtractU32x4,{Value(phis[item][4]),Value(2u)}));
+      }
+      Value combined(0u);
+      for (auto *value : converted)
+        combined = Value(&blocks[5]->AppendNewInst(ValueOpcode::BitwiseXor32,{combined,Value(value)}));
+      auto &store = blocks[5]->AppendNewInst(ValueOpcode::StoreBufferU32,
+          {Value(&handle),Value(0u),Value(&offset),Value(0u),combined,Value(true)});
+      store.SetFlags(MemoryFlags{0u,0x14u});
+      program.memory_info.push_back({.kind=ResourceKind::Buffer,.offen=true});
+      program.info.buffers.push_back({.packed_stride=1u,.written=true});
+      AllocateBindings(program);
+      ShaderComputeInputInfo compute{};
+      compute.wave_size=wave; compute.host_subgroup_size=32;
+      compute.threads_num[0]=wave; compute.threads_num[1]=compute.threads_num[2]=1;
+      auto module = ShaderRecompiler::Spirv::EmitProgram(program,{.compute=&compute});
+      ValidateSpirv(name,module);
+      size_t function_variables=0;
+      for (size_t at=5;at<module.size();at+=module[at]>>16u) {
+        if (static_cast<spv::Op>(module[at]&0xffffu)==spv::OpVariable &&
+            module[at+3]==static_cast<u32>(spv::StorageClassFunction)) ++function_variables;
+      }
+      Require(name,"many mixed cross-block/phi spills",
+          function_variables >= lanes_of_values*5u*(wave==64u?2u:1u),
+          "fixture did not exercise enough live dispatcher spill variables");
+      if (variant==0) expected=module;
+      else Require(name,"exact SPIR-V bytes despite heap relocation",module==expected,
+          "equivalent ordered dispatcher programs emitted different module bytes");
+      std::printf("DispatcherDeterministicBytes: wave=%u variant=%zu words=%zu function_variables=%zu first_phi=%p validated/equal\n",
+          wave,variant,module.size(),function_variables,static_cast<void*>(phis[0][0]));
+      retained.push_back(std::move(owned));
+      ++validated;
+    }
+    Require(name,"distinct live instruction addresses",phi_addresses.size()==variants,
+        "heap relocation fixture reused a previous live phi address");
+  }
+  std::printf("DispatcherDeterministicBytes: %zu default-validated CPU modules identical within each wave shape\n",validated);
+}
+
 void CheckExternalDispatcherWordBounds() {
   using namespace ShaderRecompiler::IR;
   constexpr const char *name = "ExternalDispatcherWordBounds";
@@ -34382,6 +34517,7 @@ void CheckExternalProbeMismatch(VulkanHarness &vulkan) {
 
 void CheckExternalBeforeBvhProbe(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler::IR;
+  using namespace ShaderRecompiler::Diagnostics;
   size_t cases = 0;
   for (u32 wave : {32u, 64u}) {
     for (u32 node_words : {1u, 2u}) {
@@ -34412,9 +34548,16 @@ void CheckExternalBeforeBvhProbe(VulkanHarness &vulkan) {
         auto &descriptor = block->AppendNewInst(ValueOpcode::CompositeConstructU32x4,
             {Value(&descriptor_low),Value(0x80000012u),Value(0x5678u),Value(0x81000000u)});
         auto &node_low = block->AppendNewInst(ValueOpcode::IAdd32, {Value(0x21u), Value(&lane)});
-        auto &ray = block->AppendNewInst(ValueOpcode::MakeImageAddress,
-            {Value(&node_low),Value(1u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),
-             Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u)});
+        std::array<Value,BvhRayWords> ray_words;
+        for (size_t word=0;word<ray_words.size();++word)
+          ray_words[word]=Value(&block->AppendNewInst(ValueOpcode::IAdd32,
+              {Value(0x3f800000u+u32(word)*0x10000u),Value(&lane)}));
+        auto &ray = node_words==1u ? block->AppendNewInst(ValueOpcode::MakeImageAddress,
+            {Value(&node_low),ray_words[0],ray_words[1],ray_words[2],ray_words[3],ray_words[4],
+             ray_words[5],ray_words[6],ray_words[7],ray_words[8],ray_words[9],Value(0u),Value(0u)})
+            : block->AppendNewInst(ValueOpcode::MakeImageAddress,
+            {Value(&node_low),Value(1u),ray_words[0],ray_words[1],ray_words[2],ray_words[3],ray_words[4],
+             ray_words[5],ray_words[6],ray_words[7],ray_words[8],ray_words[9],Value(0u)});
         auto &last = block->AppendNewInst(ValueOpcode::IEqual32, {Value(&lane),Value(wave - 1u)});
         const Value active = mask == 0u ? Value(false) : mask == 1u ? Value(&last) : Value(true);
         auto &trap = block->AppendNewInst(ValueOpcode::ExternalBvhProbe,
@@ -34440,14 +34583,14 @@ void CheckExternalBeforeBvhProbe(VulkanHarness &vulkan) {
             FindBinding(program.bindings, DescriptorBindingKind::FaultBuffer) == nullptr &&
                 test.bda_mappings.empty(), "before-BVH diagnostic unnecessarily bound/read guest nodes");
         auto output = vulkan.CreateStorageBuffer(test.name,test.initial,test.initial.size());
-        auto fault = vulkan.CreateStorageBuffer(test.name,std::vector<u32>(16u,0u),16u);
+        auto fault = vulkan.CreateStorageBuffer(test.name,std::vector<u32>(BvhDiagnosticWords,0u),BvhDiagnosticWords);
         vulkan.Dispatch(test,compiled,output,nullptr,nullptr,nullptr,nullptr,nullptr,{}, {}, &fault);
         auto expected_output = test.initial;
         if (mask == 0u) for (u32 lane_index=0;lane_index<wave;++lane_index) expected_output[lane_index]=0x2000u+lane_index;
         CompareWords(test,"active BVH stops before visible suffix; empty EXEC proceeds",expected_output,
             vulkan.ReadBuffer(test.name,output,expected_output.size()));
-        const auto event = vulkan.ReadBuffer(test.name,fault,16u);
-        if (mask == 0u) CompareWords(test,"empty EXEC has no BVH event",std::vector<u32>(16u,0u),event);
+        const auto event = vulkan.ReadBuffer(test.name,fault,BvhDiagnosticWords);
+        if (mask == 0u) CompareWords(test,"empty EXEC has no BVH event",std::vector<u32>(BvhDiagnosticWords,0u),event);
         else {
           const u32 winner = event[8] - 0x530000u;
           Require(test.name,"active-only CAS winner",mask == 1u ? winner == wave-1u : winner<32u,
@@ -34456,17 +34599,22 @@ void CheckExternalBeforeBvhProbe(VulkanHarness &vulkan) {
           const uint64_t address = ((uint64_t{0x12u}<<32u) | (0x530000u+winner)) * 256u + (node >> 3u)*64u;
           const u32 exec_low = mask == 1u ? (wave == 32u ? 0x80000000u : 0u) : UINT32_MAX;
           const u32 exec_high = wave == 64u ? (mask == 1u ? 0x80000000u : UINT32_MAX) : 0u;
-          const std::vector<u32> expected{1u,7u,static_cast<u32>(address),static_cast<u32>(address>>32u),
+          std::vector<u32> expected{1u,7u,static_cast<u32>(address),static_cast<u32>(address>>32u),
               0x4abc8060u,0x23u,0x76543210u,0xfedcba98u,0x530000u+winner,0x80000012u,
               0x5678u,0x81000000u,0x21u+winner,node_words == 2u ? 1u : 0u,exec_low,exec_high};
-          CompareWords(test,"raw narrow/wide node, descriptor and EXEC event",expected,event);
+          for (u32 word=0;word<BvhRayWords;++word) expected.push_back(0x3f800000u+word*0x10000u+winner);
+          expected.insert(expected.end(),{node_words,winner,BvhSchemaMagic,BvhSchemaVersion,0u,0u});
+          Require(test.name,"validated same-winner ray sidecar",ValidBvhRaySidecar(event),
+              "raw ray tuple sidecar schema/width/selected active lane is invalid");
+          CompareWords(test,"raw node/descriptor/EXEC/ray/width and same active winner",expected,event);
         }
         if (mask == 1u) {
-          const std::vector<u32> prior{1u,2u,3u,4u,5u,6u,7u,8u,9u,10u,11u,12u,13u,14u,15u,16u};
+          std::vector<u32> prior(BvhDiagnosticWords);
+          for (size_t word=0;word<prior.size();++word) prior[word]=u32(word)+1u;
           auto prior_output=vulkan.CreateStorageBuffer(test.name,test.initial,test.initial.size());
           auto prior_fault=vulkan.CreateStorageBuffer(test.name,prior,prior.size());
           vulkan.Dispatch(test,compiled,prior_output,nullptr,nullptr,nullptr,nullptr,nullptr,{}, {}, &prior_fault);
-          CompareWords(test,"prior CAS event remains exact",prior,vulkan.ReadBuffer(test.name,prior_fault,16u));
+          CompareWords(test,"prior32word CAS event remains exact",prior,vulkan.ReadBuffer(test.name,prior_fault,BvhDiagnosticWords));
           CompareWords(test,"prior event still stops before visible suffix",test.initial,
               vulkan.ReadBuffer(test.name,prior_output,test.initial.size()));
           vulkan.DestroyBuffer(&prior_output);
@@ -34479,7 +34627,7 @@ void CheckExternalBeforeBvhProbe(VulkanHarness &vulkan) {
       }
     }
   }
-  std::printf("BeforeBvhProbe: %zu GPU cases passed (active winner/full EXEC, narrow/wide raw nodes, unmapped node memory, visible suffix, CAS)\n",cases);
+  std::printf("BeforeBvhProbe: %zu GPU cases passed (32word same-winner raw ray/width/schema, active winner/full EXEC, narrow/wide raw nodes, unmapped node memory, visible suffix, CAS)\n",cases);
 }
 
 void CheckCheckedCallScalarInputs(VulkanHarness &vulkan) {
@@ -34710,9 +34858,11 @@ void CheckExternalLeafCalls(VulkanHarness &vulkan, bool checked = false) {
           }
         }
         auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
-        // The production host now allocates 64 bytes; ordinary leaf faults
-        // still write only their original first eight DWORDs.
-        auto fault = vulkan.CreateStorageBuffer(test.name, std::vector<u32>(16u, 0u), 16u);
+        // The128-byte channel preserves ordinary first16 expectations and
+        // must leave the new kind7-only sidecar tail untouched.
+        std::vector<u32> initial_fault(32u,0u);
+        for (u32 word=16u;word<32u;++word) initial_fault[word]=0xa5b60000u+word;
+        auto fault = vulkan.CreateStorageBuffer(test.name, initial_fault, initial_fault.size());
         vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr,
                         nullptr, {}, {}, &fault);
         const auto actual = vulkan.ReadBuffer(test.name, output, test.expected.size());
@@ -34729,20 +34879,24 @@ void CheckExternalLeafCalls(VulkanHarness &vulkan, bool checked = false) {
             0x00300400u,0x12u,0u,32u} : std::vector<u32>(8u,0u);
         CompareWords(test, "checked call input detail or untouched ordinary extras", expected_extra,
                      std::vector<u32>(extended_words.begin() + 8u, extended_words.end()));
+        const auto full_event = vulkan.ReadBuffer(test.name,fault,32u);
+        CompareWords(test,"ordinary/checked event leaves kind7 sidecar tail untouched",
+            std::vector<u32>(initial_fault.begin()+16u,initial_fault.end()),
+            std::vector<u32>(full_event.begin()+16u,full_event.end()));
         vulkan.DestroyBuffer(&output);
         vulkan.DestroyBuffer(&fault);
         ++cases;
       }
       SetRuntimeTarget(unknown_address);
-      const std::vector<u32> first_fault {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u,
-                                          9u, 10u, 11u, 12u, 13u, 14u, 15u, 16u};
+      std::vector<u32> first_fault(32u);
+      for (u32 word=0;word<first_fault.size();++word) first_fault[word]=word+1u;
       auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
       auto fault = vulkan.CreateStorageBuffer(test.name, first_fault, first_fault.size());
       vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr,
                       nullptr, {}, {}, &fault);
       CompareWords(test, "unknown-target termination with prior fault", test.initial,
                    vulkan.ReadBuffer(test.name, output, test.initial.size()));
-      CompareWords(test, "first fault remains latched", first_fault, vulkan.ReadBuffer(test.name, fault, 16u));
+      CompareWords(test, "first32word fault remains latched", first_fault, vulkan.ReadBuffer(test.name, fault, first_fault.size()));
       vulkan.DestroyBuffer(&output);
       vulkan.DestroyBuffer(&fault);
       ++cases;
@@ -42772,13 +42926,18 @@ int main(int argc, char **argv) {
       std::strcmp(argv[1], "--captured-external-before-bvh-compile-only") == 0;
   const bool captured_translation_only =
       captured_actual_inputs || captured_synthetic_inputs || captured_probe || captured_probe_emit || captured_checked_emit || captured_bvh_probe || captured_bvh_emit;
+  const bool dispatcher_determinism = argc==2 && std::strcmp(argv[1],"--dispatcher-determinism-only")==0;
   if (argc > 1 && std::string_view(argv[1]).starts_with("--captured-external-") &&
       !captured_translation_only) {
     std::fputs("CapturedExternalTranslation: requires a recognized mode plus caller.bin, "
                "capture-folder and function-limit; malformed captured requests never start the GPU suite\n", stderr);
     return 2;
   }
-  EnsureConfigInitialized(!captured_translation_only);
+  EnsureConfigInitialized(!captured_translation_only && !dispatcher_determinism);
+  if (dispatcher_determinism) {
+    CheckDispatcherDeterministicBytes();
+    return 0;
+  }
   if (captured_translation_only) {
     CheckCapturedExternalTranslation(argv[2], argv[3], argv[4],
                                      captured_actual_inputs || captured_probe || captured_probe_emit || captured_checked_emit || captured_bvh_probe || captured_bvh_emit,

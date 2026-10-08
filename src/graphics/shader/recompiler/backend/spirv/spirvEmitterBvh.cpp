@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/BvhDiagnosticRecord.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -378,9 +379,26 @@ void EmitExternalBvhProbe(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto low_address = Unary(s, spv::OpUConvert, TypeU32(s), address);
 	const auto high_address = Unary(s, spv::OpUConvert, TypeU32(s),
 	    Binary(s, spv::OpShiftRightLogical, TypeU64(s), address, ConstantU32(s, 32)));
-	const std::array<uint32_t, 8> extra {
-	    descriptor[0], descriptor[1], descriptor[2], descriptor[3],
-	    node_lo, node_hi, exec_lo, exec_hi};
+	std::array<uint32_t, Diagnostics::BvhDiagnosticExtraWords> extra;
+	extra.fill(ConstantU32(s, 0));
+	for (uint32_t word = 0; word < descriptor.size(); ++word) extra[word] = descriptor[word];
+	extra[4] = node_lo;
+	extra[5] = node_hi;
+	extra[6] = exec_lo;
+	extra[7] = exec_hi;
+	for (uint32_t word = 0; word < Diagnostics::BvhRayWords; ++word) {
+		const auto low = ctx.Arg(*ray, node_words + word);
+		const auto high = ctx.other_half != nullptr
+		    ? ctx.other_half->Arg(*ray, node_words + word) : low;
+		extra[Diagnostics::BvhRayWord - 8 + word] = choose_word(low, high);
+	}
+	extra[Diagnostics::BvhNodeWidthWord - 8] = ConstantU32(s, node_words);
+	const auto chosen_half = ctx.other_half == nullptr ? ConstantU32(s, 0)
+	    : Select(s, TypeU32(s), active_low, ConstantU32(s, 0), ConstantU32(s, 32));
+	extra[Diagnostics::BvhNativeLaneWord - 8] = Binary(s, spv::OpIAdd, TypeU32(s),
+	    EmitSubgroupLocalInvocationId(s), chosen_half);
+	extra[Diagnostics::BvhSchemaMagicWord - 8] = ConstantU32(s, Diagnostics::BvhSchemaMagic);
+	extra[Diagnostics::BvhSchemaVersionWord - 8] = ConstantU32(s, Diagnostics::BvhSchemaVersion);
 	// An inactive physical lane cannot win with stale VGPR words. All lanes
 	// converge and return after the active winner(s) have attempted the CAS.
 	const auto winner = s.builder.AllocateId();

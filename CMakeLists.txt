@@ -477,6 +477,15 @@ add_executable(shader_call_capture_tests EXCLUDE_FROM_ALL
 target_link_libraries(shader_call_capture_tests fmt::fmt)
 target_include_directories(shader_call_capture_tests PRIVATE ${inc_headers})
 
+add_executable(bvh_node_capture_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BvhNodeCaptureTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/BvhNodeCapture.cpp"
+)
+target_include_directories(bvh_node_capture_tests PRIVATE ${inc_headers})
+if(KYTY_CLANG_CL)
+	target_compile_options(bvh_node_capture_tests PRIVATE /EHsc)
+endif()
+
 add_executable(external_library_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ExternalLibraryTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ExternalLibrary.cpp"
@@ -652,7 +661,7 @@ target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests shader_call_capture_tests external_library_tests external_program_tests ir_use_tests)
+			virtual_memory_allocation_tests shader_call_capture_tests external_library_tests external_program_tests ir_use_tests bvh_node_capture_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 endif()
@@ -682,6 +691,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME shader_call_capture COMMAND $<TARGET_FILE:shader_call_capture_tests>)
+	add_test(NAME bvh_node_capture COMMAND $<TARGET_FILE:bvh_node_capture_tests>)
 	add_test(NAME external_library COMMAND $<TARGET_FILE:external_library_tests>)
 	add_test(NAME captured_compute_manifest COMMAND $<TARGET_FILE:captured_compute_manifest_tests>)
 	add_test(NAME ir_use COMMAND $<TARGET_FILE:ir_use_tests>)
@@ -690,6 +700,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_external_call_probe COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --external-call-probe-only)
 	add_test(NAME shader_external_checked_calls COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --external-checked-call-only)
 	add_test(NAME shader_external_before_bvh_probe COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --external-before-bvh-probe-only)
+	add_test(NAME shader_dispatcher_determinism COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatcher-determinism-only)
 	add_test(NAME shader_scalar_branch_restores COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-branch-restores-only)
 	add_test(NAME shader_cfg_spirv_size COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-size-only)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -770,6 +781,7 @@ if(BUILD_TESTING)
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		shader_call_capture_tests
+		bvh_node_capture_tests
 		external_library_tests
 		captured_compute_manifest_tests
 		ir_use_tests
