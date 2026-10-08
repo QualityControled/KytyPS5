@@ -898,10 +898,19 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+	return ClampRangeSize(vaddr, size, nullptr, nullptr);
+}
+
+uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size,
+                       range_failure_callback_t failure_callback,
+                       const void* failure_context) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
 	if (clamped_size == 0) {
+		if (failure_callback != nullptr) {
+			failure_callback(vaddr, size, failure_context);
+		}
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",
 		     vaddr, size);

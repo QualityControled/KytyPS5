@@ -30,6 +30,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/invalidBufferRangeDiagnostic.h"
 
 #include <algorithm>
 #include <atomic>
@@ -809,6 +810,57 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
+struct ShaderBufferRangeFailureContext {
+	const ShaderRecompiler::IR::CompiledShaderInfo* program;
+	const ShaderRecompiler::IR::ResourceSnapshot* snapshot;
+	uint32_t resource;
+	uint64_t descriptor_size;
+};
+
+static void PrintShaderBufferRangeFailure(uint64_t address, uint64_t size,
+                                         const void* opaque) noexcept {
+	if (!InvalidBufferRangeDiagnostic::Enabled()) return;
+	const auto& context = *static_cast<const ShaderBufferRangeFailureContext*>(opaque);
+	const auto& program = *context.program;
+	const auto& snapshot = *context.snapshot;
+	InvalidBufferRangeDiagnostic::Record record;
+	record.Line("RangeFaultBegin schema=1 route=shader_buffer stage=%u shader_hash=%016llx "
+	            "resource=%u snapshot_index=%u addr=%016llx requested_size=%016llx "
+	            "descriptor_size=%016llx buffers=%zu resource_metadata=%zu "
+	            "user_data_base=%u user_data_count=%u first_use_pc_is_offset=1 "
+	            "native_base_unavailable=1\n",
+	            static_cast<unsigned>(program.stage), static_cast<unsigned long long>(program.shader_hash),
+	            context.resource, context.resource, static_cast<unsigned long long>(address),
+	            static_cast<unsigned long long>(size), static_cast<unsigned long long>(context.descriptor_size),
+	            snapshot.buffers.size(), program.info.buffers.size(), program.user_data_base,
+	            program.user_data_count);
+	if (context.resource < program.info.buffers.size()) {
+		const auto& resource = program.info.buffers[context.resource];
+		record.Line("RangeFaultBuffer source=%u first_use_pc_offset=%08x read=%u written=%u "
+		            "atomic=%u scalar=%u formatted=%u max_byte_extent=%u packed_stride=%u "
+		            "indirect_root=%u image_alias=%u\n",
+		            resource.source, resource.first_use_pc, unsigned(resource.read), unsigned(resource.written),
+		            unsigned(resource.atomic), unsigned(resource.scalar), unsigned(resource.formatted),
+		            resource.max_byte_extent, resource.packed_stride, resource.indirect_root, resource.image_alias);
+	}
+	if (context.resource < snapshot.buffers.size()) {
+		const auto& raw = snapshot.buffers[context.resource];
+		record.Line("RangeFaultRaw snapshot_index=%u dword_count=%u raw=%08x,%08x,%08x,%08x\n",
+		            context.resource, raw.dword_count, raw.dwords[0], raw.dwords[1], raw.dwords[2], raw.dwords[3]);
+		if (raw.dword_count >= 4) {
+			ShaderBufferResource descriptor;
+			std::memcpy(descriptor.fields, raw.dwords.data(), sizeof(descriptor.fields));
+			record.Line("RangeFaultDecode base48=%016llx stride=%u records=%u type=%u "
+			            "format=%u oob=%u swizzle=%03x add_tid=%u index_stride=%u\n",
+			            static_cast<unsigned long long>(descriptor.Base48()), unsigned(descriptor.Stride()),
+			            descriptor.NumRecords(), unsigned(descriptor.Type()), unsigned(descriptor.RawFormat()),
+			            unsigned(descriptor.OutOfBounds()), descriptor.DstSelXYZW(),
+			            unsigned(descriptor.AddTid()), unsigned(descriptor.IndexStride()));
+		}
+	}
+	record.Flush();
+}
+
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
@@ -852,7 +904,10 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			const ShaderBufferRangeFailureContext range_failure {
+			    &program, &snapshot, resource, descriptor.GetSize()};
+			size = Libs::LibKernel::Memory::ClampRangeSize(
+			    address, size, PrintShaderBufferRangeFailure, &range_failure);
 			prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 		}
 	}

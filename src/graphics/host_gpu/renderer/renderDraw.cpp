@@ -30,6 +30,7 @@
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/invalidBufferRangeDiagnostic.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -689,6 +690,62 @@ struct PreparedVertexBuffers {
 	uint32_t                               count = 0;
 };
 
+struct VertexBufferRangeFailureContext {
+	const ShaderVertexInputInfo* input;
+	const std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>* sizes;
+	uint32_t merged_index;
+	uint32_t merged_count;
+	uint64_t requested_end;
+};
+
+static void PrintVertexBufferRangeFailure(uint64_t address, uint64_t size,
+                                         const void* opaque) noexcept {
+	if (!InvalidBufferRangeDiagnostic::Enabled()) return;
+	const auto& context = *static_cast<const VertexBufferRangeFailureContext*>(opaque);
+	const auto& input = *context.input;
+	const auto* program = input.stage.program;
+	InvalidBufferRangeDiagnostic::Record record;
+	record.Line("RangeFaultBegin schema=1 route=merged_vertex stage=%u shader_hash=%016llx "
+	            "program_present=%u logical_stage=%u addr=%016llx requested_size=%016llx "
+	            "requested_end=%016llx merged_index=%u merged_count=%u slots=%d resources=%d "
+	            "native_base_unavailable=1\n",
+	            program != nullptr ? static_cast<unsigned>(program->stage) : 0u,
+	            static_cast<unsigned long long>(program != nullptr ? program->shader_hash : 0),
+	            unsigned(program != nullptr), static_cast<unsigned>(input.logical_stage),
+	            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
+	            static_cast<unsigned long long>(context.requested_end), context.merged_index,
+	            context.merged_count, input.buffers_num, input.resources_num);
+	const int slots = std::clamp(input.buffers_num, 0, ShaderVertexInputInfo::RES_MAX);
+	const int resources = std::clamp(input.resources_num, 0, ShaderVertexInputInfo::RES_MAX);
+	for (int slot = 0; slot < slots; ++slot) {
+		const auto& buffer = input.buffers[slot];
+		const uint64_t requested = (*context.sizes)[slot];
+		// Test containment with subtraction; this observer never changes the merge.
+		const bool within = requested != 0 && buffer.addr >= address &&
+		                    buffer.addr <= context.requested_end &&
+		                    requested <= context.requested_end - buffer.addr;
+		if (!within) continue;
+		record.Line("RangeFaultVertex slot=%d addr=%016llx computed_size=%016llx stride=%u "
+		            "records=%u fetch_index=%u\n", slot,
+		            static_cast<unsigned long long>(buffer.addr), static_cast<unsigned long long>(requested),
+		            buffer.stride, buffer.num_records, buffer.fetch_index);
+		for (int index = 0; index < resources; ++index) {
+			const auto& destination = input.resources_dst[index];
+			if (destination.buffer_index != slot) continue;
+			const auto& raw = input.resources[index];
+			record.Line("RangeFaultVertexRaw resource=%d slot=%d fetch_index=%u attr_id=%d "
+			            "register_start=%d registers_num=%d raw=%08x,%08x,%08x,%08x "
+			            "base48=%016llx stride=%u records=%u format=%u oob=%u\n",
+			            index, slot, destination.fetch_index, destination.attr_id,
+			            destination.register_start, destination.registers_num,
+			            raw.fields[0], raw.fields[1], raw.fields[2], raw.fields[3],
+			            static_cast<unsigned long long>(raw.Base48()), unsigned(raw.Stride()),
+			            raw.NumRecords(), unsigned(raw.RawFormat()), unsigned(raw.OutOfBounds()));
+		}
+	}
+	record.Flush();
+}
+
 static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
                                                   const ShaderVertexInputInfo& vs_input_info) {
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
@@ -735,8 +792,10 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
 		// PPSA20298
-		const auto size =
-		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
+		const VertexBufferRangeFailureContext range_failure {
+		    &vs_input_info, &sizes, i, merged_count, range.requested_end};
+		const auto size = Libs::LibKernel::Memory::ClampRangeSize(
+		    range.base_address, range.RequestedSize(), PrintVertexBufferRangeFailure, &range_failure);
 		range.acquired_end = range.base_address + size;
 		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
 	}

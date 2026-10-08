@@ -117,6 +117,13 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Synchronous, failure-only metadata observer. The callback must not read guest
+// memory, re-enter the memory subsystem, throw, or retain the borrowed context.
+using range_failure_callback_t = void (*)(uint64_t vaddr, uint64_t size,
+                                         const void* context) noexcept;
+[[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size,
+                                      range_failure_callback_t failure_callback,
+                                      const void* failure_context);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
