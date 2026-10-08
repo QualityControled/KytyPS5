@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/carRenderDiagnostic.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -46,6 +47,7 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -1037,6 +1039,179 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+
+static void LogCarRenderDiagnostic(CommandBuffer& buffer, uint64_t submit_id,
+                                   const DrawCallInfo& draw, const DrawRenderState& state,
+                                   const RenderState& rendering,
+                                   std::span<PreparedBindings* const> stages) {
+    namespace CD = CarRenderDiagnostic;
+    if (!CD::Ready() || !state.ps_active) return;
+    static CD::SignatureBudget budget;
+    static bool limit_reported = false, active_reported = false, stopped = false;
+    if (stopped || budget.Exhausted()) return;
+    if (!active_reported) {
+        std::printf("CarRenderDiagnostic active schema=1 start_file=%u max_records=64 max_record_bytes=32768 max_total_bytes=1048576 metadata_only=1 contents=unknown\n",
+                    CD::ProcessStartGate().HasStartFile());
+        std::fflush(stdout);
+        active_reported = true;
+    }
+    CD::BoundedText text;
+    const auto& hw = buffer.GetRegisters();
+    const auto& depth = state.depth_info;
+    text.Add(fmt::format("CarDraw draw={} native_ps=0x{:016x} ps_hash=0x{:016x} index_count={} instances={} color_mask=0x{:08x} colors={} extent={}x{} layers={} depth_id={} depth_gen={} depth_test={} depth_write={} depth_cmp={} depth_load_clear={} stencil_test={} stencil_clear={} initial_contents=unknown\n",
+        draw.Name(), buffer.GetShaders().GetPs().ps_regs.data_addr,
+        state.ps_input_info.stage.program->shader_hash, draw.index_count, draw.instance_count,
+        hw.GetRenderTargetMask(), state.color_count, rendering.width, rendering.height,
+        rendering.num_layers, depth.image_id.index, depth.image_id.generation,
+        depth.depth_test_enable, depth.depth_write_enable, static_cast<uint32_t>(depth.depth_compare_op),
+        depth.depth_load_clear_enable, depth.stencil_test_enable, depth.stencil_clear_enable));
+    auto& cache = buffer.GetContext().GetTextureCache();
+    size_t total_views = 0;
+    const auto image_row = [&](const char* role, uint32_t slot, ImageId id, vk::ImageView native_view,
+                               const ImageViewInfo& requested) {
+        const auto copy = cache.InspectCarImageDiagnostic(id, native_view);
+        const auto& r = copy.owner;
+        text.Add(fmt::format("CarOwner role={} slot={} requested_id={} requested_gen={} exists={} registered={} native_image=0x{:016x} native_view=0x{:016x} actual_view_known={} data=0x{:016x}+0x{:x} stencil=0x{:016x}+0x{:x} metadata=0x{:016x}+0x{:x} metadata_kind={} guest_format={} host_format={} type={} tile={} guest_samples={} host_samples={} extent={}x{}x{} levels={} layers={} cpu_dirty={} cpu_definite={} cpu_maybe={} gpu_modified={} buffer_modified={} bound={} target={} rebind={} force_general={} shader_write={} image_layout={} attachment_layout={} subresource_states={} source_route=unknown source_route_history_not_retained=1 contents=unknown\n",
+            role, slot, id.index, id.generation, copy.exists, r.registered,
+            copy.native_image, copy.native_view, copy.view_known, r.data_address, r.data_size,
+            r.stencil_address, r.stencil_size, r.metadata_address, r.metadata_size, r.metadata_kind,
+            r.guest_format, r.backing_format, r.image_type, copy.tile_mode, r.guest_samples,
+            r.backing_samples, r.width, r.height, r.depth, r.levels, r.layers, r.cpu_dirty,
+            r.definitely_cpu_dirty, r.maybe_cpu_dirty, r.gpu_modified, r.buffer_modified,
+            r.bound, r.target, r.needs_rebind, r.force_general, r.shader_write,
+            r.global_layout, r.attachment_layout, r.subresource_state_count));
+        const auto view_row = [&](const char* which, const ImageViewInfo& view) {
+            text.Add(fmt::format("CarView role={} slot={} which={} type={} format={} aspect={} base_mip={} mips={} base_layer={} layers={} min_lod_u4_8={} swizzle={},{},{},{} usage={}\n",
+                role, slot, which, static_cast<int>(view.type), static_cast<int>(view.format),
+                static_cast<uint32_t>(static_cast<VkImageAspectFlags>(view.aspect)),
+                view.base_level, view.level_count, view.base_layer, view.layer_count, view.min_lod,
+                static_cast<int>(view.mapping.r), static_cast<int>(view.mapping.g),
+                static_cast<int>(view.mapping.b), static_cast<int>(view.mapping.a),
+                static_cast<uint32_t>(static_cast<VkImageUsageFlags>(view.usage))));
+        };
+        view_row("requested", requested);
+        if (copy.view_known) view_row("actual", copy.actual_view);
+    };
+    for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; ++i) {
+        const auto& target = state.color_info[i];
+        const auto slot = target.target_slot;
+        if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
+            text.Add("CarUnknown invalid_color_slot=1\n"); continue;
+        }
+        const auto& blend = hw.GetBlendControl(slot);
+        text.Add(fmt::format("CarColor slot={} native_samples={} lower_aa_trial={} blend={} color_factors={},{},{} alpha_factors={},{},{} separate_alpha={}\n",
+            slot, target.desc.info.samples, target.experimental_reduced_eqaa_2x, blend.enable,
+            blend.color_srcblend, blend.color_destblend, blend.color_comb_fcn,
+            blend.alpha_srcblend, blend.alpha_destblend, blend.alpha_comb_fcn, blend.separate_alpha_blend));
+        image_row("color", slot, target.image_id, rendering.color_attachments[slot].image_view, target.desc.view_info);
+    }
+    if (depth.image_id) image_row("depth", 0, depth.image_id, rendering.depth_stencil_attachment.image_view, depth.desc.view_info);
+    for (const auto* prepared: stages) {
+        if (prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime) {
+            text.Add("CarUnknown missing_stage_association=1\n"); continue;
+        }
+        const auto& program = *prepared->runtime->program;
+        const auto& snapshot = *prepared->runtime->resources;
+        const auto stage = static_cast<uint32_t>(program.stage);
+        text.Add(fmt::format("CarStage stage={} hash=0x{:016x} images={} prepared_images={} snapshots={} samplers={} sampler_snapshots={} pairs={}\n",
+            stage, program.shader_hash, program.info.images.size(), prepared->images.size(),
+            snapshot.images.size(), program.info.samplers.size(), snapshot.samplers.size(), program.info.sampled_pairs.size()));
+        const auto count = std::min({program.info.images.size(), prepared->images.size(), snapshot.images.size(), size_t {64}});
+        if (count != program.info.images.size() || count != prepared->images.size() || count != snapshot.images.size())
+            text.Add("CarUnknown images_truncated_or_mismatched=1 candidate_not_election=1\n");
+        for (uint32_t i = 0; i < count && !text.Oversize(); ++i) {
+            const auto& resource = program.info.images[i];
+            const auto& binding = prepared->images[i];
+            const auto& value = snapshot.images[i];
+            text.Add(fmt::format("CarImage stage={} hash=0x{:016x} resource={} snapshot={} source={} first_pc=0x{:x} class={} dimension={} cube={} depth_compare={} read={} write={} alias={} indirect_root={} indirect_children={} native_layout={} dword_count={} candidate_not_election=1\n",
+                stage, program.shader_hash, i, i, resource.source, resource.first_use_pc,
+                static_cast<uint32_t>(resource.resource_class), static_cast<uint32_t>(resource.dimension),
+                resource.cube, resource.depth_compare, resource.read, resource.written,
+                resource.binding_alias, resource.indirect_root, resource.indirect_resources.size(),
+                static_cast<int>(binding.layout), value.dword_count));
+            if (value.dword_count >= sizeof(ShaderTextureResource) / 4) {
+                ShaderTextureResource native {};
+                std::memcpy(&native, value.dwords.data(), sizeof(native));
+                text.Add(fmt::format("CarNativeTexture stage={} resource={} null={} base=0x{:016x} type={} format={} tile={} width={} height={} depth={} base_mip={} last_mip={} max_mip={} base_array={} min_lod_u4_8={} swizzle={} meta_compress={} meta_address=0x{:016x} msaa_depth={}\n",
+                    stage, i, native.IsNull(), native.Base40(), static_cast<uint32_t>(native.Type()),
+                    static_cast<uint32_t>(native.Format()), static_cast<uint32_t>(native.TileMode()),
+                    uint32_t(native.Width5()) + 1, uint32_t(native.Height5()) + 1, uint32_t(native.Depth()) + 1,
+                    native.BaseLevel(), native.LastLevel(), native.MaxMip(), native.BaseArray5(),
+                    native.MinLod(), native.DstSelXYZW(), native.MetaCompress(), native.MetaAddr() << 8u, native.MsaaDepth()));
+            } else text.Add("CarUnknown short_image_descriptor=1\n");
+            image_row("sampled_or_storage", i, binding.image_id, binding.image_view, binding.desc.view_info);
+            for (uint32_t v = 0; v < binding.mip_views.size() && total_views < 64 && !text.Oversize(); ++v, ++total_views) {
+                auto requested = binding.desc.view_info;
+                requested.base_level += v; requested.level_count = 1; requested.min_lod = 0;
+                image_row("dynamic_mip_view", v, binding.image_id, binding.mip_views[v], requested);
+            }
+            if (total_views == 64 && !binding.mip_views.empty()) text.Add("CarUnknown dynamic_view_cap=1\n");
+        }
+        const auto samplers = std::min(program.info.samplers.size(), size_t {32});
+        if (samplers != program.info.samplers.size()) text.Add("CarUnknown sampler_cap=1\n");
+        for (uint32_t i = 0; i < samplers && !text.Oversize(); ++i) {
+            const auto& resource = program.info.samplers[i];
+            text.Add(fmt::format("CarSampler stage={} resource={} source={} first_pc=0x{:x} snapshot={} alias={} indirect_root={} children={} depth_compare={} forced_point={} integer_border={}\n",
+                stage, i, resource.source, resource.first_use_pc, resource.snapshot_index,
+                resource.binding_alias, resource.indirect_root, resource.indirect_resources.size(),
+                resource.depth_compare, resource.force_point_filtering, resource.integer_border));
+            if (resource.snapshot_index >= snapshot.samplers.size() || i >= prepared->samplers.size() ||
+                snapshot.samplers[resource.snapshot_index].dword_count < sizeof(ShaderSamplerResource) / 4) {
+                text.Add("CarUnknown sampler_association=1\n"); continue;
+            }
+            ShaderSamplerResource native {};
+            std::memcpy(&native, snapshot.samplers[resource.snapshot_index].dwords.data(), sizeof(native));
+            const auto original_cmp = native.DepthCompareFunc();
+            if (!resource.depth_compare) native.fields[0] &= ~(0x7u << 12u);
+            if (resource.force_point_filtering) native.SetPointFiltering();
+            text.Add(fmt::format("CarNativeSampler stage={} resource={} native_handle=0x{:016x} native_create_info_unqueried=1 original_cmp={} effective_descriptor_cmp={} clamp={},{},{} mag={} min={} z={} mip={} min_lod_u4_8={} max_lod_u4_8={} bias_u={} bias_secondary_u={} aniso={} border_type={} border_ptr={} cube_wrap_disable={} prt_blend={}\n",
+                stage, i, CD::HandleBits(static_cast<VkSampler>(prepared->samplers[i])), original_cmp,
+                native.DepthCompareFunc(), native.ClampX(), native.ClampY(), native.ClampZ(),
+                native.XyMagFilter(), native.XyMinFilter(), native.ZFilter(), native.MipFilter(),
+                native.MinLod(), native.MaxLod(), native.LodBias(), native.LodBiasSec(), native.MaxAnisoRatio(),
+                native.BorderColorType(), native.BorderColorPtr(), native.DisableCubeWrap(), native.BlendZeroPrt()));
+        }
+        const auto layouts = std::min(program.bindings.descriptors.size(), size_t {64});
+        for (uint32_t i = 0; i < layouts && !text.Oversize(); ++i) {
+            const auto& layout = program.bindings.descriptors[i];
+            const auto resources = std::min(layout.resources.size(), size_t {64});
+            text.Add(fmt::format("CarDescriptorLayout stage={} layout_row={} kind={} resources={} reported={}\n",
+                stage, i, static_cast<uint32_t>(layout.kind), layout.resources.size(), resources));
+            for (uint32_t slot = 0; slot < resources && !text.Oversize(); ++slot)
+                text.Add(fmt::format("CarDescriptorResource stage={} layout_row={} element={} resource={}\n",
+                    stage, i, slot, layout.resources[slot]));
+            if (resources != layout.resources.size()) text.Add("CarUnknown descriptor_resource_cap=1\n");
+        }
+        if (layouts != program.bindings.descriptors.size()) text.Add("CarUnknown descriptor_layout_cap=1\n");
+        const auto pairs = std::min(program.info.sampled_pairs.size(), size_t {64});
+        for (uint32_t i = 0; i < pairs && !text.Oversize(); ++i) {
+            const auto& pair = program.info.sampled_pairs[i];
+            text.Add(fmt::format("CarSamplePair stage={} image={} sampler={} first_pc=0x{:x} static_candidate_pair=1\n",
+                stage, pair.image, pair.sampler, pair.first_use_pc));
+        }
+        if (pairs != program.info.sampled_pairs.size()) text.Add("CarUnknown sampled_pair_cap=1\n");
+    }
+    const auto result = text.Oversize() ? CD::Claim::Oversize : budget.Admit(text.Text());
+    if (result == CD::Claim::Accepted) {
+        std::printf("CarRenderDiagnostic begin record=%zu submit=%" PRIu64 " tick=%" PRIu64 " association=after_rebind_buffers_attachment_acquisition_and_commit_before_draw gpu_execution_not_proved=1\n%sCarRenderDiagnostic end record=%zu bytes=%zu\n",
+            budget.Count(), submit_id, buffer.GetContext().GetCommandScheduler().CurrentTick(),
+            text.Text().c_str(), budget.Count(), text.Text().size());
+        std::fflush(stdout);
+        if (budget.Exhausted()) {
+            std::printf("CarRenderDiagnostic limit records=%zu bytes=%zu oversize=0 further_coverage_unproved=1\n", budget.Count(), budget.Bytes());
+            std::fflush(stdout);
+            limit_reported = true;
+            stopped = true;
+        }
+    } else if ((result == CD::Claim::Full || result == CD::Claim::Oversize) && !limit_reported) {
+        stopped = true;
+        std::printf("CarRenderDiagnostic limit records=%zu bytes=%zu oversize=%u further_coverage_unproved=1\n",
+            budget.Count(), budget.Bytes(), result == CD::Claim::Oversize);
+        std::fflush(stdout);
+        limit_reported = true;
+    }
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1133,6 +1308,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	LogCarRenderDiagnostic(buffer, submit_id, draw, state, rendering, stages);
 	if (mesh_active) {
 		const uint32_t draw_data[] {draw.index_count,
 		                            draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)

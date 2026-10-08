@@ -61,6 +61,16 @@ public:
 	[[nodiscard]] ImageOwnerDiagnosticSnapshot
 	InspectExistingImageOwnersForDiagnostic(uint64_t address);
 
+    struct CarImageDiagnostic {
+        bool exists = false, view_known = false;
+        ImageOwnerDiagnosticRow owner;
+        uint64_t native_image = 0, native_view = 0;
+        uint32_t tile_mode = 0;
+        ImageViewInfo actual_view;
+    };
+    // Exact existing SlotId/view metadata. No LRU/query epoch/content access.
+    [[nodiscard]] CarImageDiagnostic InspectCarImageDiagnostic(ImageId id, vk::ImageView view);
+
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);

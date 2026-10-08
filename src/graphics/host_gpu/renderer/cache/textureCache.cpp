@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/carRenderDiagnostic.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -29,6 +30,71 @@
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
+
+TextureCache::CarImageDiagnostic TextureCache::InspectCarImageDiagnostic(ImageId id, vk::ImageView view) {
+    std::scoped_lock lock {m_lock};
+    CarImageDiagnostic result;
+    const auto* image = m_slot_images.try_get(id);
+    if (image == nullptr) return result;
+    result.exists = true;
+    auto& r = result.owner;
+    r.index                = id.index;
+    r.generation           = id.generation;
+    r.registered           = image->registered;
+    r.data_address         = image->info.data.address;
+    r.data_size            = image->info.data.size;
+    r.stencil_address      = image->info.stencil.address;
+    r.stencil_size         = image->info.stencil.size;
+    r.metadata_address     = image->info.metadata.range.address;
+    r.metadata_size        = image->info.metadata.range.size;
+    r.metadata_kind        = static_cast<uint32_t>(image->info.metadata.kind);
+    r.htile_clear_mask     = image->info.htile_clear_mask;
+    r.guest_samples        = image->info.samples;
+    r.guest_format         = static_cast<int32_t>(image->info.guest_format);
+    r.image_type           = static_cast<int32_t>(image->info.type);
+    r.backing_present      = image->backing.image != nullptr;
+    r.backing_samples      = image->backing.samples;
+    r.backing_format       = static_cast<int32_t>(image->backing.format);
+    r.width                = image->backing.extent.width;
+    r.height               = image->backing.extent.height;
+    r.depth                = image->backing.extent.depth;
+    r.layers               = image->backing.layers;
+    r.levels               = image->backing.mip_levels;
+    r.cpu_dirty            = image->IsCpuDirty();
+    r.definitely_cpu_dirty = image->IsDefinitelyCpuDirty();
+    r.maybe_cpu_dirty      = image->IsMaybeCpuDirty();
+    r.gpu_modified         = image->IsGpuModified();
+    r.buffer_modified      = image->IsBufferModified();
+    r.tracked              = image->IsTracked();
+    r.texture              = image->usage.texture;
+    r.storage              = image->usage.storage;
+    r.render_target        = image->usage.render_target;
+    r.depth_target         = image->usage.depth_target;
+    r.video_out            = image->usage.video_out;
+    r.bound                = image->binding.is_bound;
+    r.target               = image->binding.is_target;
+    r.needs_rebind         = image->binding.needs_rebind;
+    r.force_general        = image->binding.force_general;
+    r.shader_write         = image->binding.shader_write;
+    r.attachment_layout    = static_cast<int32_t>(image->binding.attachment_layout);
+    r.attachment_access    = static_cast<VkAccessFlags2>(image->binding.attachment_access);
+    r.global_layout        = static_cast<int32_t>(image->backing.state.layout);
+    r.global_access        = static_cast<VkAccessFlags2>(image->backing.state.access_mask);
+    r.global_stage = static_cast<VkPipelineStageFlags2>(image->backing.state.pl_stage);
+    r.subresource_state_count = image->backing.subresource_states.size();
+
+    result.native_image = CarRenderDiagnostic::HandleBits(static_cast<VkImage>(image->backing.image));
+    result.native_view = CarRenderDiagnostic::HandleBits(static_cast<VkImageView>(view));
+    result.tile_mode = static_cast<uint32_t>(image->info.tile_mode);
+    const auto cached = std::find_if(image->views.begin(), image->views.end(),
+        [view](const CachedImageView& candidate) { return candidate.view == view; });
+    if (cached != image->views.end()) {
+        result.actual_view = cached->info;
+        result.view_known = true;
+    }
+    return result;
+}
+
 
 ImageOwnerDiagnosticSnapshot
 TextureCache::InspectExistingImageOwnersForDiagnostic(uint64_t address) {
