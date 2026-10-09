@@ -4,7 +4,8 @@ param(
     [string]$MemoryBackingDirectory,
     [ValidateRange(320,7680)][int]$ScreenWidth = 2560,
     [ValidateRange(240,4320)][int]$ScreenHeight = 1440,
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$GpuFaultDiagnostic
 )
 
 # Portable experimental profile; no game or user files are bundled.
@@ -16,7 +17,7 @@ Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft
 Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1') -ErrorAction Stop
 $packageRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $emulatorPath = Join-Path $packageRoot 'kyty_emulator.exe'
-$expectedExeHash = '68A26D2B2F2065A6457ABCEA257A78E2E39EAF84457A8BD655B2B68A158DFA40'
+$expectedExeHash = 'D776A1A7FD5A6BAAD6FDD2DE624C4CBE4DF9C48DC9E13CE668AEF1F0439ED8D6'
 if ((Get-FileHash -LiteralPath $emulatorPath -Algorithm SHA256).Hash -ine $expectedExeHash) {
     throw 'The emulator differs from this experimental package. Use its matching starter or run your replacement directly.'
 }
@@ -80,7 +81,12 @@ if ($CheckOnly) {
         if (-not (Test-Path -LiteralPath $candidateGame -PathType Leaf)) { throw 'GameFolder must contain eboot.bin.' }
     }
     Write-Output 'Package identity checked. No game, memory backing, or GPU initialized.'
-    Write-Output 'Profile: experimental 2x EQAA + resolve; structured terminal external-call probe; diagnostics off.'
+    if ($GpuFaultDiagnostic) {
+        Write-Output 'Profile: experimental 2x EQAA + resolve; structured terminal external-call probe; GPU fault diagnostic requested.'
+        Write-Output 'Device support is checked at emulator startup. Vulkan validation remains disabled.'
+    } else {
+        Write-Output 'Profile: experimental 2x EQAA + resolve; structured terminal external-call probe; diagnostics off.'
+    }
     Write-Output 'A game folder containing eboot.bin is required when starting. The default backing folder is local to this extracted package.'
     return
 }
@@ -144,6 +150,7 @@ $start.EnvironmentVariables['KYTY_EXPERIMENTAL_EQAA_2X_RESOLVE'] = '1'
 $start.EnvironmentVariables['KYTY_PROBE_EXTERNAL_CALL_TARGET'] = '1'
 $start.EnvironmentVariables['KYTY_PROBE_EXTERNAL_STRUCTURED'] = '1'
 $start.EnvironmentVariables['KYTY_DIRECT_MEMORY_BACKING_DIR'] = $backingRun
+if ($GpuFaultDiagnostic) { $start.EnvironmentVariables['KYTY_GPU_FAULT_DIAGNOSTIC'] = '1' }
 $start.EnvironmentVariables['TEMP'] = $tempRoot
 $start.EnvironmentVariables['TMP'] = $tempRoot
 Write-Output 'Starting the experimental profile. Graphics may be incomplete. A race load can stop at the deliberate external-call probe.'

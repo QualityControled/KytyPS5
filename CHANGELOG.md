@@ -2,6 +2,15 @@
 
 This list covers emulator changes after `KytyPS5-2026-10-07-d2413fc`. Experimental settings are opt-in. Owned fixtures and captured CPU validation are separate from actual game observations.
 
+## r36 - 2026-10-09 - 39d62a0
+
+- Add opt-in bounded GPU device-loss reporting when the device exposes the required extension and feature. Reporting preserves the original failure path and is disabled by default.
+- Confirm at startup whether requested Vulkan validation was actually enabled. The public starter keeps validation off and does not bundle validation layers.
+- Add the optional `-GpuFaultDiagnostic` starter switch. Existing rendering settings remain unchanged; inherited diagnostic flags are still cleared before the child profile is set.
+- The three-target native build and seven registered CPU tests covering 19 authored diagnostic groups passed. Four MRT and four preserved interpolation modules passed CPU preparation/SPIR-V checks. The mapping control used the inherited r35 CPU fixture; no current authored GPU regression is claimed.
+- An isolated live validation test activated successfully and stopped at an invalid sampler/operator combination during a draw. A coordinate-conversion correction is under investigation. No device-loss report was invoked, and this observation does not establish the cause of earlier crashes or vehicle appearance.
+- Vehicle materials, lighting, shadows, crashes and low frame rates remain unresolved. No new rendering, crash or FPS repair is claimed.
+
 ## r35 - 2026-10-08 - 35d1798
 
 - Port [upstream 21a1346](https://github.com/KytyPS5/KytyPS5/commit/21a1346e27db4788515cf8d0954164a27ad637eb) to preserve physical color-export locations when the active render-target mask has gaps. Retain reverse component mapping and distinguish occupancy in shader cache identity.
