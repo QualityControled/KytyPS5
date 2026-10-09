@@ -2,6 +2,18 @@
 
 This list covers emulator changes after `KytyPS5-2026-10-07-d2413fc`. Experimental settings are opt-in. Owned fixtures and captured CPU validation are separate from actual game observations.
 
+## r37 - 2026-10-09 - 266ccca
+
+- Convert unnormalized rectangular sampled-image coordinates before binding normalized Vulkan samplers. Support direct sampling, gathering and LOD queries plus bounded indirect raw sampling. Retain native instruction and original sampler coordinate modes, including the selected indirect descriptor. Existing indirect gather and LOD-query rejection remains unchanged.
+- Convert spatial coordinates and explicit gradients with the bound base-view dimensions. Preserve array layers, comparison references, explicit LOD, bias and integer offsets. Preserve the original encoded sampler settings through the existing normalized mapping. Unnormalized cube sampling remains outside the supported scope and rejects.
+- Port [upstream b96871e](https://github.com/KytyPS5/KytyPS5/commit/b96871e2bff67570094b67012ddb62ba3601974c) so compressed SNORM16 color exports use signed-normalized values. Keep UNORM16 and half-float controls unchanged. Actual vehicle use of this export mode has not been established.
+- Keep the original strict R8 software-comparison classifier unchanged and disabled in the public starter. Optional diagnostics remain off by default; private validation settings are not included in the public profile.
+- Normalization CPU preparation passed 38 authored native modules with SPIR-V validation. The checks cover direct implicit sampling, gathering and LOD queries, bounded indirect raw sampling with selected-descriptor and warm-state checks, and a byte-identical normalized-cube control. Original indirect gather and LOD-query rejection was checked separately.
+- Owned GPU readback passed 25 modules and 27 dispatches for explicit LZ and gradient sampling, including rectangular 2D/array views, nonzero base mips, all native/sampler coordinate-mode combinations and a live sampler-mode off/on/off sequence using the same compiled module. Returned RGBA values and four guard words matched; the requested validation layer was active with no logged VUID. This is a manual owned-image ABI test, not production texture-import or GT7 proof. Implicit sampling, gathering and LOD queries have CPU evidence only.
+- Signed-export CPU preparation passed five authored native modules: three signed pairs and unchanged UNORM16/half-float controls. It has no authored GPU readback or observed vehicle-export association.
+- The merged native build and ten registered CPU tests passed. The canonical normalization preparation reproduced all 38 authored modules; signed-export preparation passed five modules, and four MRT plus four preserved interpolation modules passed CPU emission/SPIR-V validation.
+- A private validation startup stopped at an acquisition-semaphore synchronization check. That issue remains under investigation; the prior sampler failure was not logged before the stop, but its formerly failing draw was not proved reached. No vehicle appearance, playable-race, crash or FPS repair is established.
+
 ## r36 - 2026-10-09 - 39d62a0
 
 - Add opt-in bounded GPU device-loss reporting when the device exposes the required extension and feature. Reporting preserves the original failure path and is disabled by default.
@@ -15,9 +27,8 @@ This list covers emulator changes after `KytyPS5-2026-10-07-d2413fc`. Experiment
 
 - Port [upstream 21a1346](https://github.com/KytyPS5/KytyPS5/commit/21a1346e27db4788515cf8d0954164a27ad637eb) to preserve physical color-export locations when the active render-target mask has gaps. Retain reverse component mapping and distinguish occupancy in shader cache identity.
 - The coherent ten-target build and eight selected CPU regression groups passed. Four authored MRT modules passed native CPU emission/default Vulkan 1.2 SPIR-V validation with physical export-location and occupancy-key assertions. Official reverse component mapping and four preserved interpolation modules plus rectangle controls passed. No new GPU validation is claimed for this port.
-- The first r35 trial showed a Civic vehicle preview that remained dark, flat and incorrectly shaded, with the GT7 logo and no Garage controls. The exact menu or preview phase was unconfirmed. The run closed normally; no visual, FPS or crash repair was established. Targeted tracing retained 36 complete draw candidates in two signature groups and 360 pixel-shader image associations; these associations do not establish vehicle-draw identity or causality. Prior r34 vehicle appearance looked about the same; materials, lighting, shadows, details and performance remain unresolved. Scapes Movies ran, but returning to World Map ended in a native read access violation; cause unresolved. The earlier native fiber stack write fault is also unresolved.
-- Later test observation (2026-10-08, 19:08 EDT): A separate run of the same r35 build with `--redzone` enabled ended with GPU timeline `device_lost` errors rather than a normal close. The last observed scene was a dark rotating Mini preview; its exact phase was unconfirmed, and a Scapes-to-World-Map return test was not completed. The cause is unresolved; no red-zone attribution, FPS gain or crash repair is established. The public starter remains unchanged with red-zone protection off, and the previously published Windows ZIP is unchanged.
-- Separately, the existing owned CPU red-zone patcher fixture passed nine modeled cases. These deliberately controlled faults do not prove Windows overwrote the game's stack or that either crash is repaired. Red-zone protection remains off in the portable starter and first vehicle-preview trial.
+- The first r35 trial showed a Civic vehicle preview that remained dark, flat and incorrectly shaded, with the GT7 logo and no Garage controls. The exact menu or preview phase was unconfirmed. The run closed normally; no visual, FPS or crash repair was established. Targeted tracing retained 36 complete draw candidates in two signature groups and 360 pixel-shader image associations; these associations do not establish vehicle-draw identity or causality. Prior r34 vehicle appearance looked about the same; materials, lighting, shadows, details and performance remain unresolved. Replay/movie navigation remains unstable.
+- Separately, the existing owned CPU red-zone patcher fixture passed nine modeled cases. These controlled fixtures do not establish a repair for actual game behavior. Red-zone protection remains off in the portable starter and first vehicle-preview trial.
 - The portable starter retains the reviewed lower-AA/resolve, file backing and terminal external-call probe settings. Software R8 comparison, optional diagnostics and lookup remain off.
 
 ## r34 - 2026-10-08 - 8c291f1
@@ -26,7 +37,7 @@ This list covers emulator changes after `KytyPS5-2026-10-07-d2413fc`. Experiment
 - Include interpolation mode in shader cache identity. Coherent build and eight CPU regression groups passed; four authored native pixel modules and rectangle regressions passed CPU emission/default Vulkan 1.2 SPIR-V validation. No new GPU test is claimed for this port.
 - Add default-off experimental R8 point/bilinear software comparison while retaining supported native depth comparison. Its earlier authored tests passed 31 modules and 33 manual Vulkan dispatches; these tests are separate from the current interpolation checks and do not prove production texture imports or AMD comparison equivalence. An actual software-enabled startup rejected unsupported status requests before Garage, so the portable starter keeps the experiment off.
 - Add an optional exact pixel-shader trace selector and bounded first-failure metadata for the R8 experiment. The report retains the original strict rejection and is limited to 32 KiB. Optional witnesses, vehicle traces and lookup trials also remain off.
-- This revision reached Garage; the user reported that the vehicle looked about the same. Incorrect vehicle paint/materials/lighting/shadows, missing details, music silence and the prior native fiber crash remain unresolved. No wheel/lighting repair, playable race or FPS improvement is claimed. Scapes Movies ran, but returning to World Map ended in a native read access violation; cause unresolved.
+- This revision reached Garage; the user reported that the vehicle looked about the same. Incorrect vehicle paint/materials/lighting/shadows, missing details and music silence remain unresolved. No wheel/lighting repair, playable race or FPS improvement is claimed. Replay/movie navigation remains unstable.
 
 ## r33 - 2026-10-08 - 8f8d34d
 
@@ -34,7 +45,7 @@ This list covers emulator changes after `KytyPS5-2026-10-07-d2413fc`. Experiment
 - CPU bound/flag checks and the coherent emulator/compute-test build passed. Rendering commands and shader admission are unchanged. The public starter leaves this and all optional diagnostic traces off.
 - Actual geometry tracing retained 34 complete indexed/depth-tested candidates and 432 pixel-shader image associations, with zero oversized records. The bounded total was 1,046,290 bytes. The run closed normally while vehicle appearance remained dark or flat.
 - A moving-preview lookup comparison measured about 8.53 versus 8.30 completed guest flips per second, but differing shader counts and camera motion prevent a matched A/B conclusion. Lookup remains off in the public starter.
-- No vehicle material, lighting, shadow, crash or FPS repair is claimed. A native fiber stack write access violation observed in a prior Garage run remains unresolved.
+- No vehicle material, lighting, shadow, crash or FPS repair is claimed.
 
 ## r32 - 2026-10-08 - 1f6917e
 
@@ -94,7 +105,6 @@ World Map and Garage were reached, and rotating vehicle geometry was observed. T
 
 - Vehicle materials, lighting, shadows and uniform paint remain incorrect or incomplete. A selected replay/movie rendered a moving car with wrong appearance before an invalid graphics-buffer-range guard stopped it; the responsible stage/resource is unidentified.
 - Playable races and actual returning external shader calls are unproved. Terminal probes can deliberately stop those paths.
-- A native fiber stack write access violation observed in a Garage run remains unresolved. The diagnostic updates do not fix it.
 - Menu performance remains low; no supported FPS-gain claim is made.
 - Music silence is user-reported and unresolved.
 - Finite returning-call and certified image-status work is not included merely because its owned fixtures pass.
