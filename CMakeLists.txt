@@ -784,6 +784,17 @@ if(BUILD_TESTING)
 	add_test(NAME shader_external_before_bvh_probe COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --external-before-bvh-probe-only)
 	add_test(NAME shader_dispatcher_determinism COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatcher-determinism-only)
 	add_test(NAME structured_probe_prepare COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --structured-probe-prepare-only)
+	add_test(NAME unnormalized_coordinate_prepare
+		COMMAND ${CMAKE_COMMAND}
+		-DTEST_EXECUTABLE=$<TARGET_FILE:shader_recompiler_compute_tests>
+		-DARTIFACT_ROOT=${CMAKE_CURRENT_BINARY_DIR}/test-artifacts
+		-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/RunUnnormalizedCoordinatePrepare.cmake)
+	add_test(NAME unnormalized_coordinate_gpu_prepare_cpu
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --unnormalized-coordinate-gpu-prepare-only)
+	add_test(NAME compressed_snorm_export_prepare
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compressed-snorm-export-prepare-only)
+	set_tests_properties(unnormalized_coordinate_prepare unnormalized_coordinate_gpu_prepare_cpu
+		compressed_snorm_export_prepare PROPERTIES TIMEOUT 180)
 	add_test(NAME shader_scalar_branch_restores COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-branch-restores-only)
 	add_test(NAME shader_cfg_spirv_size COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-size-only)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)

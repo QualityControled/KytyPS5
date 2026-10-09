@@ -174,6 +174,8 @@ struct SamplerResource {
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
 	bool     gather_lod            = false;
+	// Indirect sampler candidates carry original descriptor coordinate units.
+	bool     force_unnormalized_coordinates = false;
 	uint32_t indirect_root = NoIndirectSampler;
 	uint32_t indirect_mapping_offset = 0;
 	uint32_t indirect_search_iterations = 0;

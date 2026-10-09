@@ -351,6 +351,11 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (a16) {
 		inst.image_sample_flags |= ImageSampleFlagA16;
 	}
+	// RDNA2 MIMG UNORM forces texel coordinates independently of S# bit 15.
+	if ((sample != nullptr || gather != nullptr || opcode == 0x60u) &&
+	    (word0 & (1u << 12u)) != 0u) {
+		inst.image_sample_flags |= ImageSampleFlagUnnormalized;
+	}
 	inst.image_dimension  = dimension;
 	inst.image_r128       = r128;
 	inst.image_nsa_dwords = nsa_dwords;

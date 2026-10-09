@@ -39,6 +39,7 @@ struct ResourceSpecialization {
 		uint32_t indirect_root                    = SamplerResource::NoIndirectSampler;
 		uint32_t indirect_mapping_offset          = 0;
 		uint32_t indirect_search_iterations       = 0;
+		bool     force_unnormalized_coordinates   = false;
 		bool     operator==(const Sampler&) const = default;
 	};
 

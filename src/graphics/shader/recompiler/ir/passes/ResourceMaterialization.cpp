@@ -848,6 +848,30 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
+	for (uint32_t sampler = 0u; sampler < specialization.samplers.size(); ++sampler) {
+		const auto& descriptor = snapshot.samplers.at(sampler);
+		if (descriptor.dword_count != 4u) return SpecializationFail("invalid original sampler coordinate descriptor");
+		// Only indirect descriptors need this module-affecting candidate fact. Direct
+		// descriptors keep bit15 dynamic in executable original S# DWORD0.
+		specialization.samplers[sampler].force_unnormalized_coordinates =
+		    specialization.samplers[sampler].indirect_root != SamplerResource::NoIndirectSampler &&
+		    (descriptor.dwords[0] & (1u << 15u)) != 0u;
+	}
+	// Cube UNORM conversion is not established. Reject any potentially paired
+	// ForceUnorm sampler/cube candidate before binding, including indirect children.
+	// This is intentionally conservative when independent indirect sets are paired.
+	for (const auto& pair: program.info.sampled_pairs) {
+		for (uint32_t image = 0u; image < specialization.images.size(); ++image) {
+			const auto& candidate = specialization.images[image];
+			if (image != pair.image && candidate.indirect_root != pair.image) continue;
+			if (!candidate.cube) continue;
+			for (uint32_t sampler = 0u; sampler < specialization.samplers.size(); ++sampler) {
+				if (sampler != pair.sampler && specialization.samplers[sampler].indirect_root != pair.sampler) continue;
+				if ((snapshot.samplers.at(sampler).dwords[0] & (1u << 15u)) != 0u)
+					return SpecializationFail("unnormalized cube sampler is outside the supported coordinate scope");
+			}
+		}
+	}
 	if (!BuildBindingAliases(program, snapshot, specialization)) return false;
 	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
 	return true;
@@ -1794,6 +1818,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 		auto& sampler                      = samplers[index];
 		sampler.snapshot_index             = index;
+		sampler.force_unnormalized_coordinates = source.force_unnormalized_coordinates;
 		sampler.indirect_root              = source.indirect_root;
 		sampler.indirect_mapping_offset    = source.indirect_mapping_offset;
 		sampler.indirect_search_iterations = source.indirect_search_iterations;

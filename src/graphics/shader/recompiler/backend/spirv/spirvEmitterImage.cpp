@@ -36,11 +36,11 @@ bool HasFlag(const IR::MemoryInfo& mem, uint32_t flag) {
 	return (mem.image_sample_flags & flag) != 0u;
 }
 
-uint32_t LoadContextSampler(ValueEmitContext& ctx, const IR::Inst& inst,
-                            const IR::MemoryInfo& mem) {
+uint32_t ContextSamplerOrdinal(ValueEmitContext& ctx, const IR::Inst& inst,
+                               const IR::MemoryInfo& mem) {
 	auto&       state   = ctx.state;
 	const auto& sampler = state.program.info.samplers.at(mem.sampler);
-	if (sampler.indirect_root != mem.sampler) return LoadSamplerDescriptor(state, mem.sampler);
+	EXIT_IF(sampler.indirect_root != mem.sampler);
 	const auto* handle = inst.NumArgs() > 1u ? inst.Arg(1).ResolveInstruction() : nullptr;
 	if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetSamplerResource ||
 	    handle->NumArgs() == 0u || sampler.indirect_resources.empty() ||
@@ -63,6 +63,15 @@ uint32_t LoadContextSampler(ValueEmitContext& ctx, const IR::Inst& inst,
 	const auto selected = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelect, TypeU32(state), selected, invalid,
 	                          ConstantU32(state, 0u), selected_raw);
+	return selected;
+}
+
+uint32_t LoadContextSampler(ValueEmitContext& ctx, const IR::Inst& inst,
+                            const IR::MemoryInfo& mem, uint32_t selected = 0u) {
+	auto& state = ctx.state;
+	const auto& sampler = state.program.info.samplers.at(mem.sampler);
+	if (sampler.indirect_root != mem.sampler) return LoadSamplerDescriptor(state, mem.sampler);
+	if (selected == 0u) selected = ContextSamplerOrdinal(ctx, inst, mem);
 	auto slot = ConstantU32(state, ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers,
 	                                                     sampler.indirect_resources[0]));
 	for (uint32_t ordinal = 1; ordinal < sampler.indirect_resources.size(); ++ordinal) {
@@ -327,7 +336,7 @@ uint32_t SoftwareColorCompareTap(ValueEmitContext& ctx, const IR::Inst& inst,
 
 uint32_t SoftwareColorComparison(ValueEmitContext& ctx, const IR::Inst& inst,
                                  const IR::MemoryInfo& mem, uint32_t sample, uint32_t reference,
-                                 const IR::Inst& address, const ImageSampleLayout& layout) {
+                                 const IR::Inst& address, const ImageSampleLayout& layout, uint32_t coordinate) {
 	auto& state = ctx.state;
 	const auto& image = state.program.info.images[mem.resource];
 	const auto zero = ConstantF32(state, 0u), one = ConstantF32(state, 0x3f800000u);
@@ -349,7 +358,7 @@ uint32_t SoftwareColorComparison(ValueEmitContext& ctx, const IR::Inst& inst,
 			    extract(size, axis, TypeU32(state)));
 			const auto position = Binary(state, spv::OpFSub, TypeF32(state),
 			    Binary(state, spv::OpFMul, TypeF32(state),
-			           AddressF32(ctx, mem, address, layout.coord + axis), extent),
+			           extract(coordinate, axis, TypeF32(state)), extent),
 			    ConstantF32(state, 0x3f000000u));
 			const auto floor = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floor, GlslStd450(state),
@@ -468,6 +477,98 @@ uint32_t LoadSelectedImageDescriptor(EmitterState& state, uint32_t resource, uin
 		DecorateNonUniform(state, image);
 	}
 	return image;
+}
+
+uint32_t SampleForceUnnormalized(ValueEmitContext& ctx, const IR::Inst& inst,
+                                  const IR::MemoryInfo& mem, uint32_t selected) {
+	auto& state = ctx.state;
+	const auto& sampler = state.program.info.samplers.at(mem.sampler);
+	if (sampler.indirect_root == mem.sampler) {
+		// Arg0 is a context key here, not raw S# bits. Use exactly the same
+		// validated ordinal mapping that selects the bound native sampler.
+		EXIT_IF(selected == 0u);
+		auto force = ConstantBool(state, false);
+		for (uint32_t ordinal = 0u; ordinal < sampler.indirect_resources.size(); ++ordinal) {
+			const auto& candidate = state.program.info.samplers.at(sampler.indirect_resources[ordinal]);
+			force = Select(state, TypeBool(state),
+			    Binary(state, spv::OpIEqual, TypeBool(state), selected, ConstantU32(state, ordinal)),
+			    ConstantBool(state, candidate.force_unnormalized_coordinates), force);
+		}
+		return force;
+	}
+	const auto* handle = inst.Arg(1).Resolve().TryInstruction();
+	if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetSamplerResource ||
+	    handle->NumArgs() != 4u) ctx.Fail(inst, "coordinate normalization has no original runtime sampler");
+	return Binary(state, spv::OpINotEqual, TypeBool(state),
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(*handle, 0u),
+	           ConstantU32(state, 1u << 15u)), ConstantU32(state, 0u));
+}
+
+struct PreparedSampleSampler { uint32_t descriptor; uint32_t force; };
+PreparedSampleSampler PrepareSampleSampler(ValueEmitContext& ctx, const IR::Inst& inst,
+                                          const IR::MemoryInfo& mem) {
+	const auto& sampler = ctx.state.program.info.samplers.at(mem.sampler);
+	const auto ordinal = sampler.indirect_root == mem.sampler ? ContextSamplerOrdinal(ctx, inst, mem) : 0u;
+	const auto descriptor = LoadContextSampler(ctx, inst, mem, ordinal);
+	// Normalized cubes keep the original emitter/pruning route. Materialization
+	// rejected any real forced cube candidate; native UNRM fails at conversion.
+	const auto force = ctx.state.program.info.images.at(mem.resource).cube ? 0u :
+	    SampleForceUnnormalized(ctx, inst, mem, ordinal);
+	return {descriptor, force};
+}
+
+// Host sampled-image samplers are normalized. Convert guest texel coordinates
+// only when MIMG UNORM or the original runtime S# ForceUnorm bit requests it.
+// Query the bound view at view-relative mip zero (not guest descriptor dimensions
+// or absolute backing mip zero), including aliases and selected image candidates.
+uint32_t NormalizeSampleCoordinate(ValueEmitContext& ctx, const IR::Inst& inst,
+                                    const IR::MemoryInfo& mem, uint32_t coordinate,
+                                    uint32_t components, uint32_t resource, uint32_t force,
+                                    uint32_t array_index = 0u) {
+	auto& state = ctx.state;
+	const auto& image = state.program.info.images.at(resource);
+	const auto& info = ImageDimensionInfoFor(image.dimension);
+	if (image.cube) {
+		// Materialization rejects ForceUnorm cube pairs. Native UNORM cube
+		// instructions also stay outside the proved rectangular-coordinate scope.
+		if (HasFlag(mem, Decoder::ImageSampleFlagUnnormalized))
+			ctx.Fail(inst, "unnormalized cube sampling is not supported");
+		return coordinate;
+	}
+	if (info.multisampled != 0u || info.spatial_components == 0u ||
+	    info.spatial_components > 3u || components < info.spatial_components || components > 3u)
+		ctx.Fail(inst, "has an unsupported sample coordinate dimension");
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto descriptor = LoadSelectedImageDescriptor(state, resource, array_index);
+	const auto size = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod,
+	    ImageViewSizeType(state, image.dimension), size, descriptor, ConstantU32(state, 0u));
+	uint32_t values[3] {};
+	for (uint32_t axis = 0u; axis < components; ++axis) {
+		auto original = coordinate;
+		if (components != 1u) {
+			original = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), original, coordinate, axis);
+		}
+		values[axis] = original;
+		if (axis >= info.spatial_components) continue; // Array layer is never normalized.
+		auto extent = size;
+		if (info.coordinate_components != 1u) {
+			extent = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extent, size, axis);
+		}
+		const auto normalized = Binary(state, spv::OpFDiv, TypeF32(state), original,
+		    Unary(state, spv::OpConvertUToF, TypeF32(state), extent));
+		values[axis] = HasFlag(mem, Decoder::ImageSampleFlagUnnormalized) ? normalized :
+		    Select(state, TypeF32(state), force, normalized, original);
+	}
+	if (components == 1u) return values[0];
+	const auto result = state.builder.AllocateId();
+	if (components == 2u)
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2u), result, values[0], values[1]);
+	else
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3u), result, values[0], values[1], values[2]);
+	return result;
 }
 
 uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
@@ -692,10 +793,10 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 
 uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                                     uint32_t coord, Prospero::TextureNumericClass numeric_class,
-                                    uint32_t sampler_id) {
+                                    uint32_t sampler_id, uint32_t array_index = 0u) {
 	auto& state = ctx.state;
 	state.builder.RequireCapability(spv::CapabilityImageQuery);
-	const auto image = LoadImageDescriptor(state, mem.resource);
+	const auto image = LoadSelectedImageDescriptor(state, mem.resource, array_index);
 	const auto width = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeU32(state), width, image,
 	                          ConstantU32(state, 0));
@@ -708,7 +809,7 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 	                                 Binary(state, spv::OpFMul, TypeF32(state), coord, width_f32),
 	                                 ConstantF32(state, 0x3f000000u)));
 
-	const auto sampled     = MakeContextSampledImage(ctx, mem, mem.resource, sampler_id);
+	const auto sampled     = MakeContextSampledImage(ctx, mem, mem.resource, sampler_id, 0u, array_index);
 	const auto vector_type = ImageVectorType(state, numeric_class, 4);
 	const auto scalar_type = ImageScalarType(state, numeric_class);
 	const auto component = ImageGatherSource(state, mem);
@@ -935,14 +1036,19 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	if (op == IR::ValueOpcode::ImageQueryLod) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);
-		const auto dimension = image.dimension;
-		const auto sampled =
-		    MakeContextSampledImage(ctx, mem, mem.resource, LoadContextSampler(ctx, inst, mem));
-		const auto lod       = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    spv::OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
-		    CoordF32(ctx, mem, *address, 0, ImageDimensionInfoFor(dimension).spatial_components,
-		             image.cube));
+		const auto prepared = PrepareSampleSampler(ctx, inst, mem);
+		const auto lod = EmitImageCandidateRuns(ctx, inst, mem, TypeF32Vector(state, 2u),
+		    [&](uint32_t resource, uint32_t array_index) {
+			const auto& candidate = state.program.info.images[resource];
+			const auto spatial = ImageDimensionInfoFor(candidate.dimension).spatial_components;
+			const auto sampled = MakeContextSampledImage(ctx, mem, resource, prepared.descriptor, 0u, array_index);
+			const auto result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpImageQueryLod, TypeF32Vector(state, 2u), result, sampled,
+			    NormalizeSampleCoordinate(ctx, inst, mem,
+			        CoordF32(ctx, mem, *address, 0u, spatial, candidate.cube), spatial, resource, prepared.force, array_index));
+			return result;
+		    });
+		if (lod == 0u) return;
 		uint32_t values[4] = {ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0),
 		                      ConstantU32(state, 0)};
 		for (uint32_t index = 0; index < 2u; index++) {
@@ -1069,19 +1175,23 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return;
 		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
-			const auto coord = CoordF32(ctx, mem, *address, layout.coord,
-			                            dimension_info.coordinate_components, image.cube);
+			const auto prepared = PrepareSampleSampler(ctx, inst, mem);
 			if (dimension == ImageDimension::Dim1D) {
 				if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
-					ctx.Fail(inst, "has an unsupported 1D gather variant");
-					return;
+					ctx.Fail(inst, "has an unsupported 1D gather variant"); return;
 				}
-				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, coord, numeric_class,
-				                                               LoadContextSampler(ctx, inst, mem));
-				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
-				                              numeric_class, false, mem, true));
+				const auto sample = EmitImageCandidateRuns(ctx, inst, mem, ImageVectorType(state, numeric_class, 4u),
+				    [&](uint32_t resource, uint32_t array_index) {
+					auto candidate_memory = mem; candidate_memory.resource = resource;
+					const auto coord = NormalizeSampleCoordinate(ctx, inst, mem,
+					    CoordF32(ctx, mem, *address, layout.coord, 1u), 1u, resource, prepared.force, array_index);
+					return EmitOneDimensionalGatherLz(ctx, candidate_memory, coord, numeric_class,
+					                                prepared.descriptor, array_index);
+				    });
+				if (sample == 0u) return;
+				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample), numeric_class, false, mem, true));
 				return;
 			}
 			if (dimension == ImageDimension::Dim1DArray) {
@@ -1108,10 +1218,15 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				operand_mask = spv::ImageOperandsOffsetMask;
 				offset = PackedOffset(ctx, mem, *address, layout, dimension);
 			}
-			const auto sampler_id = LoadContextSampler(ctx, inst, mem);
+			const auto EmitCandidateGather = [&](uint32_t resource, uint32_t array_index) {
+				const auto& candidate = state.program.info.images[resource];
+				const auto components = ImageDimensionInfoFor(candidate.dimension).coordinate_components;
+				const auto coord = NormalizeSampleCoordinate(ctx, inst, mem,
+				    CoordF32(ctx, mem, *address, layout.coord, components, candidate.cube), components,
+				    resource, prepared.force, array_index);
 			const auto EmitGather = [&](uint32_t mip) {
 				const auto sampled =
-				    MakeContextSampledImage(ctx, mem, mem.resource, sampler_id, mip);
+				    MakeContextSampledImage(ctx, mem, resource, prepared.descriptor, mip, array_index);
 				const auto sample = state.builder.AllocateId();
 				std::vector<uint32_t> words {
 				    static_cast<uint32_t>(dref ? spv::OpImageDrefGather : spv::OpImageGather), result_type,
@@ -1123,12 +1238,15 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				state.builder.AddFunction(words);
 				return sample;
 			};
-			const auto sample = image.mip_mode == IR::ImageMipMode::Dynamic && image.mip_count > 1u
+			return candidate.mip_mode == IR::ImageMipMode::Dynamic && candidate.mip_count > 1u
 			                        ? EmitIndexSwitch(
 			                              state, GatherMip(ctx, inst, mem, *address, layout,
-			                                               image.mip_count),
-			                              image.mip_count, result_type, EmitGather)
+			                                               candidate.mip_count),
+			                              candidate.mip_count, result_type, EmitGather)
 			                        : EmitGather(0);
+			};
+			const auto sample = EmitImageCandidateRuns(ctx, inst, mem, result_type, EmitCandidateGather);
+			if (sample == 0u) return;
 			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
 			                              result_numeric_class, false, mem, true));
 			return;
@@ -1171,13 +1289,22 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operand_mask |= spv::ImageOperandsBiasMask;
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
-		const auto sampler_id = LoadContextSampler(ctx, inst, mem);
+		const auto prepared = PrepareSampleSampler(ctx, inst, mem);
+		const auto sampler_id = prepared.descriptor;
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index = 0u) {
 			const auto& candidate = state.program.info.images[resource];
-			const auto coord =
-			    CoordF32(ctx, mem, *address, layout.coord,
-			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-			             candidate.cube);
+			const auto components = ImageDimensionInfoFor(candidate.dimension).coordinate_components;
+			const auto coord = NormalizeSampleCoordinate(ctx, inst, mem,
+			    CoordF32(ctx, mem, *address, layout.coord, components, candidate.cube),
+			    components, resource, prepared.force, array_index);
+			auto candidate_operands = operands;
+			if (HasFlag(mem, Decoder::ImageSampleFlagDerivative) && !candidate.cube) {
+			    const auto spatial = ImageDimensionInfoFor(candidate.dimension).spatial_components;
+			    candidate_operands[0] = NormalizeSampleCoordinate(ctx, inst, mem,
+			        CoordF32(ctx, mem, *address, layout.grad_x, spatial), spatial, resource, prepared.force, array_index);
+			    candidate_operands[1] = NormalizeSampleCoordinate(ctx, inst, mem,
+			        CoordF32(ctx, mem, *address, layout.grad_y, spatial), spatial, resource, prepared.force, array_index);
+			}
 			const auto sampled =
 			    MakeContextSampledImage(ctx, mem, resource, sampler_id, 0u, array_index);
 			const auto            sample  = state.builder.AllocateId();
@@ -1187,7 +1314,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 			if (operand_mask != 0u) {
 				sample_operands.push_back(operand_mask);
-				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
+				sample_operands.insert(sample_operands.end(), candidate_operands.begin(), candidate_operands.end());
 			}
 			if (software_linear) {
 				state.builder.AddFunction(spv::OpImageGather, result_type, sample, sampled, coord, ConstantU32(state, 0u));
@@ -1198,7 +1325,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		};
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
-			auto       result = software_dref ? SoftwareColorComparison(ctx, inst, mem, sample, dref_value, *address, layout) : sample;
+			auto       result = software_dref ? SoftwareColorComparison(ctx, inst, mem, sample, dref_value, *address, layout,
+			    NormalizeSampleCoordinate(ctx, inst, mem,
+			        CoordF32(ctx, mem, *address, layout.coord, dimension_info.coordinate_components, image.cube),
+			        dimension_info.coordinate_components, mem.resource, prepared.force)) : sample;
 			if (!dref) {
 				result = UnpackImageTexel(ctx, mem, sample);
 			}

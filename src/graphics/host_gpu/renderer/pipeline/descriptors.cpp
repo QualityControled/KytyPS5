@@ -726,6 +726,10 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
                                  uint32_t index,
                                  const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
+	// Guest unnormalized units are converted by the shader from the original S#
+	// and native instruction flag. Keep that snapshot intact; the local native
+	// sampler uses normalized coordinates with the encoded wrap/filter/LOD/CMP.
+	descriptor.fields[0] &= ~(1u << 15u);
 	const auto& sampler = program.info.samplers[index];
 	if (!sampler.depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);

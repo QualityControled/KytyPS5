@@ -58,6 +58,7 @@
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.hpp"
+#include <spirv/unified1/GLSL.std.450.h>
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
 #error "legacy render-target barrier API must remain deleted"
@@ -1830,11 +1831,13 @@ std::string StorageUint2DImageBindingName(bool atomic) {
 
 CompiledShader CompileFragmentCase(const GraphicsCase &test,
                                    ShaderRecompiler::IR::PixelSampleSensitivity *original = nullptr,
-                                   u32 target_shader_mask = UINT32_MAX) {
+                                   u32 target_shader_mask = UINT32_MAX,
+                                   u32 target_output_mode = UINT32_MAX) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
   pixel_info.target_shader_mask = target_shader_mask;
+  if (target_output_mode != UINT32_MAX) pixel_info.target_output_mode[0] = target_output_mode;
   pixel_info.input_num =
       test.pixel_interpolator_settings.empty()
           ? 1u
@@ -43859,10 +43862,111 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 
 #include "OwnedR8ComparisonFixtures.inc"
 
+#include "OwnedUnnormalizedCoordinateFixtures.inc"
+#include "OwnedUnnormalizedCoordinateGPUFixtures.inc"
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
+  if (argc >= 2 && std::string_view(argv[1]).starts_with("--unnormalized-coordinate")) {
+    const auto mode=std::string_view(argv[1]);
+    if(mode=="--unnormalized-coordinate-indirect-reject-only") {
+      if(argc!=3 || (std::string_view(argv[2])!="gather" && std::string_view(argv[2])!="query")) return 2;
+      EnsureConfigInitialized(false);
+      UNormFixture::CheckIndirect({},std::string_view(argv[2])=="gather"?0x47u:0x60u);
+      return 1;
+    }
+    if(mode=="--unnormalized-coordinate-prepare-only" && argc==3) {
+      UNormFixture::Run(argv[2]);return 0;
+    }
+    if(argc!=2 || (mode!="--unnormalized-coordinate-only" &&
+       mode!="--unnormalized-coordinate-gpu-prepare-only")) return 2;
+    EnsureConfigInitialized(false);
+    if(mode=="--unnormalized-coordinate-gpu-prepare-only") UNormGpuFixture::Run(nullptr);
+    else { VulkanHarness vulkan;UNormGpuFixture::Run(&vulkan); }
+    return 0;
+  }
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc > 1 && std::string_view(argv[1]).starts_with("--compressed-snorm-export")) {
+    if (argc != 2 || std::strcmp(argv[1], "--compressed-snorm-export-prepare-only") != 0) {
+      std::fputs("CompressedSnormExport: exact CPU preparation flag only; no Vulkan initialized\n", stderr);
+      return 2;
+    }
+    EnsureConfigInitialized(false);
+    struct ExportCase {
+      const char *name;
+      u32 mode;
+      std::array<u32, 2> packed;
+      std::array<float, 4> expected;
+      u32 unpack;
+    };
+    // Same native compressed EXP encoding as upstream b96871e. All values are authored.
+    const std::array<ExportCase, 5> cases{{
+      {"SnormExportMixedSigns", 6, {0xc0008000u, 0x7fff4000u},
+          {-1.0f, -16384.0f / 32767.0f, 16384.0f / 32767.0f, 1.0f}, GLSLstd450UnpackSnorm2x16},
+      {"SnormExportNegativeEndpoints", 6, {0x80018000u, 0x7fff0000u},
+          {-1.0f, -1.0f, 0.0f, 1.0f}, GLSLstd450UnpackSnorm2x16},
+      {"SnormExportNearZero", 6, {0xffffc000u, 0x40000001u},
+          {-16384.0f / 32767.0f, -1.0f / 32767.0f, 1.0f / 32767.0f, 16384.0f / 32767.0f}, GLSLstd450UnpackSnorm2x16},
+      {"SnormExportUnormControl", 5, {0xffff0000u, 0x80004000u},
+          {0.0f, 1.0f, 16384.0f / 65535.0f, 32768.0f / 65535.0f}, GLSLstd450UnpackUnorm2x16},
+      {"SnormExportHalfControl", 4, {0xb800bc00u, 0x3c003800u},
+          {-1.0f, -0.5f, 0.5f, 1.0f}, GLSLstd450UnpackHalf2x16},
+    }};
+    for (const auto &item : cases) {
+      GraphicsCase test;
+      test.name = item.name;
+      AppendVMovLiteral(&test.fragment_code, 0, item.packed[0]);
+      AppendVMovLiteral(&test.fragment_code, 1, item.packed[1]);
+      test.fragment_code.insert(test.fragment_code.end(),
+          {EncodeExp0(0, 0xf, true, true), EncodeExp1(0, 1, 0, 0)});
+      AppendEnd(&test.fragment_code);
+      // CPU reference vectors define the owned inputs, not observed GPU output.
+      for (u32 component = 0; component < 4u; ++component) {
+        const auto half = static_cast<uint16_t>(item.packed[component / 2u] >> ((component & 1u) * 16u));
+        float reference = 0.0f;
+        if (item.mode == 6u) {
+          reference = std::max(-1.0f, static_cast<float>(std::bit_cast<int16_t>(half)) / 32767.0f);
+        } else if (item.mode == 5u) {
+          reference = static_cast<float>(half) / 65535.0f;
+        } else {
+          // These exact half-float controls have no subnormal/NaN/infinity cases.
+          const auto exponent = static_cast<int>((half >> 10u) & 0x1fu);
+          reference = std::ldexp(1.0f + static_cast<float>(half & 0x3ffu) / 1024.0f, exponent - 15);
+          if ((half & 0x8000u) != 0u) reference = -reference;
+        }
+        Require(test.name, "authored paired16-bit reference",
+            std::abs(reference - item.expected[component]) < 0.000001f,
+            "owned reference vector has an incorrect sign, endpoint, pair order or normalization");
+      }
+      const auto compiled = CompileFragmentCase(test, nullptr, 0xfu, item.mode);
+      u32 compressed_exports = 0;
+      for (const auto &exp : compiled.program.export_info) {
+        if (exp.kind == ShaderRecompiler::IR::ExportTargetKind::Mrt && exp.index == 0u && exp.compr && exp.en == 0xfu)
+          ++compressed_exports;
+      }
+      Require(test.name, "native compressed export reflection", compressed_exports == 1u,
+          "authored native compressed MRT0 export was lost or altered");
+      u32 selected_unpacks = 0;
+      for (size_t offset = 5; offset < compiled.spirv.size();) {
+        const auto count = compiled.spirv[offset] >> 16u;
+        Require(test.name, "SPIR-V instruction bounds", count != 0u && count <= compiled.spirv.size() - offset,
+            "invalid emitted instruction length");
+        const auto words = std::span<const u32>(compiled.spirv).subspan(offset, count);
+        if ((words[0] & 0xffffu) == spv::OpExtInst && count >= 6u &&
+            (words[4] == GLSLstd450UnpackSnorm2x16 || words[4] == GLSLstd450UnpackUnorm2x16 || words[4] == GLSLstd450UnpackHalf2x16)) {
+          Require(test.name, "actual native export unpack opcode", words[4] == item.unpack,
+              "native Emit used a different numeric interpretation for the packed16-bit color pair");
+          ++selected_unpacks;
+        }
+        offset += count;
+      }
+      Require(test.name, "actual pair unpack count", selected_unpacks == 2u,
+          "each authored packed pair must be emitted exactly once");
+      std::printf("[host]    %-32s native Emit + Vulkan1.2 validation, paired unpack opcode/reference ok; no GPU\n", test.name);
+    }
+    std::puts("CompressedSnormExport CPU preparation: 3 signed-normalized native modules and unchanged UNORM/half controls passed; no memory or Vulkan device initialized");
+    return 0;
+  }
   if (argc > 1 && std::string_view(argv[1]).starts_with("--compact-mrt")) {
     if (argc != 2 || std::strcmp(argv[1], "--compact-mrt-prepare-only") != 0) {
       std::fputs("CompactMrt: exact CPU preparation flag only; no Vulkan initialized\n", stderr);

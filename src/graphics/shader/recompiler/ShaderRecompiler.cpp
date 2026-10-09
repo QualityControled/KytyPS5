@@ -786,17 +786,19 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				                              ir.info.samplers[resource].indirect_root == resource
 				                          ? 1u
 				                          : 0u;
-				// Ordinary/native descriptors are host-only. An admitted software compare
-				// consumes the original first C# DWORD, so keep that exact SSA dependency.
-				if (specialization.software_color_dref_enabled && first == 0u &&
-				    std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
-					    if (use.user->GetOpcode() != IR::ValueOpcode::ImageSampleRaw) return false;
+				// Sampling coordinates consume the original first S# DWORD (ForceUnorm),
+				// including context-selected indirect samplers. Keep that executable SSA
+				// dependency; the other descriptor words remain host-only.
+				if (first == 0u && std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
+					    const auto user = use.user->GetOpcode();
+					    if (user != IR::ValueOpcode::ImageSampleRaw &&
+					        user != IR::ValueOpcode::ImageGatherRaw &&
+					        user != IR::ValueOpcode::ImageQueryLod) return false;
 					    const auto index = use.user->Flags<IR::MemoryFlags>().index;
-					    if (index >= ir.memory_info.size()) return false;
-					    const auto& memory = ir.memory_info[index];
-					    return memory.kind == IR::ResourceKind::Image &&
-					           memory.resource < ir.info.images.size() &&
-					           ir.info.images[memory.resource].comparison_mode != IR::ImageComparisonMode::Native;
+					    return index < ir.memory_info.size() &&
+					           ir.memory_info[index].kind == IR::ResourceKind::Image &&
+					           ir.memory_info[index].resource < ir.info.images.size() &&
+					           !ir.info.images[ir.memory_info[index].resource].cube;
 				    })) first = 1u;
 			} else {
 				continue;
