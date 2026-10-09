@@ -657,6 +657,18 @@ add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 target_link_libraries(sync_on_address_tests common)
 target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
 
+# Header-only device fault policy/ABI spies; no emulator or Vulkan loader linkage.
+find_package(Threads REQUIRED)
+add_executable(device_fault_diagnostic_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DeviceFaultDiagnosticTests.cpp")
+target_include_directories(device_fault_diagnostic_tests PRIVATE "${KYTY_SOURCE_DIR}")
+target_link_libraries(device_fault_diagnostic_tests PRIVATE Vulkan::Headers Threads::Threads)
+if(KYTY_CLANG_CL)
+	target_compile_options(device_fault_diagnostic_tests PRIVATE /EHsc)
+else()
+	target_compile_options(device_fault_diagnostic_tests PRIVATE -fexceptions)
+endif()
+
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImagePageTableTests.cpp"
 )
@@ -717,6 +729,31 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
+	add_test(NAME gpu_fault_diagnostic_spy
+		COMMAND ${CMAKE_COMMAND} -E env --unset=KYTY_GPU_FAULT_DIAGNOSTIC
+		$<TARGET_FILE:device_fault_diagnostic_tests>)
+	add_test(NAME gpu_fault_diagnostic_gate_unset
+		COMMAND ${CMAKE_COMMAND} -E env --unset=KYTY_GPU_FAULT_DIAGNOSTIC
+		$<TARGET_FILE:device_fault_diagnostic_tests> --gate-child 0)
+	add_test(NAME gpu_fault_diagnostic_gate_one
+		COMMAND ${CMAKE_COMMAND} -E env KYTY_GPU_FAULT_DIAGNOSTIC=1
+		$<TARGET_FILE:device_fault_diagnostic_tests> --gate-child 1)
+	add_test(NAME gpu_fault_diagnostic_gate_zero
+		COMMAND ${CMAKE_COMMAND} -E env KYTY_GPU_FAULT_DIAGNOSTIC=0
+		$<TARGET_FILE:device_fault_diagnostic_tests> --gate-child 0)
+	add_test(NAME gpu_fault_diagnostic_gate_leading_zero
+		COMMAND ${CMAKE_COMMAND} -E env KYTY_GPU_FAULT_DIAGNOSTIC=01
+		$<TARGET_FILE:device_fault_diagnostic_tests> --gate-child 0)
+	add_test(NAME gpu_fault_diagnostic_gate_true_word
+		COMMAND ${CMAKE_COMMAND} -E env KYTY_GPU_FAULT_DIAGNOSTIC=true
+		$<TARGET_FILE:device_fault_diagnostic_tests> --gate-child 0)
+	add_test(NAME gpu_fault_diagnostic_gate_leading_space
+		COMMAND ${CMAKE_COMMAND} -E env "KYTY_GPU_FAULT_DIAGNOSTIC= 1"
+		$<TARGET_FILE:device_fault_diagnostic_tests> --gate-child 0)
+	set_tests_properties(gpu_fault_diagnostic_spy gpu_fault_diagnostic_gate_unset
+		gpu_fault_diagnostic_gate_one gpu_fault_diagnostic_gate_zero
+		gpu_fault_diagnostic_gate_leading_zero gpu_fault_diagnostic_gate_true_word
+		gpu_fault_diagnostic_gate_leading_space PROPERTIES TIMEOUT 30)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
@@ -813,6 +850,7 @@ if(BUILD_TESTING)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
+		device_fault_diagnostic_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests

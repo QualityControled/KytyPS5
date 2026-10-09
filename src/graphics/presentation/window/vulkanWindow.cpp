@@ -489,7 +489,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
+	auto& fault_diagnostic = graphics.device_fault_diagnostic;
+	if (fault_diagnostic.requested && fault_diagnostic.extension_supported) {
+		supported_fault.pNext = supported_features2.pNext;
+		supported_features2.pNext = &supported_fault;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	fault_diagnostic.feature_supported = supported_fault.deviceFault == VK_TRUE;
+	fault_diagnostic.enabled = DeviceFaultDiagnostic::EnableFeature(
+	    fault_diagnostic.requested, fault_diagnostic.extension_supported,
+	    supported_fault.deviceFault);
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
@@ -641,6 +651,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = const_cast<void*>(create_info.pNext);
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
+	}
+	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
+	if (fault_diagnostic.enabled) {
+		fault_features.pNext = const_cast<void*>(create_info.pNext);
+		fault_features.deviceFault = VK_TRUE;
+		fault_features.deviceFaultVendorBinary = VK_FALSE;
+		create_info.pNext = &fault_features;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -932,6 +949,15 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
+	if (Config::VulkanValidationEnabled() || DeviceFaultDiagnostic::Requested()) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "VulkanValidation startup requested={} enabled={} layer_count={} "
+		    "debug_messenger_available={} gpu_assisted_requested={}\n",
+		    Config::VulkanValidationEnabled(), r.enable_validation_layers,
+		    inst_info.enabledLayerCount, graphic_ctx.debug_messenger != nullptr,
+		    Config::GpuAssistedValidationEnabled()));
+	}
+
 	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
 	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
 	                              nullptr, &native_surface)) {
@@ -1001,6 +1027,14 @@ void WindowContext::CreateVulkan() {
 			        nullptr, count, values);
 		    });
 
+		auto& fault_diagnostic = graphic_ctx.device_fault_diagnostic;
+		fault_diagnostic.requested = DeviceFaultDiagnostic::Requested();
+		fault_diagnostic.extension_supported =
+		    HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		if (fault_diagnostic.requested && fault_diagnostic.extension_supported) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
+
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
@@ -1027,6 +1061,20 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	auto& fault_diagnostic = graphic_ctx.device_fault_diagnostic;
+	if (fault_diagnostic.enabled) {
+		fault_diagnostic.query = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT;
+	}
+	if (fault_diagnostic.requested) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "GpuFaultDiagnostic startup requested=1 extension_supported={} "
+		    "feature_supported={} enabled={} entrypoint_available={} vendor_binary=0 "
+		    "max_address_entries={} max_vendor_entries={} max_query_calls={}\n",
+		    fault_diagnostic.extension_supported, fault_diagnostic.feature_supported,
+		    fault_diagnostic.enabled, fault_diagnostic.query != nullptr,
+		    DeviceFaultDiagnostic::MaxEntries, DeviceFaultDiagnostic::MaxEntries,
+		    DeviceFaultDiagnostic::MaxAttempts * 2));
+	}
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 
