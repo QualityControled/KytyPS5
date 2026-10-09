@@ -669,6 +669,18 @@ else()
 	target_compile_options(device_fault_diagnostic_tests PRIVATE -fexceptions)
 endif()
 
+# Exact production method lifecycle spy; no Vulkan loader or emulator linkage.
+add_executable(swapchain_acquire_semaphore_tests EXCLUDE_FROM_ALL
+ "${KYTY_TESTS_DIR}/SwapchainAcquireSemaphoreTests.cpp")
+target_compile_definitions(swapchain_acquire_semaphore_tests PRIVATE
+ SWAPCHAIN_SOURCE_PATH="${KYTY_SOURCE_DIR}/graphics/presentation/window/swapchain.cpp")
+target_link_libraries(swapchain_acquire_semaphore_tests PRIVATE Threads::Threads)
+if(KYTY_CLANG_CL)
+ target_compile_options(swapchain_acquire_semaphore_tests PRIVATE /EHsc)
+else()
+ target_compile_options(swapchain_acquire_semaphore_tests PRIVATE -fexceptions)
+endif()
+
 add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImagePageTableTests.cpp"
 )
@@ -729,6 +741,8 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
+	add_test(NAME swapchain_acquire_semaphore_lifecycle COMMAND $<TARGET_FILE:swapchain_acquire_semaphore_tests>)
+	set_tests_properties(swapchain_acquire_semaphore_lifecycle PROPERTIES TIMEOUT 30)
 	add_test(NAME gpu_fault_diagnostic_spy
 		COMMAND ${CMAKE_COMMAND} -E env --unset=KYTY_GPU_FAULT_DIAGNOSTIC
 		$<TARGET_FILE:device_fault_diagnostic_tests>)

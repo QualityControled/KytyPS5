@@ -263,7 +263,7 @@ public:
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] bool   NeedsResize() const;
-	[[nodiscard]] Status AcquireNextImage();
+	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
@@ -288,6 +288,8 @@ private:
 	std::vector<vk::Image>         m_images;
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
+	// A frame slot is reusable only after its submission consumed the binary acquire signal.
+	std::vector<uint64_t>          m_image_acquired_ticks;
 	std::vector<vk::Semaphore>     m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
 	vk::DescriptorSetLayout        m_overlay_descriptors = nullptr;
@@ -296,6 +298,7 @@ private:
 	vk::Sampler                    m_overlay_sampler     = nullptr;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
+	bool                           m_recreate_after_present = false;
 };
 
 struct Presenter::Impl {
@@ -464,6 +467,8 @@ void Swapchain::Create() {
 	vk::SemaphoreCreateInfo semaphore_info {};
 	semaphore_info.sType = vk::StructureType::eSemaphoreCreateInfo;
 	m_image_acquired.resize(m_images.size());
+	m_image_acquired_ticks.assign(m_images.size(), 0);
+	m_recreate_after_present = false;
 	m_render_complete.resize(m_images.size());
 	for (size_t i = 0; i < m_images.size(); i++) {
 		RequireVulkanSuccess(
@@ -532,6 +537,8 @@ void Swapchain::Destroy() {
 	m_images.clear();
 	m_image_views.clear();
 	m_image_acquired.clear();
+	m_image_acquired_ticks.clear();
+	m_recreate_after_present = false;
 	m_render_complete.clear();
 }
 
@@ -557,8 +564,13 @@ bool Swapchain::NeedsResize() const {
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
-Swapchain::Status Swapchain::AcquireNextImage() {
-	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
+Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
+	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size() ||
+	        m_frame_index >= m_image_acquired_ticks.size());
+	// This is outside the renderer and queue mutexes. Waiting the slot's actual submit tick
+	// proves its prior binary wait has completed; image availability alone does not.
+	scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
+	m_recreate_after_present = false;
 	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
@@ -567,7 +579,10 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
+			// Suboptimal is a successful acquisition and submits a binary signal. Consume it
+			// through the normal render submission before queue-idle recreation.
+			m_recreate_after_present = true;
+			break;
 		case vk::Result::eErrorOutOfDateKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
@@ -824,11 +839,15 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 }
 
 uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
-	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
+	EXIT_IF(m_frame_index >= m_image_acquired.size() ||
+	        m_frame_index >= m_image_acquired_ticks.size() ||
+	        m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	return scheduler.Submit(submit);
+	const auto tick = scheduler.Submit(submit);
+	m_image_acquired_ticks[m_frame_index] = tick;
+	return tick;
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -861,7 +880,7 @@ Swapchain::Status Swapchain::Present() {
 		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());
-	return Status::Success;
+	return m_recreate_after_present ? Status::Recreate : Status::Success;
 }
 
 Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(window)) {}
@@ -972,7 +991,7 @@ void Presenter::Impl::Present() {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage();
+		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
