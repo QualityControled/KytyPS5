@@ -2,6 +2,14 @@
 
 This list covers emulator changes after `KytyPS5-2026-10-07-d2413fc`. Experimental settings are opt-in. Owned fixtures and captured CPU validation are separate from actual game observations.
 
+## r38 - 2026-10-09 - b06cfe4
+
+- Retire a frame slot's acquisition semaphore using its actual preceding submission tick before reuse. Keep present-completion semaphores indexed by acquired image.
+- Consume successful suboptimal acquisition signals through the normal render/present path before swapchain recreation.
+- Nine source-linked CPU lifecycle groups passed in an authored delayed-queue model. The original method failed the ring-wrap control; stale-source and malformed-invocation controls rejected as expected. This is CPU ordering evidence, not a Vulkan presentation retest.
+- Normalization and signed-export changes and their r37 tests are retained. No additional sampling GPU validation is claimed. Public diagnostics, software R8 comparison and red-zone protection remain disabled by default.
+- The four-target native build and registered lifecycle CPU test passed all nine groups. The private validation startup reached an unsupported R8 color-image depth comparison in compute. The two earlier startup validation errors were not logged before that later check. No menu, vehicle or FPS result was verified, and no complete rendering or crash repair is claimed.
+
 ## r37 - 2026-10-09 - 266ccca
 
 - Convert unnormalized rectangular sampled-image coordinates before binding normalized Vulkan samplers. Support direct sampling, gathering and LOD queries plus bounded indirect raw sampling. Retain native instruction and original sampler coordinate modes, including the selected indirect descriptor. Existing indirect gather and LOD-query rejection remains unchanged.
